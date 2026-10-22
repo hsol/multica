@@ -16,17 +16,11 @@
 # "don't touch another domain's schemas" rule, but the merge will only
 # resolve cleanly once those sibling tickets land matching names.
 #
-# WorkspaceMcpServerResponse below is a deliberate exception: it is the exact
-# wire shape server/internal/handler/workspace_mcp_api.go uses for BOTH the
-# four agent-scoped endpoints in this ticket's scope AND the out-of-scope
-# workspace-level MCP server library CRUD (ListWorkspaceMcpServers /
-# CreateWorkspaceMcpServer / UpdateWorkspaceMcpServer /
-# DeleteWorkspaceMcpServer) that belongs to a different, not-yet-written
-# domain file. No other file in this snapshot defines it, so it is defined
-# here to keep this ticket's responses fully specified; flagged for the
-# orchestrator to reconcile (dedupe or rename) against whichever domain
-# documents the workspace-level library, since scripts/merge.mjs hard-errors
-# on a duplicate component key.
+# WorkspaceMcpServerResponse is the exact wire shape
+# server/internal/handler/workspace_mcp_api.go uses for BOTH the four
+# agent-scoped endpoints here AND the workspace-level MCP server library CRUD.
+# It is defined once, in components/schemas/workspaces.yaml, since
+# scripts/merge.mjs hard-errors on a duplicate component key.
 
 # --- Agent Builder sessions (server/internal/handler/agent_builder.go) ---
 
@@ -352,61 +346,8 @@ AddAgentSkillsRequest:
 
 # --- Agent MCP server bindings (server/internal/handler/workspace_mcp_api.go) ---
 #
-# WorkspaceMcpServerResponse: see the file-level comment above for why this
-# is defined here rather than deferred to another domain.
-
-WorkspaceMcpServerResponse:
-  type: object
-  description: >-
-    The intentionally non-secret shape of one workspace MCP server library
-    entry. Deliberately excludes `url` / `command` / `args` / `headers` /
-    `env` — any of those routinely carries a bearer credential (even a
-    Composio-style session URL is one on its own) — mirroring the daemon's
-    own redaction line for the same reason.
-  required: [id, workspace_id, name, transport, created_at, updated_at]
-  properties:
-    id:
-      type: string
-      format: uuid
-    workspace_id:
-      type: string
-      format: uuid
-    name:
-      type: string
-    transport:
-      type: string
-      description: >-
-        One of `stdio` / `http` derived from an explicit or inferred
-        `type`/`command`/`url` in the stored config, `unknown` if neither is
-        present or the config is unparseable, or — for an explicit `type`
-        this server does not recognise (e.g. `sse`, or a future client's
-        invention) — that value passed through verbatim rather than
-        collapsed to `http`/`stdio`. Never reconstructed lossily: an
-        unrecognised explicit type would otherwise round-trip through a form
-        that silently rewrites the entry to a different protocol.
-    enabled:
-      type: boolean
-      nullable: true
-      description: >-
-        Only meaningful (and only present) on the agent-scoped responses
-        this ticket covers — reflects this binding's toggle. Omitted by the
-        workspace-level library listing (out of this ticket's scope), which
-        describes the entry itself, not an assignment.
-    agent_count:
-      type: integer
-      format: int64
-      nullable: true
-      description: >-
-        How many live (non-archived) agents this entry is assigned to. Only
-        the out-of-scope workspace library listing populates this; every
-        agent-scoped response in this ticket omits it.
-    created_at:
-      type: string
-      format: date-time
-    updated_at:
-      type: string
-      format: date-time
-  additionalProperties: false
+# WorkspaceMcpServerResponse is defined once in components/schemas/workspaces.yaml
+# and referenced from here.
 
 AddAgentMcpServerRequest:
   type: object

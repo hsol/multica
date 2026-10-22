@@ -1223,81 +1223,9 @@ AttachLabelRequest:
       format: uuid
   additionalProperties: false
 
-# ---------------------------------------------------------------------------
-# DingTalk group presence for one agent
-# ---------------------------------------------------------------------------
-
-DingTalkGroupBotResponse:
-  type: object
-  description: >-
-    One connected Multica bot observed in a DingTalk group.
-    server/internal/handler/dingtalk.go:40-50.
-  required: [installation_id, agent_id, bot_name, bot_identity_issue]
-  properties:
-    installation_id:
-      type: string
-      format: uuid
-    agent_id:
-      type: string
-      format: uuid
-      description: 'The product-facing identity.'
-    bot_name:
-      type: string
-      description: 'The readable DingTalk identity, populated only when the app has qyapi_chat_manage permission.'
-    bot_identity_issue:
-      type: string
-      description: 'Non-empty when the bot identity could not be resolved; empty string means no issue.'
-    last_active_at:
-      type: string
-      description: 'RFC3339, or empty string when never active in this group. Absent entirely on the bot_identities map values (installation-level identity has no per-group activity).'
-    mention_count:
-      type: integer
-      format: int64
-      description: 'Absent on the bot_identities map values; only meaningful per-group.'
-  additionalProperties: false
-
-DingTalkGroupResponse:
-  type: object
-  description: >-
-    Every connected bot observed under the same DingTalk openConversationId.
-    server/internal/handler/dingtalk.go:52-58.
-  required: [conversation_id, conversation_title, bots]
-  properties:
-    conversation_id:
-      type: string
-    conversation_title:
-      type: string
-    bots:
-      type: array
-      items: { $ref: '#/components/schemas/DingTalkGroupBotResponse' }
-      description: 'Sorted by installation_id.'
-  additionalProperties: false
-
-ListDingTalkGroupsResponse:
-  type: object
-  description: server/internal/handler/dingtalk.go:60-66.
-  required: [groups, group_discovery_supported, inactive_group_counts, bot_identities]
-  properties:
-    groups:
-      type: array
-      items: { $ref: '#/components/schemas/DingTalkGroupResponse' }
-      description: 'Sorted by conversation_title (empty titles last), then conversation_id.'
-    group_discovery_supported:
-      type: boolean
-      description: 'Always true from this handler (a workspace-wide sibling endpoint, not in this file''s scope, can return false).'
-    inactive_group_counts:
-      type: object
-      additionalProperties: { type: integer, format: int64 }
-      description: 'Keyed by installation_id. Count of groups inactive for 90+ days per installation.'
-    bot_identities:
-      type: object
-      additionalProperties: { $ref: '#/components/schemas/DingTalkGroupBotResponse' }
-      description: 'Keyed by installation_id. One entry per bot installation, independent of group activity.'
-    next_offset:
-      type: integer
-      nullable: true
-      description: 'Only present when `activity=inactive` and more inactive-group rows remain beyond this page.'
-  additionalProperties: false
+# DingTalkGroupBotResponse / DingTalkGroupResponse / ListDingTalkGroupsResponse
+# (used by /api/agents/{id}/dingtalk/groups) are defined once in
+# components/schemas/workspaces.yaml and referenced from here.
 
 # ---------------------------------------------------------------------------
 # Workspace-wide agent / task aggregations

@@ -214,23 +214,55 @@ InvitationRateLimitedResponse:
 WorkspaceMcpServerResponse:
   type: object
   description: >-
-    workspace_mcp_api.go:24-34 (`WorkspaceMcpServerResponse`). Never carries
-    the raw `config` (url/command/args/headers/env) — the type has no field
-    for it; `transport` is derived from config server-side by
-    `mcpTransportOf` (workspace_mcp_api.go:~60-85). `enabled`/`agent_count`
-    are `omitempty` and only populated by agent-scoped MCP list responses
-    (out of this ticket's scope), so they are absent on every one of this
-    domain's 4 endpoints.
+    The intentionally non-secret shape of one workspace MCP server library
+    entry. Deliberately excludes `url` / `command` / `args` / `headers` /
+    `env` — any of those routinely carries a bearer credential (even a
+    Composio-style session URL is one on its own) — mirroring the daemon's
+    own redaction line for the same reason.
   required: [id, workspace_id, name, transport, created_at, updated_at]
   properties:
-    id: {type: string, format: uuid}
-    workspace_id: {type: string, format: uuid}
-    name: {type: string}
-    transport: {type: string, description: "e.g. stdio/http, or the raw `type` string when unrecognised — never lossily inferred for an entry with an explicit type."}
-    enabled: {type: boolean}
-    agent_count: {type: integer, format: int64}
-    created_at: {type: string, format: date-time}
-    updated_at: {type: string, format: date-time}
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    transport:
+      type: string
+      description: >-
+        One of `stdio` / `http` derived from an explicit or inferred
+        `type`/`command`/`url` in the stored config, `unknown` if neither is
+        present or the config is unparseable, or — for an explicit `type`
+        this server does not recognise (e.g. `sse`, or a future client's
+        invention) — that value passed through verbatim rather than
+        collapsed to `http`/`stdio`. Never reconstructed lossily: an
+        unrecognised explicit type would otherwise round-trip through a form
+        that silently rewrites the entry to a different protocol.
+    enabled:
+      type: boolean
+      nullable: true
+      description: >-
+        Only meaningful (and only present) on the agent-scoped MCP server
+        responses, where it reflects that binding's toggle. Omitted by the
+        workspace-level library listing, which describes the entry itself,
+        not an assignment.
+    agent_count:
+      type: integer
+      format: int64
+      nullable: true
+      description: >-
+        How many live (non-archived) agents this entry is assigned to. Only
+        the workspace-level library listing populates this; agent-scoped
+        responses omit it.
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+  additionalProperties: false
 
 WorkspaceMcpServerRequest:
   type: object
