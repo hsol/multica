@@ -1,0 +1,759 @@
+# Domain-specific schemas for the account domain (tokens / me / attachments / webhooks /
+# projects / share-links / cli-token / upload-file). Nested under
+# components/schemas/ per docs/unofficial-api/README.md point 4 so these merge
+# into components.schemas without touching the shared components/schemas.yaml
+# (Error / ErrorCode / RevisionConflict / EditConflict only).
+#
+# Every schema below is reverse-engineered from server/internal/handler/*.go;
+# file:line citations are in each schema's description. Fields or behaviors
+# that could not be confirmed from source are called out explicitly rather
+# than guessed, per the parent ticket's rule.
+
+# ---------------------------------------------------------------------------
+# /api/me, /api/me/onboarding/*, /api/cli-token
+# ---------------------------------------------------------------------------
+
+UserResponse:
+  type: object
+  description: >-
+    server/internal/handler/auth.go:64-78 (`UserResponse`), built by
+    `userToResponse` (auth.go:86-108). Returned by GET/PATCH /api/me, PATCH
+    /api/me/onboarding, POST /api/me/onboarding/complete, and POST
+    /api/me/onboarding/cloud-waitlist.
+  required: [id, name, email, profile_description, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    email:
+      type: string
+      format: email
+    avatar_url:
+      type: [string, "null"]
+      description: Possibly rewritten/signed URL; resolved via `h.resolveAvatarURLPtr` (not independently re-verified).
+    language:
+      type: [string, "null"]
+      description: >-
+        One of `en`, `zh-Hans`, `ko`, `ja`, `fr` when set via PATCH /api/me
+        (`supportedLanguages`, auth.go:56-62); not enforced as a read-side
+        constraint (legacy values could in principle differ).
+    timezone:
+      type: [string, "null"]
+      description: IANA timezone name; validated with `time.LoadLocation` on write (auth.go:846).
+    onboarded_at:
+      type: [string, "null"]
+      format: date-time
+    onboarding_questionnaire:
+      type: object
+      description: >-
+        Opaque JSON blob (`json.RawMessage` on the wire), defaults to `{}`
+        when empty (auth.go:90-93). Informal inner shape when present: see
+        `OnboardingQuestionnaire` below — not schema-validated by the server.
+      additionalProperties: true
+    starter_content_state:
+      type: [string, "null"]
+      description: e.g. `"imported"`, set by `claimStarterContentStateIfUnset` (onboarding_shim.go:609-623).
+    profile_description:
+      type: string
+      maxLength: 2000
+      description: Rune-counted cap of 2000 enforced on write (auth.go:80-84, 833).
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+OnboardingQuestionnaire:
+  type: object
+  description: >-
+    server/internal/handler/onboarding.go:172-183 (`questionnaireAnswers`).
+    Informal shape of the `UserResponse.onboarding_questionnaire` blob once
+    populated — purely interpretive for analytics, never schema-enforced by
+    PATCH /api/me/onboarding.
+  properties:
+    source:
+      description: Accepts a single string or an array of strings on the wire (`stringOrSlice`, onboarding.go:144-170).
+      oneOf:
+        - type: string
+        - type: array
+          items: { type: string }
+    source_other: { type: string }
+    source_skipped: { type: boolean }
+    role: { type: string }
+    role_other: { type: string }
+    role_skipped: { type: boolean }
+    use_case:
+      oneOf:
+        - type: string
+        - type: array
+          items: { type: string }
+    use_case_other: { type: string }
+    use_case_skipped: { type: boolean }
+    version: { type: integer }
+
+UpdateMeRequest:
+  type: object
+  description: server/internal/handler/auth.go:506-513 (`UpdateMeRequest`). All fields optional; omit a field to leave it untouched.
+  properties:
+    name:
+      type: string
+      description: Trimmed; empty string after trim is rejected with 400 "name is required" (auth.go:801-805).
+    avatar_url:
+      type: string
+      description: >-
+        Must reference a standalone (unattached) image upload owned by this
+        deployment's storage, or a third-party/emoji/data-URI value;
+        rejected with 403 if it points at an attachment already bound to an
+        issue/comment/chat (`acceptAvatarURL`, avatar.go:254-307).
+    language:
+      type: string
+      enum: [en, zh-Hans, ko, ja, fr]
+      description: auth.go:56-62, 822-824.
+    profile_description:
+      type: string
+      maxLength: 2000
+    timezone:
+      type: string
+      description: >-
+        IANA timezone name, validated via `time.LoadLocation`. Sending an
+        empty string `""` explicitly clears the column to NULL; omitting
+        the field leaves it untouched (auth.go:837-846).
+
+PatchOnboardingRequest:
+  type: object
+  description: >-
+    server/internal/handler/onboarding.go:130-132
+    (`patchOnboardingRequest`). Body capped at 16 KiB
+    (`patchOnboardingBodyLimit`, onboarding.go:30).
+  properties:
+    questionnaire:
+      $ref: '#/components/schemas/OnboardingQuestionnaire'
+      description: >-
+        Written as-is to the JSONB column with no shape validation at this
+        handler; the referenced schema is informal/interpretive only.
+
+CompleteOnboardingRequest:
+  type: object
+  description: >-
+    server/internal/handler/onboarding.go:43-46
+    (`completeOnboardingRequest`). Body is entirely optional — an empty
+    body (`Content-Length: 0`) is accepted and treated the same as `{}`.
+  properties:
+    completion_path:
+      type: string
+      description: >-
+        Analytics-only label. Recognized values are
+        `full`/`runtime_skipped`/`cloud_waitlist`/`skip_existing`/`invite_accept`
+        (`validCompletionPaths`, onboarding.go:48-54); anything else
+        (including empty) is accepted and recorded as `unknown` — never a
+        validation error.
+    workspace_id:
+      type: string
+      format: uuid
+      description: Analytics dimension only; not written to any column (onboarding.go:39-40, 88).
+
+JoinCloudWaitlistRequest:
+  type: object
+  description: server/internal/handler/onboarding.go:312-315 (`joinCloudWaitlistRequest`).
+  required: [email]
+  properties:
+    email:
+      type: string
+      format: email
+      maxLength: 254
+      description: Lower-cased + trimmed; format-checked via `mail.ParseAddress` (onboarding.go:335-346).
+    reason:
+      type: string
+      maxLength: 500
+      description: Optional; onboarding.go:349-357.
+
+CliTokenResponse:
+  type: object
+  description: >-
+    server/internal/handler/auth.go:773 — inline map, not a named Go
+    struct. A fresh JWT the browser session can hand off to the CLI.
+  required: [token]
+  properties:
+    token:
+      type: string
+
+BootstrapOnboardingRuntimeRequest:
+  type: object
+  description: >-
+    server/internal/handler/onboarding_shim.go:108-112. DEPRECATED shim for
+    desktop < v3 clients only (router.go:1657-1664) — current clients do
+    not call this.
+  required: [workspace_id, runtime_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+    runtime_id:
+      type: string
+      format: uuid
+    starter_prompt:
+      type: string
+      maxLength: 2048
+      description: Rune-counted cap (onboarding_shim.go:51, 154-156).
+
+BootstrapOnboardingRuntimeResponse:
+  type: object
+  description: onboarding_shim.go:114-118.
+  required: [workspace_id, agent_id, issue_id]
+  properties:
+    workspace_id: { type: string, format: uuid }
+    agent_id: { type: string, format: uuid }
+    issue_id: { type: string, format: uuid }
+
+BootstrapOnboardingNoRuntimeRequest:
+  type: object
+  description: >-
+    server/internal/handler/onboarding_shim.go:120-122. DEPRECATED shim,
+    same status as BootstrapOnboardingRuntimeRequest.
+  required: [workspace_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+
+BootstrapOnboardingNoRuntimeResponse:
+  type: object
+  description: onboarding_shim.go:124-127.
+  required: [workspace_id, issue_id]
+  properties:
+    workspace_id: { type: string, format: uuid }
+    issue_id: { type: string, format: uuid }
+
+IssueLimitReachedError:
+  type: object
+  description: >-
+    402 body written by `writeIssueLimitReached` (handler/issue_limit.go:37-49),
+    used by both onboarding shim endpoints when the workspace's Cloud
+    issue-count entitlement is exhausted. Deliberately not folded into the
+    shared `ErrorCode` enum: it carries extra structured fields that enum
+    does not model.
+  required: [error, code, limit, policy_revision]
+  properties:
+    error:
+      type: string
+      const: workspace has reached its issue limit
+    code:
+      type: string
+      const: issue_limit_reached
+    limit:
+      type: integer
+    policy_revision:
+      type: integer
+
+# ---------------------------------------------------------------------------
+# /api/tokens, /api/cli-token (CreatePAT etc.)
+# ---------------------------------------------------------------------------
+
+PersonalAccessTokenResponse:
+  type: object
+  description: >-
+    server/internal/handler/personal_access_token.go:30-37. The raw secret
+    is never included here — only `token_prefix` (first 12 chars of the
+    full `mul_...` string, i.e. `mul_` + 8 hex chars).
+  required: [id, name, token_prefix, created_at]
+  properties:
+    id: { type: string, format: uuid }
+    name: { type: string }
+    token_prefix: { type: string }
+    expires_at:
+      type: [string, "null"]
+      format: date-time
+      description: Null for a never-expiring token.
+    last_used_at:
+      type: [string, "null"]
+      format: date-time
+    created_at: { type: string, format: date-time }
+
+CreatePATRequest:
+  type: object
+  description: >-
+    server/internal/handler/personal_access_token.go:55-58. No `scopes`
+    field exists — confirmed exhaustive by reading the struct.
+  required: [name]
+  properties:
+    name:
+      type: string
+      description: Required; rejected with 400 "name is required" if empty after no trimming is applied server-side beyond the empty-string check.
+    expires_in_days:
+      type: integer
+      description: >-
+        Optional. **Not a closed enum** despite the UI offering 30/90/365/never
+        (`packages/views/settings/components/tokens-tab.tsx:43`) — the
+        handler accepts any positive integer verbatim
+        (personal_access_token.go:60-111) and treats `null`, `0`, or a
+        negative value identically as "never expires." Documented here as a
+        plain optional positive integer, not an enum, per source.
+
+CreatePATResponse:
+  type: object
+  description: >-
+    server/internal/handler/personal_access_token.go:39-42
+    (`CreatePATResponse`). The **only** response in this API surface that
+    ever includes the full raw token secret, and only once, at creation.
+  allOf:
+    - $ref: '#/components/schemas/PersonalAccessTokenResponse'
+    - type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: Full secret, e.g. `mul_<40 hex chars>`. Never retrievable again after this response.
+
+RenewPATResponse:
+  type: object
+  description: >-
+    server/internal/handler/personal_access_token.go:138-141. Always 200,
+    on every branch including no-op cases — `renewed: false` is a normal
+    outcome, not an error.
+  required: [expires_at, renewed]
+  properties:
+    expires_at:
+      type: string
+      description: >-
+        Plain (non-nullable) string, distinct from
+        `PersonalAccessTokenResponse.expires_at`: the empty string `""`
+        represents "never expires" here, rather than `null`.
+    renewed:
+      type: boolean
+      description: >-
+        `false` when renewal was a no-op (never-expiring token, more than 7
+        days remaining, or a concurrent renewal already won the race).
+
+# ---------------------------------------------------------------------------
+# /api/attachments/*, /api/upload-file
+# ---------------------------------------------------------------------------
+#
+# AttachmentResponse is defined in components/schemas/issues-comments.yaml
+# (deduplicated after both domains independently defined it) and
+# referenced here via `$ref: '#/components/schemas/AttachmentResponse'`.
+
+UploadFileDegradedResponse:
+  type: object
+  description: >-
+    server/internal/handler/file.go — two distinct non-`AttachmentResponse`
+    success shapes POST /api/upload-file can return: (1) no workspace
+    context was supplied at all (e.g. avatar upload) — no DB row is ever
+    created; (2) a workspace context was supplied, the object uploaded
+    successfully, but the `CreateAttachment` DB insert itself failed for a
+    reason other than the owning comment disappearing — the handler
+    degrades to 200 with an empty `id` rather than erroring, since the
+    bytes are already durably stored. Both are indistinguishable from this
+    schema alone; `id` empty signals the second case specifically.
+  required: [id, url, filename]
+  properties:
+    id:
+      type: string
+      description: UUIDv7 of the upload, or empty string `""` if the DB row failed to persist.
+    url: { type: string }
+    filename: { type: string }
+
+# ---------------------------------------------------------------------------
+# /api/projects, /api/projects/{id}/resources
+# ---------------------------------------------------------------------------
+
+ProjectResponse:
+  type: object
+  description: >-
+    server/internal/handler/project.go:24-47. Does not embed a resources
+    array or an expanded lead/owner object (`lead_id`/`lead_type` are flat
+    polymorphic reference fields) — clients needing resources call GET
+    /api/projects/{id}/resources separately.
+  required:
+    - id
+    - workspace_id
+    - title
+    - status
+    - priority
+    - created_at
+    - updated_at
+    - issue_count
+    - done_count
+    - resource_count
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    title: { type: string }
+    description: { type: [string, "null"] }
+    icon: { type: [string, "null"] }
+    status:
+      type: string
+      enum: [planned, in_progress, paused, completed, cancelled]
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, none]
+    lead_type: { type: [string, "null"] }
+    lead_id: { type: [string, "null"], format: uuid }
+    start_date:
+      type: [string, "null"]
+      description: Calendar day, `YYYY-MM-DD`, no time/timezone component.
+    due_date:
+      type: [string, "null"]
+      description: Calendar day, `YYYY-MM-DD`.
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+    issue_count: { type: integer, format: int64 }
+    done_count: { type: integer, format: int64 }
+    resource_count: { type: integer, format: int64 }
+
+SearchProjectResponse:
+  type: object
+  description: server/internal/handler/project.go:674-678 (`SearchProjectResponse`).
+  allOf:
+    - $ref: '#/components/schemas/ProjectResponse'
+    - type: object
+      required: [match_source]
+      properties:
+        match_source:
+          type: string
+          enum: [title, description]
+        matched_snippet:
+          type: string
+          description: >-
+            Only present when `match_source` is `description` — a ~120-rune
+            window centered on the match (`extractSnippet`, issue.go:662-688).
+
+GithubRepoRef:
+  type: object
+  description: project_resource.go:88-92, 94-116 (`githubRepoRef` / `validateGithubRepoRef`).
+  required: [url]
+  properties:
+    url:
+      type: string
+      description: Must pass `isValidGitRepoURL` (http/https/ssh/git URL, or `[user@]host:path` scp-shorthand).
+    default_branch_hint:
+      type: string
+    ref:
+      type: string
+      maxLength: 255
+      description: >-
+        Branch/tag/ref name; empty means default branch. Rejects control
+        chars, space, `~^:?*[\`, `..`, `@{`, bare `@`, leading/trailing
+        `/`, `//`, trailing `.`, and segments starting with `.` or ending
+        `.lock` (`validateGitRef`, project_resource.go:430-462).
+
+LocalDirectoryRef:
+  type: object
+  description: project_resource.go:144-149, 274-303 (`localDirectoryRef` / `validateLocalDirectoryRef`).
+  required: [local_path, daemon_id]
+  properties:
+    local_path:
+      type: string
+      description: Must be an absolute path (POSIX `/...`, UNC `\\...`, or drive-letter `C:\`/`C:/`).
+    daemon_id:
+      type: string
+    label:
+      type: string
+    execution_mode:
+      type: string
+      enum: [in_place, worktree]
+      description: Defaults to empty string (treated as `in_place`) when omitted.
+
+CreateProjectResourceRequest:
+  type: object
+  description: >-
+    server/internal/handler/project_resource.go:54-59
+    (`CreateProjectResourceRequest`). Identical shape is reused inline
+    (unnamed in Go) for the bundled `resources[]` array accepted by POST
+    /api/projects (project.go:117-122, `CreateProjectResourceRequestPayload`).
+  required: [resource_type, resource_ref]
+  properties:
+    resource_type:
+      type: string
+      enum: [github_repo, local_directory]
+    resource_ref:
+      description: Shape depends on `resource_type` — see `validateAndNormalizeResourceRef` (project_resource.go:74-86).
+      oneOf:
+        - $ref: '#/components/schemas/GithubRepoRef'
+        - $ref: '#/components/schemas/LocalDirectoryRef'
+    label:
+      type: string
+    position:
+      type: integer
+      format: int32
+      description: Defaults to append-at-end (current resource count) when omitted.
+
+UpdateProjectResourceRequest:
+  type: object
+  description: >-
+    server/internal/handler/project_resource.go:64-68. `resource_type` is
+    immutable and not part of this request at all — `resource_ref` (if
+    provided) is re-validated against the resource's existing
+    `resource_type`. All fields optional; omitted vs. explicit-null is
+    handler-significant (see path description).
+  properties:
+    resource_ref:
+      oneOf:
+        - $ref: '#/components/schemas/GithubRepoRef'
+        - $ref: '#/components/schemas/LocalDirectoryRef'
+    label:
+      type: [string, "null"]
+      description: Explicit `null` or whitespace-only clears the label.
+    position:
+      type: integer
+      format: int32
+
+ProjectResourceResponse:
+  type: object
+  description: server/internal/handler/project_resource.go:23-33.
+  required: [id, project_id, workspace_id, resource_type, resource_ref, position, created_at]
+  properties:
+    id: { type: string, format: uuid }
+    project_id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    resource_type:
+      type: string
+      enum: [github_repo, local_directory]
+    resource_ref:
+      oneOf:
+        - $ref: '#/components/schemas/GithubRepoRef'
+        - $ref: '#/components/schemas/LocalDirectoryRef'
+    label: { type: [string, "null"] }
+    position: { type: integer, format: int32 }
+    created_at: { type: string, format: date-time }
+    created_by: { type: [string, "null"], format: uuid }
+
+CreateProjectRequest:
+  type: object
+  description: server/internal/handler/project.go:101-112 (`CreateProjectRequest`).
+  required: [title]
+  properties:
+    title:
+      type: string
+      description: The only required field.
+    description: { type: string }
+    icon: { type: string }
+    status:
+      type: string
+      enum: [planned, in_progress, paused, completed, cancelled]
+      description: Defaults to `planned` when omitted/empty (project.go:228, `validProjectStatuses`).
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, none]
+      description: Defaults to `none` when omitted/empty (project.go:229, `validProjectPriorities`).
+    lead_type:
+      type: string
+    lead_id:
+      type: string
+      format: uuid
+    start_date:
+      type: string
+      description: '`YYYY-MM-DD` (`util.ParseCalendarDate`).'
+    due_date:
+      type: string
+      description: '`YYYY-MM-DD`.'
+    resources:
+      type: array
+      description: >-
+        Optional bundled resource creation, run in the same transaction as
+        the project (project.go:325-368). A `local_directory` entry with
+        `execution_mode: worktree` additionally requires a registered
+        daemon runtime advertising worktree support — see
+        DaemonVersionUnsupportedError.
+      items:
+        $ref: '#/components/schemas/CreateProjectResourceRequest'
+
+CreateProjectWithResourcesResponse:
+  type: object
+  description: >-
+    server/internal/handler/project.go:462-468. Returned (201) only when
+    `resources[]` was non-empty on the request; described in-code as "a
+    transient creation echo, not a contract for reads" — a bare
+    ProjectResponse is returned instead when no resources were bundled.
+  allOf:
+    - $ref: '#/components/schemas/ProjectResponse'
+    - type: object
+      required: [resources]
+      properties:
+        resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectResourceResponse'
+
+UpdateProjectRequest:
+  type: object
+  description: >-
+    server/internal/handler/project.go:124-134. All fields optional and
+    PATCH-like via raw-field presence detection: for `description`,
+    `icon`, `lead_type`, `lead_id`, `start_date`, `due_date` — omitting the
+    key leaves the column untouched, while sending the key with an
+    explicit `null`/empty value clears it (unconditional overwrite in SQL,
+    not `COALESCE`). `title`/`status`/`priority` use simple non-nil checks
+    instead and can never be cleared to null, only left unchanged or
+    replaced. No revision/optimistic-concurrency field exists on this
+    request — updates are last-write-wins.
+  properties:
+    title: { type: string }
+    description: { type: [string, "null"] }
+    icon: { type: [string, "null"] }
+    status:
+      type: string
+      enum: [planned, in_progress, paused, completed, cancelled]
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, none]
+    lead_type: { type: [string, "null"] }
+    lead_id: { type: [string, "null"], format: uuid }
+    start_date: { type: [string, "null"], description: '`YYYY-MM-DD`, or null/empty to clear.' }
+    due_date: { type: [string, "null"], description: '`YYYY-MM-DD`, or null/empty to clear.' }
+
+DaemonVersionUnsupportedError:
+  type: object
+  description: >-
+    422 body written directly via `writeJSON` (not `writeError`/`writeErrorCode`)
+    by `requireWorktreeCapableDaemon` (project_resource.go:193-201), when a
+    `local_directory` resource requests `execution_mode: worktree` but no
+    registered runtime for that `daemon_id` currently advertises the
+    `DaemonCapabilityLocalWorktreeV1` capability. Not part of the shared
+    `ErrorCode` enum (carries extra structured fields it doesn't model).
+  required: [error, code, current_version, min_version, daemon_id]
+  properties:
+    error: { type: string }
+    code:
+      type: string
+      const: daemon_version_unsupported
+    current_version: { type: string }
+    min_version: { type: string }
+    daemon_id: { type: string, format: uuid }
+
+# ---------------------------------------------------------------------------
+# /api/share-links/{code}, /api/share-links/join
+# ---------------------------------------------------------------------------
+
+ShareLinkInfoResponse:
+  type: object
+  description: >-
+    server/internal/handler/share_link.go:229-234. Public preview — does
+    NOT expose `workspace_id`, the link `code`/`id` itself, the inviter's
+    email, `expires_at`, or usage-count/limit (confirmed absent from both
+    the SQL projection and this struct, not merely omitted by convention).
+  required: [workspace_name, workspace_slug, role]
+  properties:
+    workspace_name: { type: string }
+    workspace_slug: { type: string }
+    creator_name:
+      type: string
+      description: Inviter's display name (never email).
+    role:
+      type: string
+      description: Role the link grants on join, e.g. `admin` or `member`.
+
+JoinByShareLinkRequest:
+  type: object
+  description: >-
+    server/internal/handler/share_link.go:54-56. The code is taken
+    exclusively from this body field — this endpoint has no `{code}` path
+    parameter (unlike GET /api/share-links/{code}).
+  required: [code]
+  properties:
+    code:
+      type: string
+
+ShareLinkJoinResponse:
+  type: object
+  description: >-
+    server/internal/handler/share_link.go:452-456 — an inline map, not a
+    named Go struct. Status 200 (not 201) despite creating a new
+    membership.
+  required: [member, workspace_id, workspace_slug]
+  properties:
+    member:
+      type: object
+      description: >-
+        `MemberWithUserResponse` (server/internal/handler/workspace.go:499-508).
+        Documented inline here (rather than as a shared top-level
+        component) to avoid a naming collision with the workspaces domain
+        ticket, which owns and will define this type's canonical home.
+      required: [id, workspace_id, user_id, role, created_at, name, email]
+      properties:
+        id: { type: string, format: uuid }
+        workspace_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        role: { type: string }
+        created_at: { type: string, format: date-time }
+        name: { type: string }
+        email: { type: string, format: email }
+        avatar_url: { type: [string, "null"] }
+    workspace_id:
+      type: string
+      format: uuid
+    workspace_slug:
+      type: string
+      description: >-
+        Empty string `""` if the post-commit workspace-slug lookup itself
+        failed — that failure is swallowed, not surfaced as an error
+        (share_link.go:429-436).
+
+# ---------------------------------------------------------------------------
+# /api/webhooks/* — inbound, provider/trigger-authenticated (not Multica auth)
+# ---------------------------------------------------------------------------
+
+AutopilotWebhookAcceptedResponse:
+  type: object
+  description: server/internal/handler/autopilot_webhook.go — admitted normally.
+  required: [status, delivery_id]
+  properties:
+    status: { type: string, const: accepted }
+    delivery_id: { type: string, format: uuid }
+    run_id: { type: string, format: uuid }
+    autopilot_id: { type: string, format: uuid }
+    trigger_id: { type: string, format: uuid }
+
+AutopilotWebhookIgnoredResponse:
+  type: object
+  description: >-
+    Reasons observed in source: `trigger_disabled`, `autopilot_archived`,
+    `autopilot_paused`, `event_filtered` (with an additional `event`
+    field), or quota exhaustion (`reason_code: quota_exceeded` instead of
+    `reason`).
+  required: [status, delivery_id]
+  properties:
+    status: { type: string, const: ignored }
+    delivery_id: { type: string, format: uuid }
+    reason: { type: string }
+    reason_code: { type: string }
+    event: { type: string }
+
+AutopilotWebhookSkippedResponse:
+  type: object
+  description: The autopilot service itself skipped the run (e.g. runtime offline).
+  required: [status, delivery_id]
+  properties:
+    status: { type: string, const: skipped }
+    delivery_id: { type: string, format: uuid }
+    run_id: { type: string, format: uuid }
+    reason: { type: string }
+
+AutopilotWebhookDuplicateResponse:
+  type: object
+  description: Dedupe-key (`X-GitHub-Delivery` or `Idempotency-Key`) collision with a previously accepted delivery.
+  required: [status, delivery_id]
+  properties:
+    status: { type: string, const: duplicate }
+    delivery_id: { type: string, format: uuid }
+    run_id: { type: string, format: uuid }
+
+AutopilotWebhookRejectedResponse:
+  type: object
+  description: 401 — HMAC signature missing/invalid for a trigger that has a signing secret configured.
+  required: [status, delivery_id, reason]
+  properties:
+    status: { type: string, const: rejected }
+    delivery_id: { type: string, format: uuid }
+    reason:
+      type: string
+      enum: [invalid_signature, missing_signature]
+
+# Note: the raw inbound body for POST /api/webhooks/autopilots/{token} is
+# normalized server-side into an internal `WebhookEnvelope` wrapper
+# (`{event, eventPayload, request}`, autopilot_webhook.go) before storage —
+# that shape is NOT what the caller sends (the caller POSTs raw
+# provider-defined JSON directly) and is not modeled here as a schema since
+# nothing in this domain's request/response contract ever serializes it.

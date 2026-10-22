@@ -1,0 +1,17 @@
+# Reusable response components for the issues/comments domain.
+# "responses" is a real OpenAPI components bucket the merge script
+# recognizes from the directory name.
+
+Unauthorized:
+  description: 'No authenticated user resolvable from the request (missing/invalid token or session). Body: `{"error": "user not authenticated"}`.'
+  content:
+    application/json:
+      schema:
+        $ref: '#/components/schemas/Error'
+
+IssueNotFound:
+  description: 'The `id` path param does not resolve (as a UUID or `PREFIX-NUMBER` identifier) to an issue in the caller''s workspace. Body: `{"error": "issue not found"}`.'
+  content:
+    application/json:
+      schema:
+        $ref: '#/components/schemas/Error'

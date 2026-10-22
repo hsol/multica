@@ -1,0 +1,1488 @@
+# Domain: agents core — /api/agents CRUD/lifecycle, agent task
+# history, agent<->label attach/detach, agent DingTalk group presence, and the
+# workspace-wide agent/task aggregations (activity-30d, run-counts,
+# task-snapshot, working-agents, assignee-frequency) plus the two user-facing
+# task endpoints that sit alongside them (/api/tasks/{taskId}/messages,
+# /api/tasks/{taskId}/cancel). Source: server/internal/handler/agent.go,
+# agent_access.go, agent_permission.go, agent_runtime_skills.go, dingtalk.go,
+# label.go, activity.go, daemon.go, chat.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+#
+# This file's directory (components/schemas/) is what the merge script reads
+# to place every top-level key here into components.schemas; the filename
+# itself is not load-bearing.
+
+# ---------------------------------------------------------------------------
+# Agent resource
+# ---------------------------------------------------------------------------
+
+AgentConversationStarter:
+  type: object
+  description: >-
+    One agent-specific first-turn chat suggestion. server/internal/handler/agent.go:47-50.
+    An empty conversation_starters list on the agent tells clients to render
+    their own localized fallback prompts instead.
+  required: [label, prompt]
+  properties:
+    label:
+      type: string
+      description: 'At most 80 Unicode code points (maxAgentConversationStarterLabel, agent.go:43).'
+    prompt:
+      type: string
+      description: 'At most 4000 Unicode code points (maxAgentConversationStarterLength, agent.go:44).'
+  additionalProperties: false
+
+AgentInvocationTargetDTO:
+  type: object
+  description: >-
+    One entry in a public_to agent's invocation allow-list (MUL-3963).
+    server/internal/handler/agent_permission.go:13-20. Only present /
+    meaningful when the owning agent's permission_mode is "public_to"; absent
+    (empty array) for a private agent.
+  required: [target_type]
+  properties:
+    target_type:
+      type: string
+      enum: [workspace, member, team]
+      description: >-
+        "team" is a reserved placeholder — team membership does not exist yet
+        in V1, so a team target currently admits no one
+        (memberHitsInvocationTargets, agent_access.go:173-185).
+    target_id:
+      type: string
+      format: uuid
+      nullable: true
+      description: >-
+        Null only for a team placeholder a client omitted. Always present for
+        "workspace" (the workspace id) and "member" (the target user id) rows
+        persisted by the backend.
+  additionalProperties: false
+
+DisabledRuntimeSkill:
+  type: object
+  description: >-
+    One runtime-local skill this agent must NOT inherit, scoped to a single
+    runtime + provider pair (a same-named skill on another runtime is
+    unaffected). server/internal/handler/agent_runtime_skills.go:19-29.
+  required: [runtime_id, provider, root, key]
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+    provider:
+      type: string
+    root:
+      type: string
+    key:
+      type: string
+      description: 'At most 512 characters (maxRuntimeSkillKeyLength, agent_runtime_skills.go:17).'
+    name:
+      type: string
+    plugin:
+      type: string
+  additionalProperties: false
+
+AgentSkillSummary:
+  type: object
+  description: >-
+    The narrow skill shape embedded directly on an AgentResponse
+    (`GET /api/agents`, `GET /api/agents/{id}`) — only enough to render an
+    assignee chip. server/internal/handler/skill.go:82-92. The standalone
+    `/api/agents/{id}/skills` endpoint (a different domain ticket) returns the
+    fuller SkillSummaryResponse with source/origin info; that shape is not
+    this one.
+  required: [id, name, description, enabled]
+  properties:
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    description:
+      type: string
+    enabled:
+      type: boolean
+  additionalProperties: false
+
+AgentResponse:
+  type: object
+  description: >-
+    server/internal/handler/agent.go:52-142 (`AgentResponse`), built by
+    `agentToResponse` (agent.go:153-244). Returned by
+    GET/POST /api/agents, GET/PUT /api/agents/{id}, and
+    POST /api/agents/{id}/archive|restore.
+
+
+    `custom_env` is intentionally NEVER part of this shape (MUL-2600) — only
+    coarse `has_custom_env` / `custom_env_key_count` metadata travels here;
+    reading values requires the dedicated, audited `GET /api/agents/{id}/env`
+    (a different domain ticket). `mcp_config` and
+    `composio_toolkit_allowlist` ARE secret/privacy-sensitive fields that DO
+    travel on this shape, but are redacted to null/empty + a `*_redacted`
+    flag for callers who are not authorized to see them — see the per-field
+    notes below and the handler-level redaction helpers
+    (`redactMcpConfig`, `redactComposioToolkitAllowlist`,
+    `suppressComposioToolkitAllowlist`, agent.go:1779-1805).
+  required:
+    - id
+    - workspace_id
+    - runtime_id
+    - runtime_bound
+    - name
+    - description
+    - instructions
+    - conversation_starters
+    - avatar_url
+    - runtime_mode
+    - runtime_config
+    - custom_args
+    - mcp_config
+    - has_custom_env
+    - custom_env_key_count
+    - mcp_config_redacted
+    - visibility
+    - permission_mode
+    - invocation_targets
+    - status
+    - max_concurrent_tasks
+    - model
+    - thinking_level
+    - service_tier
+    - owner_id
+    - skills
+    - disabled_runtime_skills
+    - created_at
+    - updated_at
+    - archived_at
+    - archived_by
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    runtime_id:
+      type: string
+      description: >-
+        Empty string when the agent is unbound (its runtime was deleted; it
+        kept its configuration/history and needs a new runtime before it can
+        run again, MUL-5559). Branch on `runtime_bound`, not on this being
+        falsy — an unbound agent is a different story from a bound-but-
+        offline runtime.
+    runtime_bound:
+      type: boolean
+      description: 'False exactly when the agent has no runtime (see runtime_id).'
+    runtime_availability:
+      type: string
+      enum: [online, unstable, offline]
+      description: >-
+        Coarse liveness projection for a runtime HIDDEN from the caller's own
+        runtime list (a private runtime the caller doesn't own, seen only by
+        a non-owner/non-admin member). Carries no timestamp, device, owner,
+        configuration, or credential. Omitted when the caller's runtime list
+        already contains the full row (workspace owner/admin, or the
+        runtime's own owner), or when the agent is archived or has no bound
+        runtime. See `loadAgentRuntimeAvailability` (agent.go:1063-1107) and
+        `deriveRuntimeAvailability` (squad.go:591-609).
+    name:
+      type: string
+    description:
+      type: string
+      description: 'At most 255 Unicode code points (maxAgentDescriptionLength, agent.go:39).'
+    instructions:
+      type: string
+      description: >-
+        What this agent's OWNER wrote. For a system agent (non-empty
+        system_key) this holds only the workspace's own notes — the product
+        half of the prompt lives in system_instructions and is never stored
+        on this row.
+    conversation_starters:
+      type: array
+      items: { $ref: '#/components/schemas/AgentConversationStarter' }
+      description: 'At most 3 entries (maxAgentConversationStarters, agent.go:42).'
+    system_key:
+      type: string
+      description: >-
+        Identifies a product-defined agent (e.g. "mika"). Omitted for every
+        user- or template-created agent. The UI keys "this is maintained by
+        Multica" off THIS field, not the display name, which an owner may
+        rename.
+    system_instructions:
+      type: string
+      description: >-
+        Read-only product half of a system agent's prompt, filled from the
+        server binary. Omitted for an ordinary (non-system) agent.
+    avatar_url:
+      type: string
+      nullable: true
+    runtime_mode:
+      type: string
+      enum: [local, cloud]
+      description: 'migrations/001_init.up.sql:41 CHECK constraint.'
+    runtime_config:
+      description: >-
+        Free-form JSON, provider-specific. When `runtime_config.gateway.token`
+        (openclaw gateway mode, issue #3260) is non-empty it is ALWAYS masked
+        to the literal string `"***"` on every read
+        (`maskGatewayToken`, agent.go:151, 249-263) — the real value is never
+        returned once set. Submitting the mask verbatim back on a PUT
+        restores the persisted token instead of overwriting it with the
+        literal mask (`preserveMaskedGatewayToken`, agent.go:265-300).
+      nullable: true
+    custom_args:
+      type: array
+      items: { type: string }
+    mcp_config:
+      description: >-
+        Free-form JSON (MCP server config), or null. May contain secrets
+        (third-party API tokens). Redacted to `null` (with
+        `mcp_config_redacted: true`) unless the caller is the agent owner or
+        a workspace owner/admin (`canViewAgentSecrets`, agent.go:1739-1744)
+        — and even then, an AGENT actor (another agent's task token) NEVER
+        sees it regardless of its host's role, to close an A2A
+        lateral-movement vector (agent.go:1199-1206, 1278-1285). A
+        workspace with `settings.always_redact_env: true` (legacy JSON key
+        name, agent.go:1710-1731) redacts it unconditionally for everyone.
+      nullable: true
+    has_custom_env:
+      type: boolean
+      description: 'True when the agent has at least one custom_env key set. The values themselves never travel on this shape (MUL-2600).'
+    custom_env_key_count:
+      type: integer
+    mcp_config_redacted:
+      type: boolean
+      description: 'True when mcp_config exists on the row but was redacted for this caller (see mcp_config above).'
+    visibility:
+      type: string
+      enum: [private, workspace]
+      description: >-
+        Legacy two-value field, DERIVED from permission_mode + invocation
+        targets so an old client never observes a widening
+        (`deriveLegacyVisibility`, agent_permission.go:31-43): "workspace"
+        only when permission_mode is public_to AND one of its targets is the
+        workspace itself; "private" for everything else (including a
+        public_to agent scoped only to specific members/teams). Prefer
+        permission_mode + invocation_targets for anything beyond legacy
+        client compatibility.
+    permission_mode:
+      type: string
+      enum: [private, public_to]
+      description: >-
+        Authoritative invocation-permission mode (MUL-3963). "private" =
+        owner only. "public_to" = governed by invocation_targets.
+    invocation_targets:
+      type: array
+      items: { $ref: '#/components/schemas/AgentInvocationTargetDTO' }
+      description: >-
+        The public_to allow-list. Empty for a private agent. Only populated
+        on the detail / list / create / update responses that load it
+        (every operation in this file that returns AgentResponse does);
+        a WebSocket broadcast copy of this same shape leaves it empty.
+    status:
+      type: string
+      enum: [idle, working, blocked, error, offline]
+      description: >-
+        migrations/001_init.up.sql:44 CHECK constraint (original definition;
+        not re-verified against every later migration for a possible
+        constraint change, since none was found referencing an
+        `agent_status_check` rename). Reconciled by
+        `TaskService.ReconcileAgentStatus` as tasks dispatch/complete.
+    max_concurrent_tasks:
+      type: integer
+      format: int32
+      description: 'Between 1 and 50 inclusive (agentconfig.MinMaxConcurrentTasks/MaxMaxConcurrentTasks); default 6 (agentconfig.DefaultMaxConcurrentTasks).'
+    model:
+      type: string
+      description: 'Runtime-native model id. Empty string means the runtime''s own default.'
+    thinking_level:
+      type: string
+      description: >-
+        Runtime-native reasoning/effort token (MUL-2339). Empty = use runtime
+        default. The picker is per-runtime per-model; the API never
+        normalizes across providers.
+    service_tier:
+      type: string
+      description: 'Runtime-native Codex execution tier. Empty = inherit local Codex configuration.'
+    composio_toolkit_allowlist:
+      type: array
+      items: { type: string }
+      nullable: true
+      description: >-
+        The subset of Composio toolkit slugs this agent may mount as MCP at
+        task dispatch, using the agent OWNER's Composio connection
+        (MUL-3963). Owner-only read: redacted to `null` (with
+        `composio_toolkit_allowlist_redacted: true`) for every caller other
+        than the agent owner, and suppressed entirely (both fields
+        omitted/false) when the composio-MCP-apps feature is disabled for
+        the workspace — unlike mcp_config, workspace owner/admin do NOT
+        bypass this gate (agent.go:1216-1220, 1288-1292, 2329-2333). Null
+        means the column has never been configured; an empty array means the
+        owner explicitly cleared every toolkit — both are treated as "no
+        overlay" by dispatch, but are kept distinguishable here for the
+        owner's own UI.
+    composio_toolkit_allowlist_redacted:
+      type: boolean
+    owner_id:
+      type: string
+      format: uuid
+      nullable: true
+    skills:
+      type: array
+      items: { $ref: '#/components/schemas/AgentSkillSummary' }
+    disabled_runtime_skills:
+      type: array
+      items: { $ref: '#/components/schemas/DisabledRuntimeSkill' }
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+    archived_at:
+      type: string
+      format: date-time
+      nullable: true
+    archived_by:
+      type: string
+      format: uuid
+      nullable: true
+  additionalProperties: false
+
+CreateAgentRequest:
+  type: object
+  description: >-
+    server/internal/handler/agent.go:1297-1334 (`CreateAgentRequest`), read by
+    `CreateAgent` (agent.go:1383-1654). `template` and `skill_ids` are
+    create-only inputs with no corresponding AgentResponse field.
+  required: [name, runtime_id]
+  properties:
+    name:
+      type: string
+      description: 'Required, non-empty. Unique per (workspace_id, name) including archived agents — a 409 on collision.'
+    description:
+      type: string
+      description: 'At most 255 Unicode code points.'
+    instructions:
+      type: string
+    conversation_starters:
+      type: array
+      items: { $ref: '#/components/schemas/AgentConversationStarter' }
+    avatar_url:
+      type: string
+      nullable: true
+      description: >-
+        Omitted/empty assigns a random emoji avatar
+        (`randomAgentEmojiAvatar`, agent_avatar.go:20-26). A value pointing
+        at a storage object must be a standalone image upload, not a file
+        already attached to an issue/comment/chat (`acceptAvatarURL`,
+        avatar.go:254-271).
+    runtime_id:
+      type: string
+      format: uuid
+      description: 'Required. Must resolve to a runtime in this workspace; must be public or owned by the caller (canUseRuntimeForAgent).'
+    runtime_config:
+      nullable: true
+    custom_env:
+      type: object
+      additionalProperties: { type: string }
+      nullable: true
+      description: 'Write-only on create (never echoed back on this or any later GET — see AgentResponse). Omitted/null stores `{}`.'
+    custom_args:
+      type: array
+      items: { type: string }
+      nullable: true
+    mcp_config:
+      nullable: true
+    visibility:
+      type: string
+      enum: [private, workspace]
+      description: 'Legacy input, mapped to permission_mode when permission_mode is absent. Defaults to "private" when both are omitted.'
+    permission_mode:
+      type: string
+      enum: [private, public_to]
+      nullable: true
+      description: 'Authoritative over visibility when present (MUL-3963).'
+    invocation_targets:
+      type: array
+      items: { $ref: '#/components/schemas/AgentInvocationTargetDTO' }
+      description: 'A public_to request with no resolvable targets is normalised to a single workspace target (agent_permission.go:178-185).'
+    max_concurrent_tasks:
+      type: integer
+      format: int32
+      description: 'Omitted/null defaults to 6 (agentconfig.DefaultMaxConcurrentTasks); otherwise must be between 1 and 50.'
+    model:
+      type: string
+    thinking_level:
+      type: string
+      description: 'Validated against the target runtime''s provider (fixed enum, or dynamic-catalog token syntax for Codex/OpenCode/ACP-catalog providers).'
+    service_tier:
+      type: string
+      description: 'Validated against agent.IsKnownServiceTier(provider, value).'
+    composio_toolkit_allowlist:
+      type: array
+      items: { type: string }
+      nullable: true
+      description: 'Normalised (trimmed, lowercased, deduped) before persisting. Accepted unconditionally on create — the caller is always the owner.'
+    template:
+      type: string
+      description: 'Creation-source attribution for the agent_created analytics event (e.g. "agent_builder"). Empty = manually authored.'
+    skill_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: 'Attached in the same transaction as the agent row; each id must belong to a skill in this workspace.'
+  additionalProperties: false
+
+UpdateAgentRequest:
+  type: object
+  description: >-
+    server/internal/handler/agent.go:1656-1708 (`UpdateAgentRequest`), read by
+    `UpdateAgent` (agent.go:1882-2335). Every field is an optional pointer —
+    omit a field to leave it unchanged. Several fields are tri-state (omit /
+    explicit-null / explicit-value); those are called out per field.
+    `custom_env` is REJECTED with 400 if present at all — see the operation's
+    400 response.
+  properties:
+    name:
+      type: string
+    description:
+      type: string
+      description: 'At most 255 Unicode code points.'
+    instructions:
+      type: string
+    conversation_starters:
+      type: array
+      items: { $ref: '#/components/schemas/AgentConversationStarter' }
+    avatar_url:
+      type: string
+      nullable: true
+    runtime_id:
+      type: string
+      format: uuid
+      description: >-
+        Moving an agent across provider families with no explicit `model`
+        clears a model incompatible with the new provider
+        (`agent.ModelKnownIncompatibleWithProvider`) rather than carrying over
+        an obviously foreign model id.
+    runtime_config:
+      nullable: true
+      description: 'Submitting the literal gateway-token mask string restores the previously persisted token (see AgentResponse.runtime_config).'
+    custom_args:
+      type: array
+      items: { type: string }
+      nullable: true
+    mcp_config:
+      nullable: true
+      description: 'Tri-state: omit = unchanged, JSON `null` = clear (ClearAgentMcpConfig), any other value = replace.'
+    visibility:
+      type: string
+      enum: [private, workspace]
+      nullable: true
+      description: 'Legacy input; see permission_mode. Owner-only write (see permission_mode note).'
+    permission_mode:
+      type: string
+      enum: [private, public_to]
+      nullable: true
+      description: >-
+        OWNER-ONLY write. A non-owner (even a workspace admin, who otherwise
+        passes the general manage-agent gate) submitting a permission_mode /
+        invocation_targets / visibility that would actually CHANGE the
+        current permission is rejected with 403; a no-op resubmit of the
+        unchanged value is silently tolerated (PATCH-as-PUT compatibility).
+    invocation_targets:
+      type: array
+      items: { $ref: '#/components/schemas/AgentInvocationTargetDTO' }
+      nullable: true
+      description: 'Same owner-only gate as permission_mode. Replaced wholesale when the owner touches permission.'
+    status:
+      type: string
+      enum: [idle, working, blocked, error, offline]
+      nullable: true
+    max_concurrent_tasks:
+      type: integer
+      format: int32
+      nullable: true
+      description: 'Must be between 1 and 50 when present.'
+    model:
+      type: string
+      nullable: true
+    thinking_level:
+      type: string
+      nullable: true
+      description: >-
+        Tri-state (MUL-2339): omitted = no change; present `""` = explicit
+        clear (runtime default); present non-empty = set, validated against
+        the (possibly just-changed) target runtime's provider. A thinking
+        level with no pinned model is rejected for runtimes that resolve
+        their own default model out of sight
+        (`agent.ThinkingLevelRejectedWithoutModel`), so the pairing with
+        `model` is checked on the EFFECTIVE post-update state, not just this
+        request's own fields.
+    service_tier:
+      type: string
+      nullable: true
+      description: 'Same tri-state contract as thinking_level: omit preserves, "" clears, non-empty sets and is validated against the target runtime''s provider.'
+    composio_toolkit_allowlist:
+      type: array
+      items: { type: string }
+      nullable: true
+      description: >-
+        Tri-state (MUL-3869): omit = no change; JSON `null` = explicit clear;
+        array (including empty) = wholesale replace, normalised (trimmed,
+        lowercased, deduped). OWNER-ONLY write — a non-owner's (including
+        admin's) attempt is silently dropped (not rejected), consistent with
+        permission_mode being the owner's exclusive say over who/what may use
+        their connection.
+  additionalProperties: false
+
+CancelAgentTasksResponse:
+  type: object
+  description: server/internal/handler/agent.go:2651-2653 (`cancelAgentTasksResponse`).
+  required: [cancelled]
+  properties:
+    cancelled:
+      type: integer
+      description: 'Count of tasks (queued/dispatched/running) that were cancelled by this call.'
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Agent task history (AgentTaskResponse) and its nested shapes
+# ---------------------------------------------------------------------------
+#
+# AgentTaskResponse (agent.go:360-567) is shared wire shape between the
+# user-facing endpoints documented in this file (which populate it via the
+# PURE `taskToResponse`, agent.go:798-877) and the daemon task-claim endpoint
+# (a different domain ticket), which builds a much richer instance of the
+# SAME struct field-by-field with claim-only context (brief text, repos,
+# project resources, auth token, etc). This file documents every field the
+# Go struct carries (per this ticket's scope), but marks each field either
+# "populated here" (set by taskToResponse) or "claim-only" (always
+# absent/omitempty on every operation in this file — only ever set by the
+# daemon claim path).
+
+TaskCancellationActor:
+  type: object
+  description: >-
+    Point-in-time actor snapshot attached to a cancelled task.
+    server/internal/handler/agent.go:351-358. Populated by
+    `taskCancellationActorToResponse` (agent.go:879-891) only when the task's
+    status is "cancelled" and a cancelled-by type was recorded.
+  required: [type]
+  properties:
+    type:
+      type: string
+      description: 'Current producers emit member, agent, or system; the type stays open for forward compatibility.'
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+  additionalProperties: false
+
+# NOTE on TaskAttribution: this type (server/internal/handler/agent.go:569-592)
+# is already a top-level component defined by the issues-comments domain
+# ticket (components/schemas/issues-comments.yaml), whose own comment there
+# says it is a deliberately PARTIAL stub ("canonical/complete shape belongs
+# to the agents domain") — i.e. this ticket. A hard collision: the merge
+# script errors on a duplicate top-level key regardless of which file
+# defines it, and this ticket's instructions forbid editing any file outside
+# paths/agents/core.yaml and this one. We therefore do NOT redefine
+# TaskAttribution here — AgentTaskResponse.attribution below references the
+# EXISTING (partial) `#/components/schemas/TaskAttribution`, whose
+# initiator/originator/evidence are untyped objects rather than the precise
+# AttributionUser/TaskEvidence shapes this ticket could otherwise provide.
+# Flagged for the orchestrator: someone needs to either move the canonical
+# definition into this file and delete the issues-comments stub, or
+# explicitly assign ownership so this cross-domain collision doesn't
+# reappear. See this file's end-of-task report for the same flag.
+
+TaskUsageData:
+  type: object
+  description: >-
+    One (provider, model) slice of a single run's token usage.
+    server/internal/handler/agent.go:736-754. Field names match the
+    runtime/dashboard usage rows exactly so the client can feed this straight
+    to its existing cost-estimation helpers. Populated on
+    `GET /api/agents/{id}/tasks` only when `include_usage=true`; absent
+    everywhere else in this file (nil and `[]` both mean "no usage recorded"
+    — the UI renders an em dash for both, not a zero).
+  required: [model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens]
+  properties:
+    provider:
+      type: string
+    model:
+      type: string
+    input_tokens:
+      type: integer
+      format: int64
+    output_tokens:
+      type: integer
+      format: int64
+    cache_read_tokens:
+      type: integer
+      format: int64
+    cache_write_tokens:
+      type: integer
+      format: int64
+    cost_usd_ticks:
+      type: integer
+      format: int64
+      nullable: true
+      description: >-
+        The provider's own price for these tokens, in units of 1e-10 USD.
+        Null (not zero) when the provider reported no cost at all — the
+        client then estimates this slice from its own rate table; an actual
+        0 is a real answer ("the provider says this was free").
+  additionalProperties: false
+
+ChatAttachmentMeta:
+  type: object
+  description: >-
+    Structured attachment metadata for a chat task's triggering message.
+    server/internal/handler/agent.go:711-715. CLAIM-ONLY — never populated
+    on any operation documented in this file (`taskToResponse` does not set
+    `chat_message_attachments`).
+  required: [id, filename]
+  properties:
+    id:
+      type: string
+      format: uuid
+    filename:
+      type: string
+    content_type:
+      type: string
+  additionalProperties: false
+
+CoalescedCommentData:
+  type: object
+  description: >-
+    Full detail of a comment folded into a not-yet-started run (MUL-4195).
+    server/internal/handler/agent.go:727-734. CLAIM-ONLY — never populated on
+    any operation documented in this file.
+  required: [id]
+  properties:
+    id:
+      type: string
+      format: uuid
+    thread_id:
+      type: string
+      format: uuid
+    author_type:
+      type: string
+    author_name:
+      type: string
+    content:
+      type: string
+  additionalProperties: false
+
+RepoData:
+  type: object
+  description: >-
+    Repository info for daemon worktree setup. server/internal/handler/agent.go:304-308.
+    CLAIM-ONLY — never populated on any operation documented in this file.
+  required: [url]
+  properties:
+    url:
+      type: string
+    description:
+      type: string
+    ref:
+      type: string
+  additionalProperties: false
+
+ProjectResourceData:
+  type: object
+  description: >-
+    One project resource included in a claim response (resource_ref is
+    type-specific JSON, e.g. a github_repo url). server/internal/handler/agent.go:317-322.
+    CLAIM-ONLY — never populated on any operation documented in this file.
+  required: [id, resource_type, resource_ref]
+  properties:
+    id:
+      type: string
+      format: uuid
+    resource_type:
+      type: string
+    resource_ref: {}
+    label:
+      type: string
+  additionalProperties: false
+
+TaskIssueStatusData:
+  type: object
+  description: >-
+    One active CUSTOM workspace status in the agent brief catalog
+    (MUL-6460). server/internal/handler/agent.go:344-349. CLAIM-ONLY — never
+    populated on any operation documented in this file.
+  required: [key, name, category]
+  properties:
+    key:
+      type: string
+    name:
+      type: string
+    category:
+      type: string
+    description:
+      type: string
+  additionalProperties: false
+
+TaskAgentData:
+  type: object
+  description: >-
+    Agent info embedded in a claim response so the daemon can set up its
+    execution environment. server/internal/handler/agent.go:756-777.
+    CLAIM-ONLY — the `agent` field on AgentTaskResponse is never populated by
+    any operation documented in this file; nested shapes (skills,
+    skill_refs, custom_env, runtime_config) are intentionally not modeled
+    further here as they are out of this ticket's scope (daemon claim is a
+    different domain ticket).
+  properties:
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    instructions:
+      type: string
+    skills:
+      type: array
+      items: {}
+    skill_refs:
+      type: array
+      items: {}
+    custom_env:
+      type: object
+      additionalProperties: { type: string }
+    custom_args:
+      type: array
+      items: { type: string }
+    mcp_config: {}
+    model:
+      type: string
+    thinking_level:
+      type: string
+    service_tier:
+      type: string
+    disabled_runtime_skills:
+      type: array
+      items: { $ref: '#/components/schemas/DisabledRuntimeSkill' }
+    runtime_config: {}
+  additionalProperties: false
+
+AgentTaskResponse:
+  type: object
+  description: >-
+    server/internal/handler/agent.go:360-567 (`AgentTaskResponse`). This
+    ticket owns the canonical, complete definition of this schema (a sibling
+    ticket for issues/comments defines its own narrower `IssueTaskResponse`
+    for a different endpoint and does not define this one). Returned by
+    `GET /api/agents/{id}/tasks`, `GET /api/agent-task-snapshot`, and (nested
+    under CancelTaskByUserResponse) `POST /api/tasks/{taskId}/cancel` — all
+    three populate it via the pure `taskToResponse` (agent.go:798-877), which
+    sets only a subset of the struct's fields. Every field below is
+    documented; fields the three operations in this file never populate are
+    marked CLAIM-ONLY (they are set only by the daemon task-claim endpoint, a
+    different domain ticket, which builds this same struct directly rather
+    than through taskToResponse).
+  required:
+    - id
+    - agent_id
+    - runtime_id
+    - issue_id
+    - workspace_id
+    - status
+    - priority
+    - dispatched_at
+    - started_at
+    - completed_at
+    - result
+    - error
+    - attempt
+    - max_attempts
+    - delivered_comment_ids
+    - created_at
+    - kind
+  properties:
+    start_claim_supported:
+      type: boolean
+      description: 'CLAIM-ONLY.'
+    cancelled_by_comment_change:
+      type: boolean
+      description: >-
+        True when this task's "cancelled" status was caused by the triggering
+        comment changing before the run started. Task-scoped: does not
+        survive onto a copied retry context.
+    cancelled_by:
+      allOf: [{ $ref: '#/components/schemas/TaskCancellationActor' }]
+      nullable: true
+    id:
+      type: string
+      format: uuid
+    agent_id:
+      type: string
+      format: uuid
+    runtime_id:
+      type: string
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+      description: 'Empty string for an issue-less task (e.g. a pre-link quick-create or a run_only autopilot task).'
+    workspace_id:
+      type: string
+      format: uuid
+      description: 'Threaded in by the caller (the row itself has no workspace_id column); resolved once per request.'
+    workspace_slug:
+      type: string
+      description: 'CLAIM-ONLY.'
+    issue_identifier:
+      type: string
+      description: 'CLAIM-ONLY.'
+    remote_mcp_connections:
+      type: array
+      items: {}
+      description: 'CLAIM-ONLY. Daemon-facing Remote MCP connection metadata; see server/pkg/remotemcp/types.go (out of this ticket''s scope).'
+    plugin_hook_tools:
+      type: array
+      items: {}
+      description: 'CLAIM-ONLY. Workspace agent-trigger plugin hooks rendered as MCP tools; see server/internal/service/plugin_agent_tools.go (out of this ticket''s scope).'
+    remote_mcp_daemon_token:
+      type: string
+      description: 'CLAIM-ONLY. Short-lived, workspace-and-daemon scoped credential for the local daemon''s Remote MCP broker; never injected into the agent process.'
+    workspace_context:
+      type: string
+      description: 'CLAIM-ONLY. The workspace-level system prompt (workspace.context column).'
+    issue_statuses:
+      type: array
+      items: { $ref: '#/components/schemas/TaskIssueStatusData' }
+      description: 'CLAIM-ONLY (MUL-6460). Capped at 30 entries server-side; see issue_statuses_omitted.'
+    issue_statuses_omitted:
+      type: integer
+      description: 'CLAIM-ONLY. Count of active custom statuses dropped by the 30-entry cap.'
+    thread_name:
+      type: string
+      description: 'CLAIM-ONLY. Semantic title for provider-native session/thread history.'
+    status:
+      type: string
+      description: >-
+        e.g. queued, dispatched, running, waiting_local_directory, completed,
+        failed, cancelled, deferred — not independently re-enumerated against
+        the full agent_task_queue CHECK constraint for this ticket.
+    priority:
+      type: integer
+      format: int32
+    dispatched_at:
+      type: string
+      format: date-time
+      nullable: true
+    started_at:
+      type: string
+      format: date-time
+      nullable: true
+    completed_at:
+      type: string
+      format: date-time
+      nullable: true
+    result:
+      nullable: true
+      description: 'Free-form JSON, whatever the task''s result payload holds.'
+    error:
+      type: string
+      nullable: true
+    failure_reason:
+      type: string
+      description: 'See TaskService.MaybeRetryFailedTask.'
+    attempt:
+      type: integer
+      format: int32
+    max_attempts:
+      type: integer
+      format: int32
+    parent_task_id:
+      type: string
+      format: uuid
+      nullable: true
+    is_leader_task:
+      type: boolean
+    leader_role_resolved:
+      type: boolean
+      description: >-
+        CLAIM-ONLY capability flag, always true when sent: tells the daemon
+        it may trust is_leader_task/squad_id rather than inferring the
+        leader role from briefing text (a pre-#4951 server sent neither).
+    agent:
+      allOf: [{ $ref: '#/components/schemas/TaskAgentData' }]
+      description: 'CLAIM-ONLY.'
+    connected_apps:
+      type: array
+      items: {}
+      description: 'CLAIM-ONLY. Per-run app capabilities mounted through runtime MCP overlays.'
+    repos:
+      type: array
+      items: { $ref: '#/components/schemas/RepoData' }
+      description: 'CLAIM-ONLY.'
+    project_id:
+      type: string
+      format: uuid
+      description: 'CLAIM-ONLY. The issue''s project, when present.'
+    project_title:
+      type: string
+      description: 'CLAIM-ONLY.'
+    project_description:
+      type: string
+      description: 'CLAIM-ONLY. Durable project-level context injected into the brief.'
+    project_resources:
+      type: array
+      items: { $ref: '#/components/schemas/ProjectResourceData' }
+      description: 'CLAIM-ONLY.'
+    created_at:
+      type: string
+      format: date-time
+    prior_session_id:
+      type: string
+      description: 'CLAIM-ONLY. Session ID from a previous task on the same issue.'
+    prior_work_dir:
+      type: string
+      description: 'CLAIM-ONLY.'
+    prior_session_resume_unavailable:
+      type: boolean
+      description: 'CLAIM-ONLY (MUL-5305, MUL-7034).'
+    work_dir:
+      type: string
+      description: 'Local working directory pinned for this task; populated once the daemon reports it. Raw, not privacy-stripped — prefer relative_work_dir for display.'
+    relative_work_dir:
+      type: string
+      description: >-
+        Privacy-safe display form of work_dir: strips the daemon''s
+        workspaces root (standard tasks) or a recognised home-directory
+        prefix (local_directory tasks), falling back to the basename.
+        Derived by `relativeWorkDir` (agent.go:918-941) — never contains the
+        caller's home directory prefix or account name.
+    durable_work_dir:
+      type: string
+      description: 'The daemon-confirmed directory that remains usable after a disposable task worktree is finalized/removed. A point-in-time snapshot; does not follow later resource edits.'
+    relative_durable_work_dir:
+      type: string
+      description: 'Privacy-safe display form of durable_work_dir, same derivation as relative_work_dir.'
+    branch_name:
+      type: string
+      description: 'Git branch this run delivered its work on, for worktree-mode local_directory tasks only. Safe to show verbatim (a ref inside the user''s own repo, not a filesystem path). Populated on both terminal paths (failed runs can still have committed partial work).'
+    trigger_comment_id:
+      type: string
+      format: uuid
+      nullable: true
+    coalesced_comment_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: 'MUL-4195. Earlier comments folded into this run when it had not yet started; trigger_comment_id is the newest.'
+    coalesced_comments:
+      type: array
+      items: { $ref: '#/components/schemas/CoalescedCommentData' }
+      description: 'CLAIM-ONLY full detail of coalesced_comment_ids (MUL-4195).'
+    delivered_comment_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: '`[]` is an authoritative empty receipt; the surrounding struct always includes this field (no omitempty), unlike almost every other field here.'
+    supplement_capability:
+      type: string
+    supplement_comment_ids:
+      type: array
+      items: { type: string, format: uuid }
+    can_supplement:
+      type: boolean
+    trigger_thread_id:
+      type: string
+      format: uuid
+      description: 'Root comment ID for the triggering thread.'
+    trigger_comment_content:
+      type: string
+    trigger_summary:
+      type: string
+      nullable: true
+      description: 'Canonical short description snapshot (comment text / autopilot title) taken at task creation; survives later edits/deletes of the source.'
+    trigger_author_type:
+      type: string
+      description: '"agent" or "member" — author kind of the triggering comment.'
+    trigger_author_name:
+      type: string
+    new_comment_count:
+      type: integer
+      description: 'CLAIM-ONLY. Issue-wide comments since this agent''s last run, excluding the injected trigger and the agent''s own comments.'
+    new_comments_since:
+      type: string
+      format: date-time
+      description: 'CLAIM-ONLY. RFC3339 anchor the delta above is measured from.'
+    new_comments_delta_known:
+      type: boolean
+      description: 'CLAIM-ONLY. True only when the issue-wide delta was actually computed this claim; see new_comments_since.'
+    issue_state_delta_known:
+      type: boolean
+      description: 'CLAIM-ONLY (MUL-7344). True only when the issue''s title/description were actually compared against a prior snapshot.'
+    issue_changed_fields:
+      type: array
+      items: { type: string, enum: [title, description] }
+      description: 'CLAIM-ONLY. Subset of [title, description] in that order; meaningful only alongside issue_state_delta_known.'
+    issue_status:
+      type: string
+      description: 'The issue''s status key at claim time. CLAIM-ONLY — never set by the three operations in this file.'
+    issue_assignee_type:
+      type: string
+      enum: [agent, member, squad]
+      description: 'CLAIM-ONLY.'
+    issue_assignee_id:
+      type: string
+      format: uuid
+      description: 'CLAIM-ONLY.'
+    chat_session_id:
+      type: string
+      format: uuid
+      description: 'Non-empty for chat tasks. This field IS populated by taskToResponse (unlike most fields below it).'
+    chat_channel_type:
+      type: string
+      description: 'CLAIM-ONLY. "slack" when the chat session is backed by an IM channel; empty for a web-only chat.'
+    chat_channel_delivers_files:
+      type: boolean
+      description: 'CLAIM-ONLY server capability flag.'
+    chat_type:
+      type: string
+      enum: [group, p2p]
+      description: 'CLAIM-ONLY.'
+    chat_in_thread:
+      type: boolean
+      description: 'CLAIM-ONLY.'
+    chat_message:
+      type: string
+      description: 'CLAIM-ONLY. User message for chat tasks.'
+    chat_message_attachments:
+      type: array
+      items: { $ref: '#/components/schemas/ChatAttachmentMeta' }
+      description: 'CLAIM-ONLY.'
+    chat_intro:
+      type: boolean
+      description: 'CLAIM-ONLY legacy compatibility field for historical is_agent_intro sessions.'
+    autopilot_run_id:
+      type: string
+      format: uuid
+      description: 'Non-empty for autopilot-spawned tasks. This field IS populated by taskToResponse.'
+    autopilot_id:
+      type: string
+      format: uuid
+      description: 'CLAIM-ONLY.'
+    autopilot_title:
+      type: string
+      description: 'CLAIM-ONLY.'
+    autopilot_description:
+      type: string
+      description: 'CLAIM-ONLY.'
+    autopilot_source:
+      type: string
+      enum: [manual, schedule, webhook, api]
+      description: 'CLAIM-ONLY.'
+    autopilot_trigger_payload:
+      description: 'CLAIM-ONLY. Free-form JSON trigger payload for webhook/api runs.'
+    quick_create_prompt:
+      type: string
+      description: 'CLAIM-ONLY.'
+    quick_create_priority:
+      type: string
+      description: 'CLAIM-ONLY.'
+    quick_create_due_date:
+      type: string
+      description: 'CLAIM-ONLY.'
+    quick_create_attachment_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: 'CLAIM-ONLY.'
+    quick_create_source_context:
+      description: 'CLAIM-ONLY. Free-form JSON, immutable historical context for source-context quick-create.'
+    wakeup_id:
+      type: string
+      description: 'Populated by taskToResponse from the task''s stored context JSON.'
+    wakeup_system_rule:
+      type: string
+      description: 'Set when a platform rule (e.g. child_done) started the run. Populated by taskToResponse.'
+    wakeup_joined:
+      type: string
+      description: 'Wakeups that fired while this run waited to start and joined it instead of queuing their own. Populated by taskToResponse (service.JoinedWakeupNotes).'
+    handoff_note:
+      type: string
+      description: 'Legacy assignment handoff instruction retained for installed clients; populated by taskToResponse from the task row.'
+    squad_id:
+      type: string
+      format: uuid
+      description: 'CLAIM-ONLY. For quick-create tasks where the picker was a squad; `agent` is still the resolved leader.'
+    squad_name:
+      type: string
+      description: 'CLAIM-ONLY.'
+    parent_issue_id:
+      type: string
+      format: uuid
+      description: 'CLAIM-ONLY. For quick-create tasks opened from "Add sub issue".'
+    parent_issue_identifier:
+      type: string
+      description: 'CLAIM-ONLY.'
+    requesting_user_name:
+      type: string
+      description: 'CLAIM-ONLY.'
+    requesting_user_profile_description:
+      type: string
+      description: 'CLAIM-ONLY.'
+    initiator_type:
+      type: string
+      description: 'CLAIM-ONLY. "member" when an originator exists.'
+    initiator_id:
+      type: string
+      format: uuid
+      description: 'CLAIM-ONLY.'
+    initiator_name:
+      type: string
+      description: 'CLAIM-ONLY.'
+    initiator_email:
+      type: string
+      description: 'CLAIM-ONLY.'
+    kind:
+      type: string
+      enum: [comment, autopilot, chat, quick_create, direct]
+      description: 'Source discriminator. Populated by taskToResponse via computeTaskKind (agent.go:1034-1056); quick-create stays "quick_create" even after its result issue is linked.'
+    attribution:
+      allOf: [{ $ref: '#/components/schemas/TaskAttribution' }]
+      nullable: true
+      description: >-
+        Populated by taskToResponse (pure half) then hydrated in a batch by
+        hydrateTaskAttributions on every operation in this file. NOTE: the
+        referenced TaskAttribution component is owned by a sibling domain
+        ticket (issues-comments) and is a deliberately partial stub there —
+        see the comment above TaskUsageData in this file for the
+        cross-domain collision this could not resolve within this ticket's
+        file-scope restriction.
+    usage:
+      type: array
+      items: { $ref: '#/components/schemas/TaskUsageData' }
+      description: 'Populated ONLY on GET /api/agents/{id}/tasks with include_usage=true; omitted/nil everywhere else in this file (nil and [] both mean "no usage recorded").'
+    auth_token:
+      type: string
+      description: 'CLAIM-ONLY. Task-scoped mat_ token the daemon injects as MULTICA_TOKEN.'
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Labels (agent attach/detach)
+# ---------------------------------------------------------------------------
+
+AgentLabelResponse:
+  type: object
+  description: >-
+    The label shape returned by GET/POST /api/agents/{id}/labels and
+    DELETE /api/agents/{id}/labels/{labelId} (all three re-list via
+    `ListLabelsForAgent`, server/internal/handler/label.go:576-589). Built by
+    `labelsToResponse` -> `labelToResponse` (label.go:37-70), which is a
+    DIFFERENT (narrower) conversion than the one list/table endpoints for
+    issue labels use (`labelListRowToResponse`, label.go:50-62) — that one
+    reads a joined row with a real `usage_count`; this one does not join
+    usage, so `usage_count` is always 0 here regardless of actual
+    attachment count. No canonical `Label` schema exists yet in this
+    codebase (a separate labels-domain ticket owns it); this is scoped to
+    exactly what this endpoint's conversion function sets, named distinctly
+    to avoid colliding with that future schema.
+  required: [id, workspace_id, resource_type, name, description, color, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    resource_type:
+      type: string
+      const: agent
+      description: 'Always "agent" for this endpoint family — AttachLabelToAgent rejects any label whose resource_type is not "agent" with 404.'
+    name:
+      type: string
+    description:
+      type: string
+    color:
+      type: string
+    usage_count:
+      type: integer
+      format: int64
+      description: 'ALWAYS 0 on this endpoint family — labelToResponse never populates it (see schema description). Not a true usage count here; do not rely on it.'
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+  additionalProperties: false
+
+AttachLabelRequest:
+  type: object
+  description: server/internal/handler/label.go:372-374.
+  required: [label_id]
+  properties:
+    label_id:
+      type: string
+      format: uuid
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# DingTalk group presence for one agent
+# ---------------------------------------------------------------------------
+
+DingTalkGroupBotResponse:
+  type: object
+  description: >-
+    One connected Multica bot observed in a DingTalk group.
+    server/internal/handler/dingtalk.go:40-50.
+  required: [installation_id, agent_id, bot_name, bot_identity_issue]
+  properties:
+    installation_id:
+      type: string
+      format: uuid
+    agent_id:
+      type: string
+      format: uuid
+      description: 'The product-facing identity.'
+    bot_name:
+      type: string
+      description: 'The readable DingTalk identity, populated only when the app has qyapi_chat_manage permission.'
+    bot_identity_issue:
+      type: string
+      description: 'Non-empty when the bot identity could not be resolved; empty string means no issue.'
+    last_active_at:
+      type: string
+      description: 'RFC3339, or empty string when never active in this group. Absent entirely on the bot_identities map values (installation-level identity has no per-group activity).'
+    mention_count:
+      type: integer
+      format: int64
+      description: 'Absent on the bot_identities map values; only meaningful per-group.'
+  additionalProperties: false
+
+DingTalkGroupResponse:
+  type: object
+  description: >-
+    Every connected bot observed under the same DingTalk openConversationId.
+    server/internal/handler/dingtalk.go:52-58.
+  required: [conversation_id, conversation_title, bots]
+  properties:
+    conversation_id:
+      type: string
+    conversation_title:
+      type: string
+    bots:
+      type: array
+      items: { $ref: '#/components/schemas/DingTalkGroupBotResponse' }
+      description: 'Sorted by installation_id.'
+  additionalProperties: false
+
+ListDingTalkGroupsResponse:
+  type: object
+  description: server/internal/handler/dingtalk.go:60-66.
+  required: [groups, group_discovery_supported, inactive_group_counts, bot_identities]
+  properties:
+    groups:
+      type: array
+      items: { $ref: '#/components/schemas/DingTalkGroupResponse' }
+      description: 'Sorted by conversation_title (empty titles last), then conversation_id.'
+    group_discovery_supported:
+      type: boolean
+      description: 'Always true from this handler (a workspace-wide sibling endpoint, not in this file''s scope, can return false).'
+    inactive_group_counts:
+      type: object
+      additionalProperties: { type: integer, format: int64 }
+      description: 'Keyed by installation_id. Count of groups inactive for 90+ days per installation.'
+    bot_identities:
+      type: object
+      additionalProperties: { $ref: '#/components/schemas/DingTalkGroupBotResponse' }
+      description: 'Keyed by installation_id. One entry per bot installation, independent of group activity.'
+    next_offset:
+      type: integer
+      nullable: true
+      description: 'Only present when `activity=inactive` and more inactive-group rows remain beyond this page.'
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Workspace-wide agent / task aggregations
+# ---------------------------------------------------------------------------
+
+AgentActivityBucket:
+  type: object
+  description: >-
+    One day-bucketed throughput sample for the Agents-list activity
+    sparkline. server/internal/handler/agent.go:2771-2782. bucket_at is
+    midnight UTC of the day. Empty buckets (no tasks that day) are omitted
+    by the server rather than sent as zero rows.
+  required: [agent_id, bucket_at, task_count, failed_count, completed_count, cancelled_count, duration_ms, duration_count]
+  properties:
+    agent_id:
+      type: string
+      format: uuid
+    bucket_at:
+      type: string
+      format: date-time
+    task_count:
+      type: integer
+      format: int32
+    failed_count:
+      type: integer
+      format: int32
+    completed_count:
+      type: integer
+      format: int32
+    cancelled_count:
+      type: integer
+      format: int32
+    duration_ms:
+      type: number
+      format: double
+    duration_count:
+      type: integer
+      format: int32
+  additionalProperties: false
+
+AgentRunCount:
+  type: object
+  description: 'Trailing-30-day total task run count for one agent. server/internal/handler/agent.go:2784-2789.'
+  required: [agent_id, run_count]
+  properties:
+    agent_id:
+      type: string
+      format: uuid
+    run_count:
+      type: integer
+      format: int32
+  additionalProperties: false
+
+WorkspaceWorkingAgent:
+  type: object
+  description: >-
+    Privacy-safe agent summary for currently-working agents, independent of
+    issue filters or Table pagination. server/internal/handler/agent.go:2791-2802.
+    Deliberately carries only display info + a running-task count + referenced
+    issue ids — no runtime/integration configuration.
+  required: [id, name, avatar_url, running_task_count, issue_ids]
+  properties:
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    avatar_url:
+      type: string
+      nullable: true
+    running_task_count:
+      type: integer
+      format: int32
+    issue_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: 'Empty array, not null, when the underlying column is NULL (uuidStringsOrEmpty).'
+  additionalProperties: false
+
+AssigneeFrequencyEntry:
+  type: object
+  description: >-
+    How often the authenticated user assigns issues to a specific assignee,
+    combining assignee-change activity and initial-assignment-on-create
+    counts. server/internal/handler/activity.go:400-405.
+  required: [assignee_type, assignee_id, frequency]
+  properties:
+    assignee_type:
+      type: string
+      enum: [member, agent]
+    assignee_id:
+      type: string
+      format: uuid
+    frequency:
+      type: integer
+      format: int64
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Task messages / user-facing cancel
+# ---------------------------------------------------------------------------
+
+TaskMessagePayload:
+  type: object
+  description: >-
+    One agent execution message (tool call, text chunk, error, ...).
+    server/pkg/protocol/messages.go:216-234, built by `taskMessageToPayload`
+    (server/internal/handler/daemon.go:5343-5365).
+  required: [task_id, seq, type]
+  properties:
+    call_id:
+      type: string
+      description: 'Opaque tool-call identity scoped to one backend execution.'
+    task_id:
+      type: string
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+    seq:
+      type: integer
+      description: 'Monotonic sequence number within the task; used for the `since` pagination query param.'
+    type:
+      type: string
+      enum: [text, tool_use, tool_result, error]
+    tool:
+      type: string
+      description: 'Tool name, for tool_use/tool_result only.'
+    content:
+      type: string
+      description: 'Text content, for type=text.'
+    input:
+      type: object
+      additionalProperties: true
+      description: 'Tool input, for tool_use only.'
+    output:
+      type: string
+      description: 'Tool output, for tool_result only.'
+    output_truncated:
+      type: boolean
+      nullable: true
+      description: >-
+        Tri-state: whether `output` is the complete tool output (tool_result
+        only). Absent/null means no daemon ever measured this record
+        (historical rows, older installed daemons) — clients must present
+        this as unknown, not as "complete".
+    created_at:
+      type: string
+      format: date-time
+  additionalProperties: false
+
+CancelledChatMessageResponse:
+  type: object
+  description: >-
+    Present only when cancelling a QUEUED chat task with `queue_action=edit`
+    or `remove` restores or discards its pending input.
+    server/internal/handler/chat.go:1477-1483.
+  required: [chat_session_id, message_id, content, restore_to_input]
+  properties:
+    chat_session_id:
+      type: string
+      format: uuid
+    message_id:
+      type: string
+      format: uuid
+    content:
+      type: string
+    restore_to_input:
+      type: boolean
+      description: 'True for queue_action=edit (restore the draft to the composer); false for queue_action=remove (discard it).'
+    attachments:
+      type: array
+      items: { $ref: '#/components/schemas/AttachmentResponse' }
+  additionalProperties: false
+
+CancelTaskByUserResponse:
+  type: object
+  description: >-
+    server/internal/handler/chat.go:1485-1488. Embeds AgentTaskResponse
+    directly (Go struct embedding) rather than nesting it under a named key.
+  allOf:
+    - $ref: '#/components/schemas/AgentTaskResponse'
+    - type: object
+      properties:
+        cancelled_chat_message:
+          allOf: [{ $ref: '#/components/schemas/CancelledChatMessageResponse' }]
+          nullable: true
+          description: 'Only present when the cancelled task was a QUEUED chat task cancelled with expected_status=queued.'

@@ -1,0 +1,373 @@
+# Domain: squads. Response/request shapes for
+# server/internal/handler/squad.go — a "squad" is a named group of agents
+# (and optionally human members) led by one agent, assignable to issues and
+# autopilots as a single unit. "schemas" is the directory name that tells
+# the merge script this file belongs to components.schemas (see
+# docs/unofficial-api/README.md); the filename itself is arbitrary.
+
+SquadResponse:
+  type: object
+  description: >-
+    server/internal/handler/squad.go:63-79 (`squadToResponse`), with
+    member_count/member_preview filled in by
+    `squadToResponseWithPreview`/`ListSquads` (~line 167-224). A squad always
+    has exactly one `leader_id`, which must be an agent (never a human
+    member) — enforced at create/update time by `GetAgentInWorkspace` /
+    `LockAgentForAutopilotAssignment` validation, not by a DB constraint.
+  required:
+    - id
+    - workspace_id
+    - name
+    - description
+    - instructions
+    - avatar_url
+    - leader_id
+    - creator_id
+    - created_at
+    - updated_at
+    - archived_at
+    - archived_by
+    - member_count
+    - member_preview
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    description:
+      type: string
+      description: Defaults to `""` when omitted on create; never null.
+    instructions:
+      type: string
+      description: >-
+        Free-text briefing injected into the squad leader's prompt context.
+        Settable only via PUT /api/squads/{id} — CreateSquad has no
+        `instructions` field, so a squad is always created with `""` and
+        instructions must be added in a follow-up update.
+    avatar_url:
+      type: string
+      nullable: true
+      description: >-
+        Resolved via `resolveAvatarURLPtr` the same way every other
+        avatar_url in this API is (see components/schemas/account.yaml);
+        null when unset.
+    leader_id:
+      type: string
+      format: uuid
+      description: ID of the agent (never a human member) that leads this squad.
+    creator_id:
+      type: string
+      format: uuid
+      description: >-
+        The workspace member (user id) who created the squad. Drives
+        `canManageSquad`: the creator (or any workspace owner/admin) may
+        rename, change leader, add/remove members, or archive the squad;
+        other members may only read it (MUL-4223).
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+    archived_at:
+      type: string
+      format: date-time
+      nullable: true
+      description: Set by DELETE /api/squads/{id} (an archive, not a hard delete). Null while active.
+    archived_by:
+      type: string
+      format: uuid
+      nullable: true
+      description: The member who archived the squad; null while active.
+    member_count:
+      type: integer
+      description: >-
+        Total squad_member row count for this squad. On ListSquads/GetSquad
+        this and member_preview come from a separate preview query
+        (`ListSquadMemberPreviewRows`/`...BySquad`) joined in after the base
+        squad row is loaded, not from a single query — a squad with zero
+        members briefly after creation would be a server bug, since
+        CreateSquad always auto-adds the leader as a member (see
+        CreateSquadRequest).
+    member_preview:
+      type: array
+      maxItems: 3
+      description: >-
+        First up to 3 members, ordered leader-first then by join order
+        (`addSquadMemberPreview` caps at 3; `member_count` still reflects
+        the true total). Empty array (never null) when the summary load
+        itself fails, since the handler only propagates that as its own 500
+        rather than leaving the field unset.
+      items:
+        $ref: '#/components/schemas/SquadMemberPreview'
+
+SquadMemberPreview:
+  type: object
+  description: squad.go:41-45 (`SquadMemberPreviewResponse`).
+  required: [member_type, member_id, role]
+  properties:
+    member_type:
+      type: string
+      enum: [agent, member]
+    member_id:
+      type: string
+      format: uuid
+    role:
+      type: string
+      description: >-
+        Free-form, not an enum at the database or handler level. The only
+        value the server itself ever assigns is `"leader"`, stamped once
+        when CreateSquad/UpdateSquad auto-adds the new leader agent as a
+        member (squad.go:304-309, :440-445). Every other value is whatever
+        the caller passed to POST .../members or PATCH .../members/role.
+
+SquadMemberResponse:
+  type: object
+  description: squad.go:52-59, 81-90 (`SquadMemberResponse` / `squadMemberToResponse`). One squad_member row.
+  required: [id, squad_id, member_type, member_id, role, created_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: squad_member row id (distinct from member_id, the agent/member's own id).
+    squad_id:
+      type: string
+      format: uuid
+    member_type:
+      type: string
+      enum: [agent, member]
+    member_id:
+      type: string
+      format: uuid
+    role:
+      type: string
+      description: See SquadMemberPreview.role — free-form, "leader" is the only server-assigned value.
+    created_at:
+      type: string
+      format: date-time
+
+SquadMemberStatusEntry:
+  type: object
+  description: >-
+    squad.go:569-575 (`SquadMemberStatusResponse`). One entry per squad
+    member, agent and human alike, so the front-end can render both kinds in
+    one list without reordering (squad.go:564-568).
+  required: [member_type, member_id, status, active_issues, last_active_at]
+  properties:
+    member_type:
+      type: string
+      enum: [agent, member]
+    member_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+      nullable: true
+      enum: [working, idle, unstable, offline, archived]
+      description: >-
+        Only ever set for member_type=agent (`deriveSquadMemberStatus`,
+        squad.go:629-647); always null for member_type=member, since a human
+        member has no runtime to derive a status from. Precedence:
+        archived (agent's own archived_at is set) beats working (a
+        dispatched/running task exists for this agent on this squad) beats
+        the runtime-availability bucket (online -> idle; offline with
+        last_seen_at within 5 minutes -> unstable; otherwise offline).
+    active_issues:
+      type: array
+      description: >-
+        Issues behind a dispatched/running task for this agent member.
+        Always `[]`, never null, for a member with no active work, and
+        always `[]` for member_type=member. A `waiting_local_directory`
+        task is included in the underlying query row set (so its issue
+        stays queryable) but does NOT count toward `status=working` and
+        does NOT appear here — only dispatched/running tasks populate this
+        list (squad.go:705-728).
+      items:
+        $ref: '#/components/schemas/SquadActiveIssueBrief'
+    last_active_at:
+      type: string
+      format: date-time
+      nullable: true
+      description: >-
+        Prefers the most recent dispatched_at among this agent's active
+        tasks over the runtime's last_seen_at heartbeat, so a currently
+        working agent does not look stale merely because its heartbeat is a
+        few seconds behind (squad.go:751-759). Null for member_type=member
+        and for an agent member with neither an active task nor any
+        observed runtime heartbeat.
+
+SquadActiveIssueBrief:
+  type: object
+  description: squad.go:577-582.
+  required: [issue_id, identifier, title, issue_status]
+  properties:
+    issue_id:
+      type: string
+      format: uuid
+    identifier:
+      type: string
+      description: '`<workspace issue prefix>-<number>`, e.g. `ENG-123`.'
+    title:
+      type: string
+    issue_status:
+      type: string
+      description: Empty string (not null) when the joined issue row has no status for some reason.
+
+SquadMemberStatusListResponse:
+  type: object
+  description: squad.go:584-586. Response body of GET /api/squads/{id}/members/status.
+  required: [members]
+  properties:
+    members:
+      type: array
+      items:
+        $ref: '#/components/schemas/SquadMemberStatusEntry'
+
+CreateSquadRequest:
+  type: object
+  description: >-
+    squad.go:237-242 (anonymous request struct in `CreateSquad`). No
+    `instructions` field — a newly created squad always starts with empty
+    instructions; use PUT /api/squads/{id} to set them. The leader agent is
+    automatically added as a squad_member with role "leader" in the same
+    request (squad.go:304-309); if that insert itself fails, the error is
+    silently discarded (its return value is not checked) and the squad is
+    still returned as created — a flagged gap, not a documented contract.
+  required: [name, leader_id]
+  properties:
+    name:
+      type: string
+      description: '"name is required" (400) when empty.'
+    description:
+      type: string
+      description: Defaults to `""` when omitted.
+    leader_id:
+      type: string
+      format: uuid
+      description: >-
+        Must be an existing agent in the target workspace
+        (`GetAgentInWorkspace`), and one the caller is allowed to
+        @-mention-trigger unless the caller is a workspace owner/admin
+        (`memberCanWireAgent`, squad.go:126-142) — otherwise 403.
+    avatar_url:
+      type: string
+      nullable: true
+      description: >-
+        Validated with the same `acceptAvatarURL` gate as every other
+        avatar_url write in this API (403 if it points at an attachment
+        already bound to an issue/comment/chat).
+
+UpdateSquadRequest:
+  type: object
+  description: >-
+    squad.go:359-365 (anonymous request struct in `UpdateSquad`, method PUT
+    despite being a partial update). Every field is a plain Go pointer
+    decoded straight from JSON, NOT the raw-body-inspecting
+    absent-vs-explicit-null pattern `UpdateIssue` uses (see
+    issues-comments/core.yaml's updateIssue description) — encoding Go's
+    `json.Unmarshal` behavior, an explicit JSON `null` for any of these
+    fields decodes to the same nil pointer as omitting the field entirely,
+    so there is no way to use this endpoint to clear a field back to empty;
+    sending `""` is the only way to blank out name/description/instructions.
+  properties:
+    name:
+      type: string
+      description: Omit (or send JSON null, equivalently) to leave unchanged.
+    description:
+      type: string
+    instructions:
+      type: string
+    leader_id:
+      type: string
+      format: uuid
+      description: >-
+        Changing the leader re-validates the new agent exactly like
+        CreateSquad's leader_id (valid workspace agent + `memberCanWireAgent`
+        access check), auto-adds it as a squad_member with role "leader" if
+        not already a member, and — if the new leader agent has no bound
+        runtime — pauses every Autopilot targeting this squad
+        (`PauseAutopilotsByUnrunnableSquad`) so automation does not keep
+        firing at an unrunnable leader. The prior leader is NOT
+        automatically removed as a squad_member.
+    avatar_url:
+      type: string
+      nullable: true
+
+AddSquadMemberRequest:
+  type: object
+  description: squad.go:787-791 (anonymous request struct in `AddSquadMember`).
+  required: [member_type, member_id]
+  properties:
+    member_type:
+      type: string
+      enum: [agent, member]
+      description: '"member_type must be ''agent'' or ''member''" (400) for any other value.'
+    member_id:
+      type: string
+      format: uuid
+      description: >-
+        For member_type=agent: must be an existing agent in this workspace,
+        and one the caller can @-mention-trigger unless owner/admin (same
+        `memberCanWireAgent` gate as leader_id). For member_type=member:
+        must be an existing member of this workspace
+        (`GetMemberByUserAndWorkspace`) — no further access check.
+    role:
+      type: string
+      description: >-
+        Free-form; not validated. Defaults to `""` when omitted (plain
+        string field, not a pointer) — there is no server-assigned default
+        like "leader" here; that value is only ever stamped by the server's
+        own internal leader-auto-add calls.
+
+RemoveSquadMemberRequest:
+  type: object
+  description: >-
+    squad.go:872-875 (anonymous request struct in `RemoveSquadMember`, read
+    from the DELETE request body). `member_type` is NOT validated against
+    an enum here (unlike AddSquadMember) — it is compared directly against
+    squad.LeaderID only when member_type=="agent" for the leader guard below,
+    and otherwise passed through verbatim to the DELETE query; a value other
+    than "agent"/"member" simply never matches a stored row and surfaces as
+    404 "squad member not found", the same as any other non-matching pair.
+  required: [member_type, member_id]
+  properties:
+    member_type:
+      type: string
+      enum: [agent, member]
+    member_id:
+      type: string
+      format: uuid
+      description: >-
+        No separate "member_id is required" check — an empty string goes
+        straight into UUID parsing and surfaces as 400 "invalid member_id".
+
+UpdateSquadMemberRoleRequest:
+  type: object
+  description: >-
+    squad.go:928-932 (anonymous request struct in `UpdateSquadMemberRole`).
+    All three fields are plain (non-pointer) strings: omitting `role` from
+    the JSON body does not leave the stored role untouched, it overwrites it
+    with `""` — the UPDATE always runs with whatever was decoded, there is
+    no COALESCE-style partial-update semantics here (contrast with
+    UpdateSquad, whose fields ARE pointers).
+  required: [member_type, member_id, role]
+  properties:
+    member_type:
+      type: string
+      enum: [agent, member]
+      description: >-
+        Not validated against this enum by the handler — passed straight
+        into the UPDATE's WHERE clause; a non-matching value surfaces as 404
+        "squad member not found" via the same not-found mapping described
+        below, same as any member_type/member_id pair that doesn't match an
+        existing row.
+    member_id:
+      type: string
+      format: uuid
+    role:
+      type: string
+      description: New role value, stored verbatim; see the free-form note on SquadMemberPreview.role.

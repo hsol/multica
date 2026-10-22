@@ -1,0 +1,646 @@
+# Comment CRUD, resolution and reactions. Source:
+# server/internal/handler/comment.go, reaction.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+
+/api/issues/{id}/comments/trigger-preview:
+  post:
+    operationId: previewCommentTriggers
+    summary: Dry-run which agents a prospective comment would trigger
+    description: Pure dry-run — computes trigger candidates without posting anything or enqueueing any task.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              content:
+                type: string
+                description: Empty after sanitization short-circuits to `200 {"agents":[]}`.
+              parent_id:
+                type: string
+                format: uuid
+                description: Must resolve to a comment on this issue; if set, must also match editing_comment_id's parent when both are given.
+              editing_comment_id:
+                type: string
+                format: uuid
+                description: Must resolve to a comment on this issue, in this workspace.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentTriggerPreviewResponse'
+      '400':
+        description: >-
+          "invalid request body"; "invalid editing_comment_id"; "invalid
+          editing comment"; "invalid parent_id"; "parent_id does not match
+          editing comment"; "invalid parent comment".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+
+/api/issues/{id}/comments:
+  get:
+    operationId: listComments
+    summary: List comments on an issue (flat, threaded, or folded)
+    description: >-
+      One endpoint serves several mutually-exclusive read modes via query
+      params — chronological, thread-anchored with a reply tail, most-recent
+      roots, or resolve-aware folding — each documented on its own parameter
+      below. `roots_only`, `fold`, `thread`+`tail`, and `recent` are mutually
+      exclusive with each other (a combination is a 400); `summary` composes
+      with any of them.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: since
+        in: query
+        schema: {type: string, format: date-time}
+        description: RFC3339Nano (falls back to RFC3339).
+      - name: thread
+        in: query
+        schema: {type: string, format: uuid}
+        description: Any comment in a thread (root or reply) — the server walks up to the root.
+      - name: tail
+        in: query
+        schema: {type: integer, minimum: 0}
+        description: 'Requires `thread`. Capped at 2000. `tail=0` returns just the root.'
+      - name: recent
+        in: query
+        schema: {type: integer, minimum: 1}
+        description: Number of most-recently-active threads to return, capped at 2000. Mutually exclusive with `thread`.
+      - name: before
+        in: query
+        schema: {type: string, format: date-time}
+        description: Pagination cursor timestamp; must be set together with before_id.
+      - name: before_id
+        in: query
+        schema: {type: string, format: uuid}
+        description: 'Pagination cursor id (alias `before-id`); must be set together with `before`, and paired with either `recent` or `thread`+`tail`.'
+      - name: roots_only
+        in: query
+        schema: {type: boolean}
+        description: 'Alias `roots-only`. Only top-level comments, each annotated with reply_count + last_activity_at.'
+      - name: summary
+        in: query
+        schema: {type: boolean}
+        description: Clips each comment's content to 200 runes, sets content_truncated.
+      - name: fold
+        in: query
+        schema: {type: boolean}
+        description: Resolve-aware thread projection — collapses a resolved thread to root+conclusion or root-only.
+    responses:
+      '200':
+        description: >-
+          OK — a flat, chronological (oldest-first) JSON array. Response
+          headers (not part of the JSON body): `X-Multica-Next-Before` /
+          `X-Multica-Next-Before-Id` (pagination cursor for the next page,
+          when present) and `X-Comments-Truncated: true` (set when the 2000
+          comment hard cap truncated results).
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/CommentResponse'
+      '400':
+        description: >-
+          Invalid combinations/values of the parameters above (each has its
+          own message, e.g. "invalid since parameter; expected RFC3339
+          format", "tail requires thread", "before and before_id must be set
+          together", "thread and recent are mutually exclusive",
+          "roots_only"/"fold" mutual-exclusivity messages).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found", or "thread anchor not found in this issue" when `thread` does not resolve within this issue.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to list comments".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  post:
+    operationId: createComment
+    summary: Post a comment on an issue
+    description: May trigger one or more agents (issue assignee, @-mentions, thread-parent authors) depending on content and parent_id.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [content]
+            properties:
+              content:
+                type: string
+                minLength: 1
+                description: Sanitized for embedded NUL bytes; empty after sanitizing is a 400.
+              type:
+                type: string
+                enum: [comment, progress_update]
+                default: comment
+                description: Only these two types are client-authorable.
+              parent_id:
+                type: string
+                format: uuid
+                description: Must belong to the same issue.
+              attachment_ids:
+                type: array
+                items: {type: string, format: uuid}
+              suppress_agent_ids:
+                type: array
+                items: {type: string, format: uuid}
+              steer_task_ids:
+                type: array
+                items: {type: string, format: uuid}
+                description: Forced to empty when attachment_ids is non-empty (a running turn receives text only).
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentResponse'
+      '400':
+        description: >-
+          "content is required"; "invalid comment type"; "invalid
+          parent_id"/"invalid parent comment"; "invalid attachment_ids";
+          "invalid suppress_agent_ids"; "invalid steer_task_ids".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found" — either from loadIssueForUser, or (race) a CreateComment write failing because the issue was deleted mid-request.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: >-
+          "comment-triggered tasks cannot create top-level comments; set
+          parent_id (--parent) to `<trigger_comment_id>` or a coalesced
+          comment id" (an agent author's active comment-triggered task tried
+          to post without parent_id, or with the wrong one); "squad leader
+          recorded no_action; comments are not allowed for this task".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to create comment: <err>".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/comments/{commentId}:
+  put:
+    operationId: updateComment
+    summary: Edit a comment's content/attachments
+    description: >-
+      `content_base` or `expected_revision` makes this a "strict content
+      edit" with optimistic-concurrency enforcement; omitting both edits
+      best-effort without a conflict check.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IfMatchHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [content]
+            properties:
+              content:
+                type: string
+                minLength: 1
+              content_base:
+                type: string
+                description: 'Presence makes this a "strict content edit"; a 409 EditConflict is raised if it no longer matches the current content.'
+              attachment_ids:
+                type: array
+                items: {type: string, format: uuid}
+                description: 'When the key is present (even an empty array), this replaces the full attachment set.'
+              suppress_agent_ids:
+                type: array
+                items: {type: string, format: uuid}
+              expected_revision:
+                type: integer
+                format: int64
+                minimum: 1
+                description: Optimistic-concurrency fence; presence also makes this a "strict content edit".
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentResponse'
+      '400':
+        description: >-
+          Invalid `comment id`/`workspace id`; "invalid request body";
+          "content is required"; "expected_revision must be a positive
+          integer"; "invalid attachment_ids"/"invalid suppress_agent_ids".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"only comment author or admin can edit".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"comment not found" (missing, or a tombstoned comment with no content to edit).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: >-
+          "additional messages cannot be edited" (comment bound to a task
+          supplement); a revision mismatch (eager check, or lost on a
+          concurrent write); or a content_base mismatch when no
+          expected_revision was supplied.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RevisionConflict'
+                - $ref: '#/components/schemas/EditConflict'
+                - $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to verify additional message"; "failed to load issue"; "failed to prepare comment edit"; "failed to update comment".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: deleteComment
+    summary: Delete a comment
+    description: >-
+      Behaviorally identical to `DELETE .../keep-replies` below (both routes
+      share the exact same handler and code path) — a comment with replies
+      is always tombstoned (content/attachments/reactions cleared, row
+      kept so replies retain their parent); only a reply-less comment (and
+      any now-replyless tombstone ancestors) is actually removed. The
+      `/keep-replies` alias exists purely so a client depending on the
+      "replies are kept" guarantee gets a clean 404 against an older server
+      that would instead cascade-delete, rather than a silent behavior
+      change.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted (or tombstoned) — no body.
+      '400':
+        description: Invalid `comment id`/`workspace id`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"only comment author or admin can delete".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"comment not found" (missing, already tombstoned, or removed concurrently).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: '"additional message is still being delivered" (a pending task supplement is bound to this comment).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to load issue"; "failed to delete comment".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/comments/{commentId}/keep-replies:
+  delete:
+    operationId: deleteCommentKeepReplies
+    summary: Delete a comment, guaranteeing replies are kept (routing-compatibility alias)
+    description: See DELETE /api/comments/{commentId} — this route is byte-identical in behavior on this server version; it exists only so an older server (pre #8296) 404s instead of silently cascade-deleting replies.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted (or tombstoned) — no body.
+      '400':
+        description: Invalid `comment id`/`workspace id`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"only comment author or admin can delete".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"comment not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: '"additional message is still being delivered".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to load issue"; "failed to delete comment".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/comments/{commentId}/resolve:
+  post:
+    operationId: resolveComment
+    summary: Mark a comment thread as resolved
+    description: Clears any other resolved comment in the same thread first (single-resolution-per-thread invariant); re-resolving an already-resolved comment is a no-op that does not re-broadcast.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentResponse'
+      '400':
+        description: 'Invalid `comment id`/`workspace id`; "invalid actor id" (defensive, actor resolved to a non-UUID string).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"comment not found" (missing, tombstoned, or removed between load and write); workspace/member lookup failure.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to resolve comment".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: unresolveComment
+    summary: Clear a comment thread's resolved state
+    description: Publishes an unresolved event only if it was previously resolved (no-op suppression otherwise).
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentResponse'
+      '400':
+        description: Invalid `comment id`/`workspace id`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"comment not found" (missing, tombstoned, or workspace/member lookup failure).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to unresolve comment" (also covers a comment deleted concurrently — there is no special-cased 404 here, unlike resolve).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/comments/{commentId}/reactions:
+  post:
+    operationId: addCommentReaction
+    summary: Add an emoji reaction to a comment
+    description: No format/allowlist validation on `emoji` — any non-empty string is accepted and stored verbatim. The write is serialized under a per-comment lock against concurrent delete.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [emoji]
+            properties:
+              emoji: {type: string, minLength: 1}
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReactionResponse'
+      '400':
+        description: 'Invalid `comment id`/`workspace id`; "invalid request body"; "emoji is required".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"comment not found" (missing, tombstoned, or deleted concurrently between the check and the write).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to add reaction".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: removeCommentReaction
+    summary: Remove an emoji reaction from a comment
+    description: Matches by (actor, emoji) on this comment; removing a reaction that doesn't exist is a no-op.
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [emoji]
+            properties:
+              emoji: {type: string, minLength: 1}
+    responses:
+      '204':
+        description: Removed — no body. A no-op removal (reaction didn't exist) still returns 204, without broadcasting.
+      '400':
+        description: 'Invalid `comment id`/`workspace id`; "invalid request body"; "emoji is required".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"comment not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to remove reaction".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'

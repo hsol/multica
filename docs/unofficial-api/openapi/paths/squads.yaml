@@ -1,0 +1,711 @@
+# Domain: squads. Source: server/internal/handler/squad.go,
+# mounted at server/cmd/server/router.go:2139-2152 inside the single
+# workspace-scoped r.Group wrapped with middleware.RequireWorkspaceMember(
+# queries) (router.go ~1985 onward). Every operation below is therefore
+# gated, BEFORE the handler ever runs, by that one middleware
+# (server/internal/middleware/workspace.go:161/195-265) — no route in this
+# file has any additional per-route middleware. That shared gate is what the
+# &squadsCommonResponses anchor below documents once instead of repeating it
+# on all 10 operations.
+#
+# A "squad" (db.Squad / squad.go:24-39) is a named group with exactly one
+# leader, who must be an agent (never a human member) — enforced by handler
+# validation (GetAgentInWorkspace / LockAgentForAutopilotAssignment), not a
+# DB constraint. Squad membership (squad_member rows) is polymorphic: each
+# row is (member_type: "agent"|"member", member_id), disambiguated by an
+# explicit member_type field in every request body that references a
+# member, never by inspecting the UUID. Management of a squad (rename,
+# leader change, member add/remove/role-change, archive) is gated by
+# canManageSquad (squad.go:120-125): workspace owner/admin, or the member
+# who created the squad; read access (list/get/list-members/member-status)
+# is open to any workspace member via the route middleware alone.
+
+/api/squads:
+  get:
+    operationId: listSquads
+    summary: List a workspace's squads
+    description: >-
+      server/internal/handler/squad.go:191-225 (`ListSquads`). Unfiltered —
+      every non-archived squad in the workspace, visible to any workspace
+      member regardless of canManageSquad. Response is a bare JSON array
+      (not wrapped in an object), each entry carrying a member_count/
+      member_preview summary built from a second, batched query
+      (ListSquadMemberPreviewRows) rather than per-squad N+1 lookups.
+    tags: [squads]
+    security: &squadsAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters: &workspaceHeaders
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SquadResponse'
+      '400': &squadsWorkspaceBad400
+        description: >-
+          No workspace identifier on the request at all
+          ("workspace_id or workspace_slug is required", from the route
+          middleware), or the resolved workspace_id failed UUID parsing
+          ("invalid workspace_id").
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              identifierMissing:
+                value: { error: "workspace_id or workspace_slug is required" }
+              invalidWorkspaceId:
+                value: { error: "invalid workspace_id" }
+      '401': &squadsUnauthorized
+        $ref: '#/components/responses/Unauthorized'
+      '403': &squadsTaskTokenForbidden
+        description: >-
+          An AgentTaskToken (mat_) request targeting a workspace other than
+          the one the task token is bound to.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "task token is bound to a different workspace" }
+      '404': &squadsWorkspaceNotFound
+        description: >-
+          The resolved workspace id/slug does not exist, or the
+          authenticated user is not a member of it (the route middleware
+          collapses both cases to the same message).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "workspace not found" }
+      '500':
+        description: '"failed to list squads"; "failed to list squad member preview".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              listFailed: { value: { error: "failed to list squads" } }
+              previewFailed: { value: { error: "failed to list squad member preview" } }
+  post:
+    operationId: createSquad
+    summary: Create a squad
+    description: >-
+      server/internal/handler/squad.go:227-324 (`CreateSquad`). Any
+      workspace member may create a squad — this is intentionally as open
+      as agent/project creation — and becomes its creator, which is what
+      later gates who may manage it (canManageSquad). The leader agent
+      supplied in the request is auto-added as a squad_member with role
+      "leader" in the same call; see CreateSquadRequest for the (unchecked)
+      error-handling gap in that auto-add.
+    tags: [squads]
+    security: *squadsAuth
+    parameters: *workspaceHeaders
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateSquadRequest'
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadResponse'
+      '400':
+        description: >-
+          "invalid request body"; "name is required"; "leader_id is
+          required"; "invalid leader_id" (malformed UUID); "invalid
+          workspace_id"; "leader must be a valid agent in this workspace"
+          (leader_id does not resolve to an agent in this workspace); plus
+          the shared workspace-identifier failures below.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              nameRequired: { value: { error: "name is required" } }
+              leaderIdRequired: { value: { error: "leader_id is required" } }
+              invalidLeaderId: { value: { error: "invalid leader_id" } }
+              leaderNotAnAgent: { value: { error: "leader must be a valid agent in this workspace" } }
+      '401': *squadsUnauthorized
+      '403':
+        description: >-
+          The caller is a non-admin/owner member and the chosen leader_id is
+          an agent they cannot @-mention-trigger (`memberCanWireAgent`,
+          squad.go:126-142); or avatar_url points at an attachment already
+          bound to an issue/comment/chat; or the shared task-token
+          workspace-mismatch case.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              leaderNotWireable: { value: { error: "you can only use an agent you have access to as leader" } }
+              avatarNotPublishable: { value: { error: "avatar_url must reference a standalone image upload, not a file attached to an issue, comment, or chat" } }
+              taskTokenWorkspaceMismatch: { value: { error: "task token is bound to a different workspace" } }
+      '404': *squadsWorkspaceNotFound
+      '500':
+        description: '"failed to create squad"; "failed to load squad member preview".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              createFailed: { value: { error: "failed to create squad" } }
+              previewFailed: { value: { error: "failed to load squad member preview" } }
+
+/api/squads/{id}:
+  get:
+    operationId: getSquad
+    summary: Get a single squad
+    description: >-
+      server/internal/handler/squad.go:326-337 (`GetSquad`). Read-only; any
+      workspace member may fetch any squad regardless of canManageSquad.
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadResponse'
+      '400':
+        description: >-
+          '{id}' is not a parseable UUID ("invalid squad id"); the shared
+          workspace-identifier failures also apply (loadSquadInWorkspace
+          parses workspace_id too, "invalid workspace_id").
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              invalidSquadId: { value: { error: "invalid squad id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
+      '401': *squadsUnauthorized
+      '403': *squadsTaskTokenForbidden
+      '404':
+        description: >-
+          `{id}` does not resolve to a squad in the caller's workspace
+          (`GetSquadInWorkspace`); same message as a resolved-but-missing
+          workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "squad not found" }
+      '500':
+        description: '"failed to load squad member preview".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "failed to load squad member preview" }
+  put:
+    operationId: updateSquad
+    summary: Update a squad (rename, change leader, set instructions/avatar)
+    description: >-
+      server/internal/handler/squad.go:339-481 (`UpdateSquad`). Despite the
+      PUT verb this is a partial update — see UpdateSquadRequest for why it
+      cannot distinguish "field omitted" from "field explicitly null" the
+      way PUT /api/issues/{id} does. Runs inside a transaction that takes
+      `LockSquadForUpdate` (FOR UPDATE) before any leader change, to
+      serialize against autopilot-assignment's FOR SHARE lock on the same
+      squad row (squad.go:397-407). Changing leader_id to an agent with no
+      bound runtime auto-pauses every Autopilot currently targeting this
+      squad (`PauseAutopilotsByUnrunnableSquad`) and publishes an
+      `autopilot:updated` event for each one paused, alongside the usual
+      `squad:updated` event.
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UpdateSquadRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadResponse'
+      '400':
+        description: >-
+          "invalid squad id"/"invalid workspace_id" (same as GET); "invalid
+          request body"; "invalid leader_id" (malformed UUID); "leader must
+          be a valid agent in this workspace" (new leader_id does not
+          resolve to a workspace agent under `LockAgentForAutopilotAssignment`).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              invalidSquadId: { value: { error: "invalid squad id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidLeaderId: { value: { error: "invalid leader_id" } }
+              leaderNotAnAgent: { value: { error: "leader must be a valid agent in this workspace" } }
+      '401': *squadsUnauthorized
+      '403':
+        description: >-
+          Caller is neither a workspace owner/admin nor this squad's
+          creator ("insufficient permissions", `canManageSquad`); or the new
+          leader_id is an agent the caller cannot @-mention-trigger; or
+          avatar_url points at an attachment already bound to an
+          issue/comment/chat; or the shared task-token workspace-mismatch
+          case.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              insufficientPermissions: { value: { error: "insufficient permissions" } }
+              leaderNotWireable: { value: { error: "you can only use an agent you have access to as leader" } }
+              avatarNotPublishable: { value: { error: "avatar_url must reference a standalone image upload, not a file attached to an issue, comment, or chat" } }
+      '404':
+        description: "`{id}` does not resolve to a squad in the caller's workspace."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "squad not found" }
+      '500':
+        description: >-
+          "failed to update squad" (transaction begin/lock/leader-lookup/
+          member-check/member-insert/update/pause-autopilots/commit — every
+          internal failure in the write path maps to this one message, so
+          the client cannot distinguish which step failed); "failed to load
+          squad member preview" (post-commit response build).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              updateFailed: { value: { error: "failed to update squad" } }
+              previewFailed: { value: { error: "failed to load squad member preview" } }
+  delete:
+    operationId: deleteSquad
+    summary: Archive (soft-delete) a squad
+    description: >-
+      server/internal/handler/squad.go:483-541 (`DeleteSquad`). A soft
+      delete — sets archived_at/archived_by, does not remove the row or its
+      squad_member rows. Before archiving, best-effort reassigns every issue
+      and every autopilot currently assigned to this squad over to the
+      squad's leader agent (`TransferSquadAssignees`,
+      `TransferSquadAutopilotsToLeader`); if either transfer query itself
+      errors, the error is only logged (`slog.Warn`), not surfaced to the
+      caller or treated as a failure — the archive proceeds regardless, so a
+      transfer failure can leave an issue/autopilot pointing at an archived
+      squad id. The only guard against archiving is "already archived"; there
+      is no guard against archiving a squad that still has members, and no
+      separate "remove all members first" requirement (contrast with the
+      member-removal leader guard on DELETE .../members below).
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Archived — no body.
+      '400':
+        description: '"invalid squad id"/"invalid workspace_id"; "squad is already archived" (archived_at already set).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              invalidSquadId: { value: { error: "invalid squad id" } }
+              alreadyArchived: { value: { error: "squad is already archived" } }
+      '401': *squadsUnauthorized
+      '403':
+        description: Caller is neither a workspace owner/admin nor this squad's creator.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "insufficient permissions" }
+      '404':
+        description: "`{id}` does not resolve to a squad in the caller's workspace."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "squad not found" }
+      '500':
+        description: '"failed to archive squad".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "failed to archive squad" }
+
+/api/squads/{id}/members:
+  get:
+    operationId: listSquadMembers
+    summary: List a squad's members (static membership, no derived status)
+    description: >-
+      server/internal/handler/squad.go:545-560 (`ListSquadMembers`).
+      Read-only; any workspace member may list any squad's members
+      regardless of canManageSquad. Deliberately excludes runtime/task
+      status — this is a membership roster, not a presence view; use GET
+      .../members/status for live status. Response is a bare JSON array,
+      ordered by squad_member.created_at ASC (join order, leader not
+      pinned first the way the member_preview summary on SquadResponse is).
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SquadMemberResponse'
+      '400':
+        description: '"invalid squad id"/"invalid workspace_id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401': *squadsUnauthorized
+      '403': *squadsTaskTokenForbidden
+      '404':
+        description: "`{id}` does not resolve to a squad in the caller's workspace."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "squad not found" }
+      '500':
+        description: '"failed to list squad members".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "failed to list squad members" }
+  post:
+    operationId: addSquadMember
+    summary: Add a member (agent or human) to a squad
+    description: >-
+      server/internal/handler/squad.go:767-854 (`AddSquadMember`). Member
+      identity is polymorphic: the request body carries an explicit
+      `member_type` ("agent" | "member") alongside `member_id`, and the
+      handler branches on it to validate against the right table
+      (GetAgentInWorkspace vs. GetMemberByUserAndWorkspace) — it never
+      infers the kind from the UUID itself. Adding the same (member_type,
+      member_id) pair twice is rejected as a conflict, not silently
+      deduplicated.
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AddSquadMemberRequest'
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadMemberResponse'
+      '400':
+        description: >-
+          "invalid squad id"/"invalid workspace_id"; "invalid request
+          body"; "member_type must be 'agent' or 'member'"; "member_id is
+          required"; "invalid member_id"; "agent not found in this
+          workspace" (member_type=agent, id not a workspace agent); "member
+          not found in this workspace" (member_type=member, id not a
+          workspace member).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              invalidMemberType: { value: { error: "member_type must be 'agent' or 'member'" } }
+              memberIdRequired: { value: { error: "member_id is required" } }
+              invalidMemberId: { value: { error: "invalid member_id" } }
+              agentNotFound: { value: { error: "agent not found in this workspace" } }
+              memberNotFound: { value: { error: "member not found in this workspace" } }
+      '401': *squadsUnauthorized
+      '403':
+        description: >-
+          Caller is neither a workspace owner/admin nor this squad's
+          creator ("insufficient permissions"); or member_type=agent and the
+          caller cannot @-mention-trigger that agent
+          (`memberCanWireAgent`) — admins/owners may add any workspace
+          agent, a regular creator only agents they can themselves invoke.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              insufficientPermissions: { value: { error: "insufficient permissions" } }
+              agentNotWireable: { value: { error: "you can only add an agent you have access to" } }
+      '404':
+        description: "`{id}` does not resolve to a squad in the caller's workspace."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "squad not found" }
+      '409':
+        description: '(member_type, member_id) is already a member of this squad (unique constraint).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "member already in squad" }
+      '500':
+        description: '"failed to add squad member".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "failed to add squad member" }
+  delete:
+    operationId: removeSquadMember
+    summary: Remove a member (agent or human) from a squad
+    description: >-
+      server/internal/handler/squad.go:856-910 (`RemoveSquadMember`).
+      Request body (not a query param) carries `member_type` + `member_id`
+      to identify the row to delete, matching the polymorphic shape of
+      AddSquadMember. The ONLY removal guard in source: a request naming
+      member_type="agent" with member_id equal to the squad's current
+      leader_id is rejected before the delete runs
+      ("cannot remove the squad leader; change leader first",
+      squad.go:886-890) — change the leader via PUT /api/squads/{id} first.
+      There is no guard against removing the squad down to zero members.
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RemoveSquadMemberRequest'
+    responses:
+      '204':
+        description: Removed — no body.
+      '400':
+        description: >-
+          "invalid squad id"/"invalid workspace_id"; "invalid request
+          body"; "invalid member_id" (malformed or empty — there is no
+          separate "member_id is required" check, unlike AddSquadMember);
+          "cannot remove the squad leader; change leader first" (the one
+          removal guard described above).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              invalidMemberId: { value: { error: "invalid member_id" } }
+              cannotRemoveLeader: { value: { error: "cannot remove the squad leader; change leader first" } }
+      '401': *squadsUnauthorized
+      '403':
+        description: Caller is neither a workspace owner/admin nor this squad's creator.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "insufficient permissions" }
+      '404':
+        description: >-
+          `{id}` does not resolve to a squad in the caller's workspace
+          (same "squad not found" as other squad-scoped routes); OR the
+          squad was resolved but no squad_member row matched
+          (member_type, member_id) — "squad member not found" (0 rows
+          deleted). These are two distinct 404 bodies on this endpoint.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              squadNotFound: { value: { error: "squad not found" } }
+              memberNotFound: { value: { error: "squad member not found" } }
+      '500':
+        description: '"failed to remove squad member".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "failed to remove squad member" }
+
+/api/squads/{id}/members/status:
+  get:
+    operationId: listSquadMemberStatus
+    summary: List a squad's members with derived live status and active issues
+    description: >-
+      server/internal/handler/squad.go:654-765 (`ListSquadMemberStatus`),
+      distinct from the plain GET .../members roster above: this endpoint
+      additionally joins in runtime presence (agent_runtime status/
+      last_seen_at), archived-agent state, and any in-flight
+      (dispatched/running) task for each agent member, then derives one of
+      five status buckets per agent (`deriveSquadMemberStatus`,
+      squad.go:629-647) — working > archived is NOT the actual precedence
+      used; archived wins outright regardless of any leftover running task,
+      then working, then runtime availability (online -> idle; offline
+      within the last 5 minutes of a heartbeat -> unstable; otherwise
+      offline). Human (member_type=member) entries are returned with
+      status/active_issues/last_active_at all null/empty so the client can
+      render a single unified list without special-casing membership kind.
+      Read-only; any workspace member may call this regardless of
+      canManageSquad.
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadMemberStatusListResponse'
+      '400':
+        description: '"invalid squad id"/"invalid workspace_id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401': *squadsUnauthorized
+      '403': *squadsTaskTokenForbidden
+      '404':
+        description: "`{id}` does not resolve to a squad in the caller's workspace."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "squad not found" }
+      '500':
+        description: '"failed to list squad member status".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "failed to list squad member status" }
+
+/api/squads/{id}/members/role:
+  patch:
+    operationId: updateSquadMemberRole
+    summary: Change a squad member's role label
+    description: >-
+      server/internal/handler/squad.go:912-958 (`UpdateSquadMemberRole`).
+      `role` is a free-form string, not validated against any enum — the
+      only value the server itself ever assigns is "leader", stamped by
+      the internal leader-auto-add path on CreateSquad/UpdateSquad, never
+      by this endpoint. All three request fields are plain (non-pointer)
+      strings, so omitting `role` from the body overwrites the stored role
+      with `""` rather than leaving it unchanged — there is no partial-
+      update semantics here, unlike UpdateSquad's pointer fields. Any
+      backing-query error (not just a genuine "no such row") is reported as
+      404 "squad member not found" — the handler does not distinguish a
+      true not-found from any other query failure on this path.
+    tags: [squads]
+    security: *squadsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UpdateSquadMemberRoleRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadMemberResponse'
+      '400':
+        description: '"invalid squad id"/"invalid workspace_id"; "invalid request body"; "invalid member_id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401': *squadsUnauthorized
+      '403':
+        description: Caller is neither a workspace owner/admin nor this squad's creator.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            example: { error: "insufficient permissions" }
+      '404':
+        description: >-
+          `{id}` does not resolve to a squad in the caller's workspace
+          ("squad not found"); OR the UPDATE matched no squad_member row for
+          (member_type, member_id) — including any other query error, per
+          the description above ("squad member not found"). Two distinct
+          404 bodies on this endpoint.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+            examples:
+              squadNotFound: { value: { error: "squad not found" } }
+              memberNotFound: { value: { error: "squad member not found" } }

@@ -1,0 +1,526 @@
+# Domain-specific schemas for the "skills" slice (/api/skills*,
+# /api/skills/{id}/labels*, /api/skills/{id}/files*) — 14 endpoints, all
+# handled in server/internal/handler/skill.go, skill_create.go,
+# skill_refresh.go, skill_import_archive.go, and label.go:639-700.
+#
+# Nested under components/schemas/ per docs/unofficial-api/README.md point 4
+# so these merge into components.schemas without touching the shared
+# components/schemas.yaml (Error / ErrorCode / RevisionConflict /
+# EditConflict only).
+#
+# Every schema below is reverse-engineered directly from source; file:line
+# citations sit on the operations in paths/skills.yaml. Ambiguous or
+# unconfirmed details are called out in-line rather than guessed.
+
+# ---------------------------------------------------------------------------
+# Skill core
+# ---------------------------------------------------------------------------
+
+SkillResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:46-56 (`SkillResponse`), built by
+    `skillToResponse` (skill.go:172-184). The full shape, including the
+    SKILL.md body (`content`) — used by the detail/write endpoints, never by
+    a list endpoint (see SkillSummaryResponse).
+  required:
+    - id
+    - workspace_id
+    - name
+    - description
+    - content
+    - config
+    - created_by
+    - created_at
+    - updated_at
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    description:
+      type: string
+    content:
+      type: string
+      description: The skill's SKILL.md body.
+    config:
+      type: object
+      additionalProperties: true
+      default: {}
+      description: >-
+        Free-form JSONB blob (`decodeSkillConfig`, skill.go:212-223) —
+        defaults to `{}` when the stored value is null or fails to parse.
+        Imported skills carry provenance under `config.origin` (`{type:
+        "github"|"skills_sh"|"clawhub", source_url: "..."}`, read by
+        POST .../refresh — see skill_refresh.go:30-52); nothing else about
+        this object's shape is validated or enforced server-side.
+    created_by:
+      type: [string, "null"]
+      format: uuid
+      description: Null when the skill was created by a deleted user (CreatedBy.Valid == false).
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+# SkillSummaryResponse is the list-endpoint shape: everything SkillResponse
+# has except `content`. SKILL.md bodies routinely run 50-200KB and shipping
+# them in list payloads bloats responses past CLI timeouts on high-latency
+# links (GH multica-ai/multica#2174).
+SkillSummaryResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:63-80 (`SkillSummaryResponse`), built by
+    `skillSummaryToResponse` (skill.go:225-242). Returned (as a bare array,
+    not wrapped in an object) by GET /api/skills.
+  required:
+    - id
+    - workspace_id
+    - name
+    - description
+    - config
+    - created_by
+    - created_at
+    - updated_at
+    - labels
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    name: { type: string }
+    description: { type: string }
+    config:
+      type: object
+      additionalProperties: true
+      default: {}
+    created_by: { type: [string, "null"], format: uuid }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+    enabled:
+      type: boolean
+      description: >-
+        Only ever populated on the agent-scoped skill summary endpoints
+        (`GET /api/agents/{id}/skills`, out of this domain's scope); GET
+        /api/skills never sets it, so it is always absent here despite being
+        part of the same Go struct.
+    labels:
+      type: array
+      description: >-
+        Bulk-attached by ListSkills (skill.go:358-374) via `labelsBySkill`
+        so the client can filter without an N+1 round trip. Always a
+        (possibly empty) array on this endpoint, never omitted or null —
+        `append([]LabelResponse{}, ...)` guarantees a non-nil slice. On a
+        `labelsBySkill` query failure the whole list still succeeds with
+        every skill's `labels` defaulted to `[]` (skill.go:383-395,
+        logged as a warning, not surfaced as an error).
+      items:
+        $ref: '#/components/schemas/SkillLabelResponse'
+
+SkillWithFilesResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:133-136. SkillResponse plus its
+    supporting files with full content. Returned by GET /api/skills/{id}
+    (default `include`), POST /api/skills, PUT /api/skills/{id}, and (on
+    success) POST /api/skills/{id}/refresh.
+  allOf:
+    - $ref: '#/components/schemas/SkillResponse'
+    - type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillFileResponse'
+
+# SkillWithFileMetadataResponse is GET /api/skills/{id}?include=metadata: the
+# skill without its SKILL.md body, and its files without theirs. Sizes and
+# hashes stand in for the content that was dropped (GH
+# multica-ai/multica#7498 — a ~600KB skill could not be listed at all while
+# every row carried its full body).
+SkillWithFileMetadataResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:138-149, built by `writeSkillMetadata`
+    (skill.go:504-525). Returned by GET /api/skills/{id}?include=metadata and
+    GET /api/skills/{id}/files?include=metadata (files array only, there).
+  allOf:
+    - $ref: '#/components/schemas/SkillSummaryResponse'
+    - type: object
+      required: [content_size, content_hash, files]
+      properties:
+        content_size:
+          type: integer
+          format: int64
+          description: Byte length of the SKILL.md body that `content` would have carried.
+        content_hash:
+          type: string
+          description: Hex SHA-256 of the SKILL.md body (`contentHash`, skill.go:270-273).
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillFileMetadataResponse'
+
+SkillFileResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:94-101, built by `skillFileToResponse`
+    (skill.go:244-253). `content` is the raw file body, stored and returned
+    inline as text — there is no separate upload/blob-storage flow for skill
+    files; they live directly in the `skill_file` Postgres row.
+  required: [id, skill_id, path, content, created_at, updated_at]
+  properties:
+    id: { type: string, format: uuid }
+    skill_id: { type: string, format: uuid }
+    path: { type: string }
+    content: { type: string }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+
+SkillFileMetadataResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:110-121, built by
+    `skillFileMetadataToResponse` (skill.go:255-265). The file-listing shape
+    without `content`: size and a content hash in its place.
+  required: [id, skill_id, path, size, content_hash, created_at, updated_at]
+  properties:
+    id: { type: string, format: uuid }
+    skill_id: { type: string, format: uuid }
+    path: { type: string }
+    size:
+      type: integer
+      format: int64
+      description: Byte length of `content`, computed in Postgres.
+    content_hash:
+      type: string
+      description: >-
+        Hex SHA-256 of the file body (`encode(sha256(content::bytea),
+        'hex')` in SQL) — comparable to the Go-computed `contentHash` used
+        for `content_hash` on SkillWithFileMetadataResponse.
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+
+# ---------------------------------------------------------------------------
+# Requests
+# ---------------------------------------------------------------------------
+
+CreateSkillFileRequest:
+  type: object
+  description: server/internal/handler/skill.go:285-288.
+  required: [path, content]
+  properties:
+    path:
+      type: string
+      description: >-
+        Relative path, validated by `validateFilePath` (skill.go:308-321):
+        non-empty, not absolute, and `filepath.Clean` must not start with
+        `..` (no traversal). A literal `SKILL.md` (case-insensitive,
+        `skillpkg.IsReservedContentPath`) is silently dropped from
+        create/update bundles (it is reserved for the top-level `content`
+        field) but explicitly rejected with 400 on the single-file upsert
+        endpoint — see PUT /api/skills/{id}/files.
+    content:
+      type: string
+      description: File body. Empty string is a valid (empty) file.
+
+CreateSkillRequest:
+  type: object
+  description: server/internal/handler/skill.go:277-283.
+  required: [name]
+  properties:
+    name:
+      type: string
+      description: Required, non-empty. Unique per workspace (409 on collision).
+    description:
+      type: string
+    content:
+      type: string
+      description: SKILL.md body. Omitting it creates a skill with an empty body.
+    config:
+      description: >-
+        Arbitrary JSON (Go `any` — object, array, string, number, bool, or
+        null are all accepted as-is and persisted verbatim); `null`/absent
+        is normalized to `{}` on write (skill_create.go:30-36).
+    files:
+      type: array
+      items:
+        $ref: '#/components/schemas/CreateSkillFileRequest'
+
+UpdateSkillRequest:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:290-296 (`UpdateSkillRequest`). Every
+    field is an optional pointer except `files`, which has its own
+    presence rule: absent (`null`/omitted) leaves existing files untouched;
+    present (including `[]`) replaces the ENTIRE file set — every existing
+    file not in the new array is deleted (skill.go:665-695). There is no
+    per-file patch; a partial update that intends to keep some files must
+    resend them all.
+  properties:
+    name: { type: [string, "null"] }
+    description: { type: [string, "null"] }
+    content: { type: [string, "null"] }
+    config:
+      description: Same free-form JSON acceptance as CreateSkillRequest.config.
+    files:
+      type: [array, "null"]
+      items:
+        $ref: '#/components/schemas/CreateSkillFileRequest'
+
+ImportSkillRequest:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:751-754. The `application/json` request
+    body for POST /api/skills/import when importing from a hosted URL. See
+    that operation for the alternate `multipart/form-data` shape used for an
+    uploaded `.skill`/`.zip` archive.
+  required: [url]
+  properties:
+    url:
+      type: string
+      description: >-
+        A clawhub.ai, skills.sh, or github.com URL (scheme-optional — `//`
+        is prepended if missing), or a bare ClawHub slug with no `/` or `.`
+        (detectImportSource, skill.go:950-981).
+    on_conflict:
+      type: string
+      enum: [fail, overwrite, rename, skip]
+      description: >-
+        Omitted or `""` selects the legacy (pre-on_conflict) behavior: a
+        same-name collision returns a bare 409 instead of the structured
+        `SkillImportResult` body, and a clean create returns the bare
+        `SkillWithFilesResponse` instead of `SkillImportResult` — see the
+        operation description for the full status/body matrix. Sending the
+        literal string `"fail"` is NOT equivalent to omitting the field: it
+        still switches on the structured-response behavior
+        (`structuredResult := req.OnConflict != ""`, skill.go:2341), only
+        the conflict-handling semantics (fail with 409) match the legacy
+        default.
+
+# ---------------------------------------------------------------------------
+# Import results
+# ---------------------------------------------------------------------------
+
+ExistingSkillIdentity:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:158-163, built by
+    `existingSkillIdentity` (skill.go:200-210) /
+    `existingSkillIdentityByName` (skill.go:186-198, which always passes an
+    empty userID and therefore always reports `can_overwrite: false`).
+    Identifies the pre-existing skill a name collision was resolved against.
+  required: [id, name]
+  properties:
+    id: { type: string, format: uuid }
+    name: { type: string }
+    created_by:
+      type: string
+      format: uuid
+      description: Omitted (`omitempty`) when the existing skill's creator is unknown/deleted.
+    can_overwrite:
+      type: boolean
+      description: >-
+        Whether the caller may overwrite this skill via a local-runtime
+        re-import (`canOverwriteSkillByLocalImport` — creator-only, strictly
+        narrower than the general `canManageSkill` admin-or-creator policy
+        used elsewhere; see MUL-2701 / MUL-2800). `omitempty`: absent means
+        false, not just unset.
+
+SkillImportResult:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:151-156. The structured response body
+    for POST /api/skills/import whenever `on_conflict` was explicitly sent
+    (JSON body) or the request was a multipart archive upload (always
+    structured). See the operation description for which `status` values
+    pair with which HTTP status code.
+  required: [status]
+  properties:
+    status:
+      type: string
+      enum: [created, updated, skipped, conflict, failed]
+      description: >-
+        `created` — a new skill row was written (clean import, or
+        `on_conflict=rename`). `updated` — `on_conflict=overwrite` replaced
+        an existing skill in place. `skipped` — `on_conflict=skip` left the
+        existing skill untouched. `conflict` — no `on_conflict` strategy
+        matched skip/overwrite/rename (i.e. `on_conflict=fail`, the
+        explicit-but-default case). `failed` — the chosen strategy could not
+        be carried out (permission denied, the target vanished mid-flight,
+        or a write error).
+    reason:
+      type: string
+      description: Human-readable detail; omitted only when status is "created" without a rename.
+    skill:
+      $ref: '#/components/schemas/SkillWithFilesResponse'
+    existing_skill:
+      $ref: '#/components/schemas/ExistingSkillIdentity'
+
+# writeSkillImportDuplicateConflict (skill.go:165-170) — a second, narrower
+# 409 shape hit only on the race path described on the import operation
+# (unique-violation recovery when the structured re-lookup itself fails but
+# a plain by-name lookup still succeeds), and on the legacy
+# (on_conflict-omitted) duplicate-name path. Deliberately NOT folded into
+# SkillImportResult: it has no "status"/"reason" fields, just {error,
+# existing_skill}.
+SkillImportDuplicateConflictResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:165-170
+    (`writeSkillImportDuplicateConflict`). Always HTTP 409.
+  required: [error, existing_skill]
+  properties:
+    error:
+      type: string
+      const: a skill with this name already exists
+    existing_skill:
+      $ref: '#/components/schemas/ExistingSkillIdentity'
+
+# ---------------------------------------------------------------------------
+# Search (ClawHub proxy)
+# ---------------------------------------------------------------------------
+
+SkillSearchCandidateResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:123-131, built by `searchClawHubSkills`
+    (skill.go:1006-1044). One ClawHub search hit. `install_count` is fetched
+    with a second request per candidate, capped at the first 10 results
+    (`clawHubSearchStatsLimit`) to bound the number of upstream calls;
+    `github_stars` is declared on the struct but no code path in this
+    handler ever sets it (always absent/null on the wire) — not confirmed
+    to be populated anywhere else either.
+  required: [name, url, source, repo, description]
+  properties:
+    name:
+      type: string
+      description: ClawHub `displayName`, falling back to `slug` when blank.
+    url:
+      type: string
+      description: Constructed ClawHub URL (`https://clawhub.ai/{owner}/{slug}` or `/{slug}` with no owner).
+    source:
+      type: string
+      const: clawhub.ai
+    repo:
+      type: [string, "null"]
+      description: Always null from this handler (field exists on the struct but is never assigned here).
+    install_count:
+      type: [integer, "null"]
+      format: int64
+      description: Null when the per-candidate stats fetch was skipped (beyond the first 10) or failed.
+    github_stars:
+      type: [integer, "null"]
+      format: int64
+      description: Always null — see the schema-level note.
+    description:
+      type: string
+
+# Ad hoc 502 body written directly with writeJSON (skill.go:421-426), NOT
+# through writeErrorCode — its "code" value ("upstream_unavailable") is not
+# a member of the shared ErrorCode enum in components/schemas.yaml, so it is
+# modeled here as its own plain-string code rather than borrowing that
+# component. Flagged in the domain report rather than added to the shared
+# enum (out of scope for this ticket to edit).
+SkillSearchUpstreamErrorResponse:
+  type: object
+  description: >-
+    server/internal/handler/skill.go:412-429 (`SearchSkills`). Written when
+    the ClawHub search request itself fails (network error, non-200
+    response, or an undecodable response body) — distinct from the shared
+    `ErrorCode` schema's fixed 50-value enum.
+  required: [code, error]
+  properties:
+    code:
+      type: string
+      const: upstream_unavailable
+    error:
+      type: string
+      description: >-
+        One of `"failed to reach ClawHub: <err>"`, `"ClawHub search returned
+        status <n>"`, or `"failed to parse ClawHub search response"`.
+
+# ---------------------------------------------------------------------------
+# Labels (skill-scoped)
+# ---------------------------------------------------------------------------
+
+# label.go's labelToResponse/labelsToResponse (label.go:37-70) build this
+# from db.IssueLabel — the same underlying row type issue labels use — but
+# no shared "Label" component exists yet in this codebase (the dedicated
+# labels-domain ticket hasn't landed). Scoped here to what the skill label
+# endpoints actually emit; deliberately not named "Label" to avoid a future
+# collision with that ticket's own component.
+SkillLabelResponse:
+  type: object
+  description: >-
+    server/internal/handler/label.go:25-35 (`LabelResponse`), built by
+    `labelToResponse`/`labelsToResponse` (label.go:37-70) for the three
+    skill-label endpoints. `usage_count` is part of the shared Go struct but
+    is only ever populated by the issue-label list query
+    (`labelListRowToResponse`, label.go:50-62, out of scope here) — every
+    skill-label response path (`labelToResponse`, plus
+    `labelsBySkill`/`ListLabelsForSkills` on the list-skills endpoint) leaves
+    it at its zero value, so it is always `0` on every response in this
+    domain, never a real count.
+  required:
+    - id
+    - workspace_id
+    - resource_type
+    - name
+    - description
+    - color
+    - usage_count
+    - created_at
+    - updated_at
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    resource_type:
+      type: string
+      const: skill
+      description: >-
+        Always `"skill"` on this domain's endpoints — AttachLabelToSkill
+        rejects any label whose `resource_type` isn't `"skill"` with 404
+        (label.go:668-672).
+    name: { type: string }
+    description: { type: string }
+    color: { type: string }
+    usage_count:
+      type: integer
+      format: int64
+      description: Always 0 here — see the schema-level note.
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+
+SkillLabelListResponse:
+  type: object
+  description: >-
+    server/internal/handler/label.go:651 (`ListLabelsForSkill`) and the tail
+    shared by AttachLabelToSkill/DetachLabelFromSkill, which both re-render
+    this same shape after mutating (label.go:680, label.go:699-700).
+  required: [labels]
+  properties:
+    labels:
+      type: array
+      items:
+        $ref: '#/components/schemas/SkillLabelResponse'
+
+AttachSkillLabelRequest:
+  type: object
+  description: server/internal/handler/label.go:372-374 (`AttachLabelRequest`), reused as-is for the skill endpoint.
+  required: [label_id]
+  properties:
+    label_id:
+      type: string
+      format: uuid
+      description: >-
+        Must already exist in the workspace with `resource_type: "skill"`
+        (404 otherwise, label.go:668-672). Re-attaching an already-attached
+        label is a silent no-op (`ON CONFLICT DO NOTHING` in the underlying
+        `skill_to_label` insert, pkg/db/queries/issue_label.sql:234-248) —
+        not an error.

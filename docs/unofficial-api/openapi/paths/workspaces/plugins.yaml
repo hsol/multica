@@ -1,0 +1,683 @@
+# Domain: Plugins.
+# Source: server/internal/handler/plugin.go, plugin_package.go, plugin_mcp.go,
+# plugin_surface.go, plugin_hook.go; router.go:1692-1786.
+#
+# Common to all 17 operations below:
+# - Gated by `requirePluginsV1` (feature flag) FIRST, before any other check:
+#   403 {error: "Plugin management is not enabled", code: "plugin_api_disabled"}.
+# - `writePluginError` (plugin.go:30-52) maps a `service.PluginError.Kind` to
+#   a status: invalid->400, not_found->404, conflict->409, forbidden->403,
+#   incompatible->422, quota->507, anything else (including "unavailable")
+#   ->502 default. A non-PluginError err is 500. All of these use the plain
+#   `Error` schema (`{error}`, no `code`) — `writePluginError` never calls
+#   `writeErrorCode`.
+# - GET /plugins and GET .../surfaces/.../launch require only membership;
+#   every other operation below requires `owner` or `admin`
+#   (RequireWorkspaceRoleFromURL, router.go:1734).
+
+/api/workspaces/{id}/plugins:
+  get:
+    operationId: listPlugins
+    summary: List installed Plugins
+    description: plugin.go:181-204 (`ListPlugins`). Member-visible.
+    tags: [Workspaces, Plugins]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plugins]
+              properties:
+                plugins: {type: array, items: {$ref: '#/components/schemas/PluginInstallationResponse'}}
+      '403':
+        description: Plugin management feature flag disabled.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "Plugin management is not enabled", code: plugin_api_disabled}
+      '500':
+        description: Listing or payload-building failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list Plugins"}
+  post:
+    operationId: installPlugin
+    summary: Install a Plugin (step two)
+    description: >-
+      plugin.go:235-270 (`InstallPlugin`). Step two of the two-step install —
+      should reuse the `version_id` a prior `POST .../plugins/preview` call
+      returned, so the consented manifest and the executed code are
+      guaranteed to be the same artifact. Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/InstallPluginRequest'}
+    responses:
+      '201':
+        description: Installed
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginInstallationResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, or PluginError(invalid).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid request body"}
+      '403':
+        description: Plugin management disabled, or PluginError(forbidden).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '404':
+        description: PluginError(not_found) — unknown version_id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: Already installed, or `granted_scopes` does not exactly match the manifest's scopes.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              alreadyInstalled: {value: {error: "this plugin is already installed in this workspace"}}
+              scopeMismatch: {value: {error: "granted_scopes contains \"repo:write\", which the manifest does not request"}}
+      '422':
+        description: PluginError(incompatible) — manifest incompatible with this deployment.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Payload-building after install failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to install the Plugin"}
+      '502':
+        description: PluginError default/unavailable kind.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '507':
+        description: PluginError(quota).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/preview:
+  post:
+    operationId: previewPlugin
+    summary: Preview a Plugin before installing (step one)
+    description: >-
+      plugin.go:206-233 (`PreviewPlugin`). Writes nothing — lets the
+      administrator see the scope list and manifest before consenting.
+      Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/PreviewPluginRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginPreviewResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, or PluginError(invalid).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Plugin management disabled, or PluginError(forbidden).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found) — unknown version_id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '422':
+        description: PluginError(incompatible).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '502':
+        description: PluginError default/unavailable kind.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/packages:
+  get:
+    operationId: listPluginPackages
+    summary: List published Plugin packages
+    description: plugin_package.go:21-35 (`ListPluginPackages`). Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [packages]
+              properties:
+                packages: {type: array, items: {$ref: '#/components/schemas/PluginPackageSummary'}}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '502':
+        description: PluginError default kind (fallback "failed to list published Plugins").
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list published Plugins"}
+  post:
+    operationId: publishPluginPackage
+    summary: Publish a Plugin package from an uploaded bundle
+    description: >-
+      plugin_package.go:42-92 (`PublishPluginPackage`). Multipart upload, NOT
+      a JSON body. Max size is `plugincontract.MaxBundleSize` plus a 64 KiB
+      multipart overhead allowance. Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [bundle]
+            properties:
+              bundle: {type: string, format: binary, description: "Zip archive of the plugin bundle."}
+    responses:
+      '201':
+        description: Published
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginPackageSummary'}
+      '400':
+        description: No `bundle` field in the form, the bundle could not be read, or PluginError(invalid) — manifest/bundle validation failure (e.g. incomplete surface).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              missing: {value: {error: "a Plugin package file is required"}}
+              readFailed: {value: {error: "failed to read the Plugin package"}}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '413':
+        description: Malformed/oversized multipart form, or the bundle itself exceeds the size cap.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              malformed: {value: {error: "the Plugin package upload is too large or malformed"}}
+              tooLarge: {value: {error: "the Plugin package is too large"}}
+
+/api/workspaces/{id}/plugins/packages/local:
+  post:
+    operationId: publishLocalPluginPackage
+    summary: Publish a Plugin package from a local dev directory
+    description: >-
+      plugin_package.go:99-135 (`PublishLocalPluginPackage`). Dev-only
+      channel: loads from a subdirectory of `MULTICA_PLUGIN_DIR`. Owner/admin
+      only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/PublishLocalPluginRequest'}
+    responses:
+      '201':
+        description: Published
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginPackageSummary'}
+      '400':
+        description: Invalid body, empty/unsafe name, or PluginError(invalid) (e.g. `MULTICA_PLUGIN_DIR` unset).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid request body"}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/packages/{packageId}:
+  delete:
+    operationId: deletePluginPackage
+    summary: Delete a published Plugin package
+    description: plugin_package.go:138-151 (`DeletePluginPackage`). Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: packageId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted.
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: PluginError(conflict) (e.g. package has installed versions in use — not independently re-verified from this file alone).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}:
+  delete:
+    operationId: uninstallPlugin
+    summary: Uninstall a Plugin
+    description: plugin.go:328-339 (`UninstallPlugin`). Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Uninstalled.
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}/invocations:
+  get:
+    operationId: listPluginInvocations
+    summary: List a Plugin installation's recent hook invocations
+    description: >-
+      plugin_hook.go:125-168 (`ListPluginInvocations`). Owner/admin only
+      (installation-scoped routes sit in the admin group). Bodies were never
+      stored — this answers "what happened and how often", not "what was
+      sent". Capped at the 100 most recent, no further pagination.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invocations]
+              properties:
+                invocations: {type: array, items: {$ref: '#/components/schemas/PluginInvocationResponse'}}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to load the Plugin activity"}
+
+/api/workspaces/{id}/plugins/{installationId}/token:
+  post:
+    operationId: rotatePluginToken
+    summary: Rotate a Plugin installation's inbound token
+    description: >-
+      plugin_hook.go:181-192 (`RotatePluginToken`). Owner/admin only. The
+      token and signing secret are returned exactly once, on this call — no
+      read endpoint exists; a lost token must be rotated again, not recovered.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginTokenResponse'}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+  delete:
+    operationId: revokePluginToken
+    summary: Revoke a Plugin installation's inbound token
+    description: plugin_hook.go:195-205 (`RevokePluginToken`). Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}/mcp/{hookKey}/tools:
+  get:
+    operationId: listPluginMCPTools
+    summary: Discover an MCP hook's available tools
+    description: >-
+      plugin_mcp.go:32-58 (`ListPluginMCPTools`). Owner/admin only. Read-only
+      discovery — adopts nothing; `approved`/`drifted` reflect previously
+      approved state compared against the live schema digest.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: hookKey
+        in: path
+        required: true
+        schema: {type: string}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tools]
+              properties:
+                tools: {type: array, items: {$ref: '#/components/schemas/PluginMCPToolResponse'}}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found) — unknown installation/hookKey.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '502':
+        description: PluginError default/unavailable — could not reach the Plugin's MCP server.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to reach the Plugin's MCP server"}
+  put:
+    operationId: approvePluginMCPTools
+    summary: Set an MCP hook's approved tool set
+    description: >-
+      plugin_mcp.go:68-100 (`ApprovePluginMCPTools`). Owner/admin only.
+      `tools` is the COMPLETE approved set, not a delta — omitting a
+      previously-approved name revokes it. Tools are pinned by schema digest.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: hookKey
+        in: path
+        required: true
+        schema: {type: string}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ApprovePluginMCPToolsRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginInstallationResponse'}
+      '400':
+        description: Invalid body, or PluginError(invalid).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid request body"}
+      '401':
+        description: Not authenticated (`requireUserID`).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}/config:
+  put:
+    operationId: configurePlugin
+    summary: Set a Plugin installation's configuration values
+    description: >-
+      plugin.go:272-298 (`ConfigurePlugin`). Owner/admin only. Secret fields
+      route to a separate encrypted table (`SetConfig`); the response's
+      `config` never echoes them back, only `configured_secrets` (names).
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ConfigurePluginRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginInstallationResponse'}
+      '400':
+        description: Invalid body, or PluginError(invalid) — unknown field, non-string value, or secret value exceeds the byte cap.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              unknownField: {value: {error: "unknown config field \"timeout\""}}
+              notString: {value: {error: "config field \"api_key\" must be a string"}}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}/enable:
+  post:
+    operationId: enablePlugin
+    summary: Enable a Plugin installation
+    description: plugin.go:300-303 (`EnablePlugin`, shares `setPluginEnabled` with Disable). Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginInstallationResponse'}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}/disable:
+  post:
+    operationId: disablePlugin
+    summary: Disable a Plugin installation
+    description: plugin.go:305-308 (`DisablePlugin`, shares `setPluginEnabled` with Enable). Owner/admin only.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginInstallationResponse'}
+      '403':
+        description: Plugin management disabled, or caller not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: PluginError(not_found).
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+/api/workspaces/{id}/plugins/{installationId}/surfaces/{surfaceKey}/launch:
+  get:
+    operationId: getPluginSurfaceLaunch
+    summary: Get a short-lived launch descriptor for a hosted Plugin surface
+    description: >-
+      plugin_surface.go:152-214 (`GetPluginSurfaceLaunch`). Member-visible
+      (not admin-gated) — opening an issue is what triggers this, not an
+      admin action. Returns a 2-minute-TTL bridge token and launch URL, never
+      the surface's executable bytes. Response sent with
+      `Cache-Control: private, no-store`.
+    tags: [Workspaces, Plugins]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: surfaceKey
+        in: path
+        required: true
+        schema: {type: string}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PluginSurfaceLaunchResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: >-
+          Plugin management disabled; surfaces not configured on this
+          deployment (`plugin_surfaces_not_configured`); or the installation
+          is disabled.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              surfacesNotConfigured: {value: {error: "Plugin surfaces are not configured", code: plugin_surfaces_not_configured}}
+              disabledPlugin: {value: {error: "this Plugin is disabled"}}
+      '404':
+        description: PluginError(not_found) — unknown installation/surfaceKey.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Misconfigured surface signing (origin parsing/derivation failure).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "Plugin surfaces are misconfigured", code: plugin_surfaces_misconfigured}

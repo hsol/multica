@@ -1,0 +1,458 @@
+# Domain: Slack + Telegram + WeCom channel integrations.
+# Source: server/internal/handler/slack.go, telegram.go, wecom_web.go,
+# router.go:1836-1868. Binding-token redemption endpoints
+# (/api/{slack,telegram,wecom}/binding/redeem) are a different ticket's scope
+# (G8) and are NOT documented here.
+#
+# Common pattern across all three channels: GET (list) requires only
+# workspace membership and degrades to `configured: false` + empty list
+# rather than erroring when the at-rest encryption key (or, for WeCom, any of
+# its 3 dependencies) is unset. DELETE (revoke) and POST (BYO install) both
+# require `owner` or `admin` and 403 with a `*_not_configured` code when the
+# integration isn't configured. None of the three list/response types ever
+# include the raw bot token/secret.
+
+/api/workspaces/{id}/slack/installations:
+  get:
+    operationId: listSlackInstallations
+    summary: List the workspace's Slack app installations
+    description: slack.go:56-83 (`ListSlackInstallations`). Member-visible.
+    tags: [Workspaces, Slack]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SlackInstallationsListResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list slack installations"}
+
+/api/workspaces/{id}/slack/installations/{installationId}:
+  delete:
+    operationId: revokeSlackInstallation
+    summary: Revoke a Slack app installation
+    description: >-
+      slack.go:182-217 (`RevokeSlackInstallation`). Requires `owner` or
+      `admin`. Soft-delete (status -> 'revoked', row preserved for audit /
+      reinstall).
+    tags: [Workspaces, Slack]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '400':
+        description: Invalid workspace id or installation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Slack integration not configured, or caller is not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "slack integration not configured", code: slack_not_configured}
+      '404':
+        description: No Slack installation with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "slack installation not found"}
+      '500':
+        description: Loading the installation, or the revoke, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/slack/install/byo:
+  post:
+    operationId: registerSlackBYO
+    summary: Register a user-supplied ("bring your own") Slack app for an agent
+    description: >-
+      slack.go:98-168 (`RegisterSlackBYO`). Requires `owner` or `admin`. Lets
+      several agents in the same Slack workspace each have their own bot
+      identity. Broadcasts `slack_installation:created` on success.
+    tags: [Workspaces, Slack]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: agent_id
+        in: query
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RegisterSlackBYORequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SlackInstallationResponse'}
+      '400':
+        description: Invalid workspace/agent/user id, missing `agent_id`, invalid body, or the tokens themselves failed verification.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              missingAgent: {value: {error: "agent_id is required"}}
+              invalidBody: {value: {error: "invalid request body"}}
+              verifyFailed: {value: {error: "could not verify the Slack tokens — check the bot token and app-level token, that the app is installed to your workspace, and that it has the users:read scope"}}
+      '403':
+        description: Slack integration not configured, or caller is not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "slack integration not configured", code: slack_not_configured}
+      '404':
+        description: No agent with `agent_id` in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "agent not found in this workspace"}
+      '409':
+        description: This Slack app is already connected to another agent in the same workspace, to an archived agent, or to a different Multica workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              sameWorkspace: {value: {error: "this Slack app is already connected to another agent in this workspace — disconnect it there first, then connect it here"}}
+              archived: {value: {error: "this Slack app is connected to an archived agent in this workspace — restore that agent, or disconnect its app, before connecting it here"}}
+              otherWorkspace: {value: {error: "this Slack app is already connected to a different Multica workspace — disconnect it there before connecting it here"}}
+
+/api/workspaces/{id}/telegram/installations:
+  get:
+    operationId: listTelegramInstallations
+    summary: List the workspace's Telegram bot installations
+    description: telegram.go:53-80 (`ListTelegramInstallations`). Member-visible.
+    tags: [Workspaces, Telegram]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TelegramInstallationsListResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list telegram installations"}
+
+/api/workspaces/{id}/telegram/installations/{installationId}:
+  delete:
+    operationId: revokeTelegramInstallation
+    summary: Revoke a Telegram bot installation
+    description: >-
+      telegram.go:169-204 (`RevokeTelegramInstallation`). Requires `owner` or
+      `admin`. Soft-delete (status -> 'revoked'), preserving chat history.
+    tags: [Workspaces, Telegram]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '400':
+        description: Invalid workspace id or installation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Telegram integration not configured, or caller is not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "telegram integration not configured", code: telegram_not_configured}
+      '404':
+        description: No Telegram installation with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "telegram installation not found"}
+      '500':
+        description: Loading the installation, or the revoke, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/telegram/install:
+  post:
+    operationId: registerTelegramBot
+    summary: Register a Telegram bot for an agent
+    description: >-
+      telegram.go:91-163 (`RegisterTelegramBot`). Requires `owner` or `admin`.
+      Uses long polling, not webhooks — a bot with an existing webhook
+      configured is rejected until the webhook is removed.
+    tags: [Workspaces, Telegram]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: agent_id
+        in: query
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RegisterTelegramRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TelegramInstallationResponse'}
+      '400':
+        description: Invalid workspace/agent id, missing `agent_id`, invalid body, Telegram rejected the token, or the bot has a webhook configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              missingAgent: {value: {error: "agent_id is required"}}
+              invalidBody: {value: {error: "invalid request body"}}
+              rejectedToken: {value: {error: "Telegram rejected this bot token — generate a current token in @BotFather and try again"}}
+              webhookConfigured: {value: {error: "this Telegram bot has a webhook configured — remove the webhook before connecting it with long polling"}}
+      '403':
+        description: Telegram integration not configured, or caller is not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "telegram integration not configured", code: telegram_not_configured}
+      '404':
+        description: No agent with `agent_id` in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "agent not found in this workspace"}
+      '409':
+        description: This Telegram bot is already connected to another agent in the same workspace, to an archived agent, or to a different Multica workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '500':
+        description: Saving the bot after successful verification failed (token not persisted).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "could not save this Telegram bot — something went wrong on the server; the token was not saved"}
+      '503':
+        description: Telegram could not be reached to verify the bot (network/proxy issue) — distinct from credential rejection; token not persisted.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "could not reach Telegram to verify this bot — check the server network or proxy and try again; the token was not saved"}
+
+/api/workspaces/{id}/wecom/installations:
+  get:
+    operationId: listWecomInstallations
+    summary: List the workspace's WeCom smart-bot installations
+    description: >-
+      wecom_web.go:74-106 (`ListWecomInstallations`). Member-visible. Degrades
+      to `configured: false` when ANY of 3 dependencies (WecomStore,
+      WecomCredentials, ChannelRouter) is nil — a stricter check than
+      Slack/Telegram/Lark's single-dependency check.
+    tags: [Workspaces, WeCom]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WecomInstallationsListResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: WeCom "service" resolver misconfigured (distinct from simply unconfigured, which returns 200 instead — see description).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "wecom integration not enabled", code: wecom_not_configured}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list wecom installations"}
+
+/api/workspaces/{id}/wecom/installations/{installationId}:
+  delete:
+    operationId: revokeWecomInstallation
+    summary: Revoke a WeCom smart-bot installation
+    description: >-
+      wecom_web.go:265-303 (`RevokeWecomInstallation`). Requires `owner` or
+      `admin`. Row-preserving: a later re-install atomically upserts back to
+      'active'.
+    tags: [Workspaces, WeCom]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '400':
+        description: Invalid workspace id or installation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: WeCom integration not configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "wecom integration not enabled", code: wecom_not_configured}
+      '404':
+        description: No WeCom installation with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "wecom installation not found"}
+      '500':
+        description: Loading the installation, or the revoke, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/wecom/install/byo:
+  post:
+    operationId: registerWecomBYO
+    summary: Register a user-supplied ("bring your own") WeCom smart-bot for an agent
+    description: >-
+      wecom_web.go:127-187 (`RegisterWecomBYO`). Requires `owner` or `admin`.
+      Request body capped at 16 KiB — the only one of the five channel BYO
+      endpoints with an explicit size limit. All error responses carry a
+      stable `code` via `writeWecomInstallError` (wecom_web.go:215-260).
+    tags: [Workspaces, WeCom]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: agent_id
+        in: query
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RegisterWecomBYORequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WecomInstallationResponse'}
+      '400':
+        description: >-
+          Invalid workspace/agent id, missing `agent_id`, invalid body
+          (including an over-16KiB body), or required installation params
+          missing (`wecom_install_rejected`) / rejected by WeCom
+          (`wecom_credentials_rejected`) — `code` is confirmed from source;
+          the `error` text for those last two is illustrative only, not an
+          independently re-verified literal (defined in the `wecom` package).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              missingAgent: {value: {error: "agent_id is required"}}
+              invalidBody: {value: {error: "invalid request body"}}
+              rejectedParams: {value: {error: "bot_id and secret are required", code: wecom_install_rejected}}
+              credentialsRejected: {value: {error: "wecom rejected these credentials", code: wecom_credentials_rejected}}
+      '403':
+        description: WeCom integration not configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "wecom integration not enabled", code: wecom_not_configured}
+      '404':
+        description: No agent with `agent_id` in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "agent not found in this workspace"}
+      '409':
+        description: >-
+          This WeCom bot is already connected to another agent in the same
+          workspace, to an archived agent, or to a different Multica
+          workspace. `code` is confirmed from source; `error` text below is
+          illustrative only.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            examples:
+              sameWorkspace: {value: {error: "this wecom bot is already connected to another agent in this workspace", code: wecom_bot_owned_by_same_workspace}}
+              archived: {value: {error: "this wecom bot is connected to an archived agent in this workspace", code: wecom_bot_owned_by_archived_agent}}
+              otherWorkspace: {value: {error: "this wecom bot is already connected to a different multica workspace", code: wecom_bot_owned_by_another_workspace}}
+      '500':
+        description: Any failure not attributable to the submitted credentials (DB, encryption key, internal bug) — logged as an error server-side. `code` is confirmed from source; the `error` text below is illustrative only, not an independently re-verified literal.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "could not install this wecom bot", code: wecom_install_failed}
+      '503':
+        description: WeCom could not be reached to verify the credentials; credentials themselves are not blamed. `code` is confirmed from source; the `error` text below is illustrative only, not an independently re-verified literal.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "could not verify these wecom credentials", code: wecom_credentials_unverifiable}

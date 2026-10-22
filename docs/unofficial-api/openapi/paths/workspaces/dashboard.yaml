@@ -1,0 +1,229 @@
+# Domain: workspace dashboard rollups.
+# Source: server/internal/handler/dashboard.go, router.go:1985-1986 (group
+# middleware), 2314-2321 (route registration).
+#
+# UNLIKE every other operation in this ticket's domain, these 6 are scoped by
+# the X-Workspace-ID/X-Workspace-Slug HEADER (middleware.RequireWorkspaceMember,
+# no {id} in the path) rather than a URL path parameter — hence the header
+# parameters below, matching the account/dashboard-style domains, not the
+# path-scoped workspaces/* operations in this same ticket.
+#
+# All 6 share: `?days=N` (default 30, capped at 365) and optional
+# `?project_id=<uuid>` to scope to one project (omitted = whole workspace).
+# The 3 per-AGENT rollups (usage/by-agent, agent-runtime, failures/by-agent)
+# additionally apply per-agent visibility: rows for an agent the caller may
+# not see are folded into a synthetic `"__restricted_agents__"` bucket rather
+# than dropped, so the visible rows plus the bucket still sum to the
+# workspace-wide totals. The 3 non-agent series (usage/daily, runtime/daily,
+# failures/daily) carry no such restriction.
+
+/api/dashboard/usage/daily:
+  get:
+    operationId: getDashboardUsageDaily
+    summary: Per-day token usage rollup
+    description: >-
+      dashboard.go:178-196 (`GetDashboardUsageDaily`). Backed by
+      `task_usage_hourly`, bucketed into calendar days in the viewer's
+      timezone. No agent-visibility restriction.
+    tags: [Dashboard]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters: &dashboardParams
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: days
+        in: query
+        required: false
+        schema: {type: integer, default: 30, maximum: 365}
+      - name: project_id
+        in: query
+        required: false
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/DashboardUsageDailyResponse'}}
+      '400':
+        description: Invalid `project_id`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid project_id"}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list usage"}
+
+/api/dashboard/usage/by-agent:
+  get:
+    operationId: getDashboardUsageByAgent
+    summary: Per-agent token usage rollup
+    description: >-
+      dashboard.go:262-293 (`GetDashboardUsageByAgent`). Uses the EXACT
+      N-day cutoff (not N+1) because this response carries no date dimension
+      the client could otherwise trim (MUL-5551 fix). Restricted-agent rows
+      fold into `"__restricted_agents__"`, split by (provider, model) so cost
+      remains computable.
+    tags: [Dashboard]
+    security: *auth
+    parameters: *dashboardParams
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/DashboardUsageByAgentResponse'}}
+      '400':
+        description: Invalid `project_id`.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Resolving restricted agents, or the query itself, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              restricted: {value: {error: "failed to resolve agent access"}}
+              query: {value: {error: "failed to list usage by agent"}}
+
+/api/dashboard/agent-runtime:
+  get:
+    operationId: getDashboardAgentRunTime
+    summary: Per-agent total run time and task counts
+    description: >-
+      dashboard.go:384-430 (`GetDashboardAgentRunTime`). Counts only terminal
+      tasks (completed/failed/cancelled) with both `started_at` and
+      `completed_at` set. `failed_count`/`cancelled_count` are disjoint
+      subsets of `task_count`. Exact N-day cutoff (MUL-5551, same rationale as
+      usage/by-agent); restricted agents fold into one
+      `"__restricted_agents__"` bucket (no further dimension).
+    tags: [Dashboard]
+    security: *auth
+    parameters: *dashboardParams
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/DashboardAgentRunTimeResponse'}}
+      '400':
+        description: Invalid `project_id`.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Resolving restricted agents, or the query itself, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              restricted: {value: {error: "failed to resolve agent access"}}
+              query: {value: {error: "failed to list agent runtime"}}
+
+/api/dashboard/runtime/daily:
+  get:
+    operationId: getDashboardRunTimeDaily
+    summary: Per-day total run time and task counts
+    description: >-
+      dashboard.go:474-510 (`GetDashboardRunTimeDaily`). Same terminal-task
+      filter as agent-runtime; bucketed by `completed_at` in the viewer's
+      timezone. Workspace-wide, no agent restriction.
+    tags: [Dashboard]
+    security: *auth
+    parameters: *dashboardParams
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/DashboardRunTimeDailyResponse'}}
+      '400':
+        description: Invalid `project_id`.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list daily runtime"}
+
+/api/dashboard/failures/daily:
+  get:
+    operationId: getDashboardFailuresDaily
+    summary: Per-day terminal-task counts by failure reason
+    description: >-
+      dashboard.go:538-575 (`GetDashboardFailuresDaily`). Returns EVERY
+      terminal task, not only failed ones — `failure_reason: ""` is the
+      succeeded-task bucket, carried in the same payload as the denominator
+      for an error-rate calculation. Workspace-wide, no agent restriction.
+    tags: [Dashboard]
+    security: *auth
+    parameters: *dashboardParams
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/DashboardFailureDailyResponse'}}
+      '400':
+        description: Invalid `project_id`.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list daily failures"}
+
+/api/dashboard/failures/by-agent:
+  get:
+    operationId: getDashboardFailuresByAgent
+    summary: Per-agent terminal-task counts by failure reason
+    description: >-
+      dashboard.go:588-630 (`GetDashboardFailuresByAgent`). Same "every
+      terminal task" convention as failures/daily. Exact N-day cutoff
+      (MUL-5551). Restricted-agent rows fold into `"__restricted_agents__"`,
+      split by `failure_reason` so the offender list's rate math still
+      reconciles.
+    tags: [Dashboard]
+    security: *auth
+    parameters: *dashboardParams
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/DashboardFailureByAgentResponse'}}
+      '400':
+        description: Invalid `project_id`.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Resolving restricted agents, or the query itself, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              restricted: {value: {error: "failed to resolve agent access"}}
+              query: {value: {error: "failed to list failures by agent"}}

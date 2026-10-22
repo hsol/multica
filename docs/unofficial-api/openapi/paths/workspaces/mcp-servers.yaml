@@ -1,0 +1,218 @@
+# Domain: workspace MCP server library.
+# Source: server/internal/handler/workspace_mcp_api.go (HTTP layer) and
+# workspace_mcp.go (domain logic, no HTTP handlers), router.go:1694-1759.
+#
+# Scope note: workspace_mcp_api.go also contains agent-scoped MCP binding
+# handlers (ListAgentMcpServers/AddAgentMcpServer/SetAgentMcpServerEnabled/
+# RemoveAgentMcpServer, under /api/agents/{id}/mcp-servers...) — out of this
+# ticket's 78-endpoint scope and not documented here.
+
+/api/workspaces/{id}/mcp-servers:
+  get:
+    operationId: listWorkspaceMcpServers
+    summary: List the workspace's MCP server library
+    description: >-
+      workspace_mcp_api.go:90 (`ListWorkspaceMcpServers`). Requires
+      membership. Returns the whole library (including entries not yet bound
+      to any agent), ordered by name; no pagination. Response never carries
+      raw config/secrets — `transport` is derived server-side.
+    tags: [Workspaces, MCP Servers]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/WorkspaceMcpServerResponse'}}
+      '400':
+        description: Invalid workspace id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid workspace id"}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list workspace MCP servers"}
+  post:
+    operationId: createWorkspaceMcpServer
+    summary: Add a server to the workspace MCP library
+    description: >-
+      workspace_mcp_api.go:153 (`CreateWorkspaceMcpServer`). Requires `owner`
+      or `admin`, AND the caller must be a human actor — an agent-authenticated
+      request (mat_ token) is rejected outright regardless of role
+      (`requireWorkspaceMcpWriter`). The new entry is bound to no agent yet.
+      Runs inside a transaction that locks the workspace row (#5219) against
+      a concurrent teardown.
+    tags: [Workspaces, MCP Servers]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/WorkspaceMcpServerRequest'}
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceMcpServerResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, or name/config failed validation.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              nameRequired: {value: {error: "name is required"}}
+              badName: {value: {error: "name may only contain letters, digits, hyphens, and underscores"}}
+              badConfigType: {value: {error: "config must be a JSON object"}}
+              emptyConfig: {value: {error: "config must not be empty"}}
+      '403':
+        description: Caller is not owner/admin, or is an agent-authenticated actor (never permitted regardless of role).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              role: {value: {error: "insufficient permissions"}}
+              agentActor: {value: {error: "agents cannot modify the workspace MCP servers"}}
+      '404':
+        description: Workspace lock failed (e.g. concurrent teardown).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace not found"}
+      '409':
+        description: An MCP server with this name already exists in the workspace (unique index on workspace_id+name, migration 316).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "an MCP server with this name already exists in the workspace"}
+      '500':
+        description: Transaction begin/commit or insert failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to create the MCP server"}
+
+/api/workspaces/{id}/mcp-servers/{serverId}:
+  put:
+    operationId: updateWorkspaceMcpServer
+    summary: Update an MCP library entry
+    description: >-
+      workspace_mcp_api.go:222 (`UpdateWorkspaceMcpServer`). Same writer gate
+      as create (owner/admin, human actor only). Partial update: a
+      blank/absent `name` or empty/absent `config` leaves the existing value
+      unchanged (`COALESCE` in the query) — sending neither field is a no-op
+      success, not an error. Renaming does not disturb existing agent
+      bindings (keyed by `server_id`).
+    tags: [Workspaces, MCP Servers]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: serverId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/WorkspaceMcpServerRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceMcpServerResponse'}
+      '400':
+        description: Invalid workspace/server id, invalid body, or name/config (when provided) failed validation.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '403':
+        description: Caller is not owner/admin, or is an agent-authenticated actor.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '404':
+        description: >-
+          "MCP server not found" — this is the catch-all for any query error
+          other than a unique-name violation, INCLUDING transient DB errors;
+          it is not narrowed to "row absent" at the source (noted as a
+          correctness caveat, not a guess).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "MCP server not found"}
+      '409':
+        description: An MCP server with the new name already exists in the workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "an MCP server with this name already exists in the workspace"}
+  delete:
+    operationId: deleteWorkspaceMcpServer
+    summary: Remove an MCP library entry
+    description: >-
+      workspace_mcp_api.go:274 (`DeleteWorkspaceMcpServer`). Same writer gate
+      as create/update. Transaction locks the row `FOR UPDATE` first (serializing
+      against a concurrent `AddAgentMcpServer`'s `FOR SHARE`), then deletes it
+      AND every agent binding to it in the same transaction — library deletion
+      cascades to bindings at the application layer (no DB foreign key, per
+      repo convention).
+    tags: [Workspaces, MCP Servers]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: serverId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted (and all its agent bindings removed).
+      '400':
+        description: Invalid workspace id or server id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '403':
+        description: Caller is not owner/admin, or is an agent-authenticated actor.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '404':
+        description: Row-lock step found no matching server.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "MCP server not found"}
+      '500':
+        description: Transaction begin/commit, delete, or binding-cleanup failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to delete the MCP server"}

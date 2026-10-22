@@ -1,0 +1,617 @@
+# Domain schemas for 이슈 보조 리소스: labels, properties, issue-statuses,
+# issue-views (+ preferences), pins, quick-actions. Nested under
+# components/schemas/ per the merge script's convention (file basename is
+# irrelevant to the merge; the parent directory name "schemas" is what
+# routes these into components.schemas). Derived from
+# server/internal/handler/{label,property,issue_status,issue_view,
+# issue_view_preference,pin,quick_action}.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+
+# ---------------------------------------------------------------------------
+# Quick actions (quick_action.go, MUL-5465)
+# ---------------------------------------------------------------------------
+
+QuickActionResponse:
+  type: object
+  required:
+    - id
+    - workspace_id
+    - name
+    - description
+    - assignee_type
+    - assignee_id
+    - prompt
+    - visibility
+    - status
+    - use_count
+    - created_by_id
+    - created_at
+    - updated_at
+    - target_public
+    - target_missing
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    name: { type: string, maxLength: 32 }
+    description: { type: string, maxLength: 200 }
+    assignee_type:
+      type: string
+      enum: [agent, squad]
+    assignee_id: { type: string, format: uuid }
+    prompt:
+      type: string
+      maxLength: 4000
+      description: Sent verbatim to the target on run — no server-side interpolation.
+    visibility:
+      type: string
+      enum: [public, private]
+    status:
+      type: string
+      enum: [active, archived]
+    last_used_at: { type: string, format: date-time, nullable: true }
+    use_count: { type: integer, format: int64 }
+    created_by_id: { type: string, format: uuid }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+    target_name:
+      type: string
+      description: Display name of the resolved target (the bound agent, or the squad name for a squad binding). Omitted when the target no longer resolves.
+    target_public:
+      type: boolean
+      description: Whether the bound target is currently invocable by every workspace member. false (not omitted) when target_missing is true.
+    target_missing:
+      type: boolean
+      description: True when the bound agent/squad is archived, deleted, or otherwise unresolvable.
+  additionalProperties: false
+
+CreateQuickActionRequest:
+  type: object
+  required: [name, assignee_type, assignee_id, prompt]
+  properties:
+    name: { type: string, maxLength: 32 }
+    description: { type: string, maxLength: 200 }
+    assignee_type:
+      type: string
+      enum: [agent, squad]
+    assignee_id: { type: string, format: uuid }
+    prompt:
+      type: string
+      maxLength: 4000
+      description: Rejected if it contains a `{{...}}` template token or an `agent`/`squad`/`member`/`all` mention link; an `issue` mention link is allowed.
+    visibility:
+      type: string
+      enum: [public, private]
+      default: public
+      description: Empty/omitted defaults to "public". A "public" action must bind a target every workspace member can invoke.
+  additionalProperties: false
+
+UpdateQuickActionRequest:
+  type: object
+  description: All fields optional; omit to leave unchanged. assignee_type/assignee_id are re-validated together against the resulting visibility even when only one of the two is sent.
+  properties:
+    name: { type: string, maxLength: 32 }
+    description: { type: string, maxLength: 200 }
+    assignee_type:
+      type: string
+      enum: [agent, squad]
+    assignee_id: { type: string, format: uuid }
+    prompt: { type: string, maxLength: 4000 }
+    visibility:
+      type: string
+      enum: [public, private]
+    status:
+      type: string
+      enum: [active, archived]
+      description: Reactivating (active, from a non-active status) is rejected with 400 once the workspace is back at the 30-active-action cap.
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Labels (label.go)
+# ---------------------------------------------------------------------------
+#
+# LabelResponse itself is NOT defined here: it is already a shared component
+# from the issues-comments domain (components/schemas/issues-comments.yaml,
+# where label.go's labelToResponse backs both ListLabelsForIssue/
+# AttachLabel/DetachLabel there and ListLabels/GetLabel/CreateLabel/
+# UpdateLabel here). Redefining it under this domain would be a duplicate
+# components.schemas key the merge script hard-errors on. This domain's
+# operations reference '#/components/schemas/LabelResponse' as-is; that
+# schema's own description already calls out that GET /api/labels (this
+# ticket) is the one endpoint that populates a real usage_count.
+
+CreateLabelRequest:
+  type: object
+  required: [name, color]
+  properties:
+    resource_type:
+      type: string
+      enum: [issue, agent, skill]
+      default: issue
+      description: Empty/omitted defaults to "issue".
+    name: { type: string, maxLength: 32 }
+    description: { type: string }
+    color:
+      type: string
+      description: 6-digit hex, with or without a leading '#' (e.g. "3b82f6" or "#3b82f6").
+  additionalProperties: false
+
+UpdateLabelRequest:
+  type: object
+  description: All fields optional; omit to leave unchanged.
+  properties:
+    name: { type: string, maxLength: 32 }
+    description: { type: string }
+    color: { type: string, description: 6-digit hex, with or without a leading '#'. }
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Properties (property.go)
+# ---------------------------------------------------------------------------
+
+PropertyOption:
+  type: object
+  description: One select/multi_select option. Values reference this id, not the name, so renames never touch issue rows.
+  required: [id, name, color]
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: Server-assigned if omitted on create/update.
+    name: { type: string, maxLength: 32 }
+    color:
+      type: string
+      pattern: '^#[0-9a-f]{6}$'
+  additionalProperties: false
+
+PropertyConfig:
+  type: object
+  description: >-
+    Only meaningful for type select/multi_select (1-50 options required);
+    every other type stores `{}` and rejects a non-empty `options`.
+  properties:
+    options:
+      type: array
+      items: { $ref: '#/components/schemas/PropertyOption' }
+  additionalProperties: false
+
+PropertyResponse:
+  type: object
+  required:
+    - id
+    - workspace_id
+    - name
+    - type
+    - description
+    - icon
+    - config
+    - position
+    - archived
+    - usage_count
+    - created_at
+    - updated_at
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    name: { type: string, maxLength: 32 }
+    type:
+      type: string
+      enum: [text, number, select, multi_select, date, checkbox, url, actor, multi_actor]
+    description: { type: string, maxLength: 500 }
+    icon:
+      type: string
+      description: >-
+        One of a fixed Lucide-glyph icon-key allowlist (e.g. "tag",
+        "flag", "bug"; ~36 values as of baseline — see
+        server/internal/handler/property.go's validPropertyIcons) or "".
+    config: { $ref: '#/components/schemas/PropertyConfig' }
+    position: { type: number, format: double }
+    archived: { type: boolean }
+    archived_at: { type: string, format: date-time, nullable: true }
+    usage_count:
+      type: integer
+      format: int64
+      description: Only populated by GET /api/properties (ListIssueProperties row); 0 on GET /api/properties/{id} (GetIssueProperty does not join usage).
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+  additionalProperties: false
+
+CreatePropertyRequest:
+  type: object
+  required: [name, type]
+  properties:
+    name:
+      type: string
+      maxLength: 32
+      description: >-
+        Normalized (lowercased, spaces -> underscores) and checked against a
+        reserved-name list (status, priority, assignee, project, parent,
+        stage, label, labels, start_date, due_date, title, description,
+        creator, created_at, updated_at, metadata, properties).
+    type:
+      type: string
+      enum: [text, number, select, multi_select, date, checkbox, url, actor, multi_actor]
+    description: { type: string, maxLength: 500 }
+    icon: { type: string, description: 'See PropertyResponse.icon; empty string is also accepted.' }
+    config:
+      $ref: '#/components/schemas/PropertyConfig'
+  additionalProperties: false
+
+UpdatePropertyRequest:
+  type: object
+  description: All fields optional; omit to leave unchanged.
+  properties:
+    name: { type: string, maxLength: 32 }
+    description: { type: string, maxLength: 500 }
+    icon: { type: string }
+    config: { $ref: '#/components/schemas/PropertyConfig' }
+    archived:
+      type: boolean
+      description: >-
+        true archives (always allowed); false unarchives and is rejected
+        with 400 once the workspace is already at the 20-active-property cap.
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Issue statuses (issue_status.go, server/internal/issuestatus)
+# ---------------------------------------------------------------------------
+
+IssueStatusResponse:
+  type: object
+  required:
+    - id
+    - workspace_id
+    - key
+    - name
+    - description
+    - category
+    - color
+    - icon
+    - is_system
+    - position
+    - created_at
+    - updated_at
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    key:
+      type: string
+      description: >-
+        Immutable once created. One of the 7 built-in keys (backlog, todo,
+        in_progress, in_review, blocked, done, cancelled) for a system row,
+        or a custom "[a-z0-9][a-z0-9_]{0,31}" key, derived from `name` when
+        not supplied explicitly on create.
+    name: { type: string }
+    description: { type: string }
+    category:
+      type: string
+      enum: [backlog, todo, in_progress, in_review, blocked, done, cancelled]
+      description: >-
+        WireCategory(): a built-in row echoes its own key verbatim; a custom
+        row's stored lifecycle category (unstarted/started/done/closed) is
+        projected to todo/in_progress/done/cancelled respectively (custom
+        rows never report backlog, in_review, or blocked here — those stay
+        distinct only for built-ins).
+    color:
+      type: string
+      pattern: '^#[0-9a-f]{6}$'
+    icon:
+      type: string
+      enum: ["", dotted, circle, half, three_quarters, check, slash, cross]
+      description: Geometry of the status dot, not workflow semantics.
+    is_system:
+      type: boolean
+      description: True for one of the 7 built-ins; built-ins cannot be modified or archived (PATCH/DELETE return 403).
+    position: { type: number, format: double }
+    archived_at: { type: string, format: date-time, nullable: true }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+  additionalProperties: false
+
+CreateIssueStatusRequest:
+  type: object
+  required: [name, category, color]
+  properties:
+    key:
+      type: string
+      description: >-
+        Optional; immutable once set. Must be 1-32 chars of lowercase
+        letters/digits/underscore starting with a letter or digit, and
+        cannot collide with a built-in key or a category name. Derived from
+        `name` when omitted (collision-safe under an exclusive catalog lock).
+    name: { type: string, minLength: 1, maxLength: 64 }
+    description: { type: string, maxLength: 256 }
+    category:
+      type: string
+      description: >-
+        Accepts the 4 canonical categories (unstarted, started, done,
+        closed), the aliases "completed" (-> done) / "canceled" (-> closed),
+        or any of the 7 built-in status keys (mapped to the category that
+        key belongs to) — see issuestatus.ParseCategory. The stored result
+        is always one of the 4 canonical categories.
+    color: { type: string, description: 6-digit hex, with or without a leading '#'. }
+    icon:
+      type: string
+      enum: ["", dotted, circle, half, three_quarters, check, slash, cross]
+  additionalProperties: false
+
+UpdateIssueStatusRequest:
+  type: object
+  description: >-
+    All fields optional; omit to leave unchanged. No key or category field —
+    both are immutable after creation (changing category would silently
+    rewrite the lifecycle semantics of every issue already on that status).
+    Rejected with 403 for a built-in status and 409 for an already-archived one.
+  properties:
+    name: { type: string, minLength: 1, maxLength: 64 }
+    description: { type: string, maxLength: 256 }
+    color: { type: string, description: 6-digit hex, with or without a leading '#'. }
+    icon:
+      type: string
+      enum: ["", dotted, circle, half, three_quarters, check, slash, cross]
+    position: { type: number, format: double }
+  additionalProperties: false
+
+ReorderIssueStatusesRequest:
+  type: object
+  required: [category, ids]
+  properties:
+    category:
+      type: string
+      description: Same accepted spellings as CreateIssueStatusRequest.category.
+    ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: >-
+        Must name every active (non-archived) status in the requested scope
+        exactly once — a partial list, a duplicate, a foreign-category id, or
+        (when include_system is false/omitted) a built-in id is rejected.
+    include_system:
+      type: boolean
+      default: false
+      description: >-
+        false (default): only custom statuses in the category are
+        reordered/returned by position index, preserving installed clients'
+        narrower contract. true: built-ins in the category are included and
+        positions are written as 1-based rank.
+  additionalProperties: false
+
+IssueStatusInUseError:
+  type: object
+  description: >-
+    409 response from DELETE /api/issue-statuses/{id} (ArchiveIssueStatus)
+    when issues still use the status being archived. Does not match the
+    shared ErrorCode schema shape (carries issue_count, not a schema the
+    rest of the API reuses).
+  required: [error, code, issue_count]
+  properties:
+    error:
+      type: string
+      description: 'e.g. "cannot archive status: 3 issues still use it; move them to another status first".'
+    code:
+      type: string
+      const: issue_status_in_use
+    issue_count:
+      type: integer
+      format: int64
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Pins (pin.go)
+# ---------------------------------------------------------------------------
+
+PinnedItemResponse:
+  type: object
+  description: >-
+    Title/status/identifier/icon are deliberately NOT included — clients
+    derive display data from their own issue/project query cache.
+  required: [id, workspace_id, user_id, item_type, item_id, position, created_at]
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    user_id: { type: string, format: uuid }
+    item_type:
+      type: string
+      enum: [issue, project, view]
+    item_id: { type: string, format: uuid }
+    position: { type: number, format: double }
+    created_at: { type: string, format: date-time }
+  additionalProperties: false
+
+CreatePinRequest:
+  type: object
+  required: [item_type, item_id]
+  properties:
+    item_type:
+      type: string
+      enum: [issue, project, view]
+    item_id:
+      type: string
+      format: uuid
+      description: Must resolve inside the caller's workspace (and, for "view", be readable by the caller — see IssueViewResponse visibility rules).
+  additionalProperties: false
+
+ReorderItem:
+  type: object
+  required: [id, position]
+  properties:
+    id: { type: string, format: uuid }
+    position: { type: number, format: double }
+  additionalProperties: false
+
+ReorderPinsRequest:
+  type: object
+  required: [items]
+  properties:
+    items:
+      type: array
+      items: { $ref: '#/components/schemas/ReorderItem' }
+  additionalProperties: false
+
+# ---------------------------------------------------------------------------
+# Issue views + per-surface view-bar preferences
+# (issue_view.go, issue_view_preference.go)
+# ---------------------------------------------------------------------------
+
+IssueViewResponse:
+  type: object
+  required:
+    - id
+    - workspace_id
+    - owner_id
+    - name
+    - scope_type
+    - scope_id
+    - scope_variant
+    - visibility
+    - definition_version
+    - query
+    - display
+    - revision
+    - created_at
+    - updated_at
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    owner_id: { type: string, format: uuid }
+    name: { type: string, minLength: 1, maxLength: 80 }
+    scope_type:
+      type: string
+      enum: [workspace, my, project]
+    scope_id:
+      type: string
+      format: uuid
+      nullable: true
+      description: Set only for scope_type=project.
+    scope_variant:
+      type: string
+      nullable: true
+      description: >-
+        For scope_type=my: one of assigned/created/involved/any (required).
+        For scope_type=workspace/project: one of members/agents, or null/omitted
+        for the unrestricted "All" tab.
+    visibility:
+      type: string
+      enum: [private, workspace]
+      description: A scope_type=my view is always forced to private; CHECK-constrained at the DB level too.
+    definition_version:
+      type: integer
+      format: int32
+      description: Client-defined filter-schema version; opaque to the server beyond being a positive integer (defaults to 1).
+    query:
+      type: object
+      description: Opaque filter document; server only validates it is a JSON object.
+    display:
+      type: object
+      description: Opaque display-default document (sort/columns/etc); server only validates it is a JSON object. Defaults to {} when omitted on create.
+    revision:
+      type: integer
+      format: int32
+      description: Optimistic-concurrency counter for PATCH's required expected_revision.
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+  additionalProperties: false
+
+CreateIssueViewRequest:
+  type: object
+  required: [name, scope_type, query]
+  properties:
+    name: { type: string, minLength: 1, maxLength: 80 }
+    scope_type:
+      type: string
+      enum: [workspace, my, project]
+    scope_id:
+      type: string
+      format: uuid
+      description: Required (and must resolve in this workspace) when scope_type=project; ignored otherwise.
+    scope_variant:
+      type: string
+      description: >-
+        Required (assigned/created/involved/any) when scope_type=my.
+        Optional (members/agents, or "all"/empty for no restriction) for
+        workspace/project.
+    visibility:
+      type: string
+      enum: [private, workspace]
+      default: private
+      description: Forced to private server-side when scope_type=my, regardless of what is sent.
+    definition_version:
+      type: integer
+      format: int32
+      default: 1
+      description: Non-positive/omitted defaults to 1.
+    query:
+      type: object
+      description: Must be a JSON object (not array/scalar/null).
+    display:
+      type: object
+      default: {}
+      description: Must be a JSON object when provided; defaults to {}.
+  additionalProperties: false
+
+UpdateIssueViewRequest:
+  type: object
+  required: [expected_revision]
+  description: >-
+    name/visibility/query/display/scope_variant are optional (omit to leave
+    unchanged); scope_type itself is immutable. expected_revision is always
+    required and must be a positive integer matching the view's current
+    `revision`, or the request 409s.
+  properties:
+    name: { type: string, minLength: 1, maxLength: 80 }
+    visibility:
+      type: string
+      enum: [private, workspace]
+      description: Rejected with 400 if the view's scope_type is "my" and this is not "private".
+    scope_variant:
+      type: string
+      description: Re-validated against the view's (immutable) scope_type — same rules as CreateIssueViewRequest.scope_variant.
+    query:
+      type: object
+      description: Must be a JSON object when provided (empty/omitted leaves the stored value unchanged).
+    display:
+      type: object
+      description: Must be a JSON object when provided (empty/omitted leaves the stored value unchanged).
+    expected_revision:
+      type: integer
+      format: int32
+  additionalProperties: false
+
+IssueViewPreferenceResponse:
+  type: object
+  required: [scope_type, scope_id, prefs]
+  properties:
+    scope_type:
+      type: string
+      enum: [workspace, my, project]
+    scope_id:
+      type: string
+      format: uuid
+      nullable: true
+      description: Backfilled server-side so the composite key never carries NULL — the workspace id for "workspace" scope, the caller's user id for "my", the validated project id for "project".
+    prefs:
+      type: object
+      description: >-
+        Client-owned opaque document (hidden items + order for one surface
+        container); item ids inside follow a "builtin:<key>" / "view:<uuid>"
+        convention the server does not interpret. {} when no row exists yet.
+    updated_at:
+      type: string
+      format: date-time
+      description: Absent on the synthesized "no row yet" 200 response from GET.
+  additionalProperties: false
+
+PutIssueViewPreferenceRequest:
+  type: object
+  required: [scope_type, prefs]
+  properties:
+    scope_type:
+      type: string
+      enum: [workspace, my, project]
+    scope_id:
+      type: string
+      format: uuid
+      description: Required (and must resolve in this workspace) when scope_type=project; ignored otherwise (backfilled from the workspace/user id).
+    prefs:
+      type: object
+      description: Must be a JSON object; empty/omitted is stored as {}.
+  additionalProperties: false

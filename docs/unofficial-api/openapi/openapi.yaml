@@ -1,0 +1,72 @@
+openapi: 3.1.0
+info:
+  title: Multica API (Unofficial)
+  version: "0.1.0"
+  description: >-
+    **Unofficial, reverse-engineered documentation.** This is not published or
+    endorsed by the Multica team. It was built by reading the
+    `multica-ai/multica` server source directly (handlers, middleware,
+    router) rather than any official spec, so gaps are marked explicitly
+    instead of guessed.
+
+
+    Baseline revision: `ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe` (tag
+    `v0.6.0`, 2026-09-30). The repository's `main` branch
+    may have moved ahead of this revision since.
+
+
+    Structure: this document is assembled from per-domain fragments under
+    `docs/unofficial-api/openapi/` by
+    `docs/unofficial-api/scripts/merge.mjs`. See
+    `docs/unofficial-api/README.md` for the directory layout and naming
+    convention new domain documents should follow.
+servers:
+  - url: https://app.multica.ai
+    description: Production (actual base URL not confirmed in source; placeholder)
+security:
+  - PersonalAccessToken: []
+  - BrowserSession: []
+tags:
+  - name: issues
+    description: Issue CRUD, listing/search/grouping, sub-resources and agent task execution on an issue.
+  - name: comments
+    description: Comment CRUD, resolution and reactions.
+  - name: wakeups
+    description: Issue wakeup rules (agent-created subscriptions/schedules) and the platform's system wakeup.
+  - name: tasks
+    description: Agent task execution on an issue (active task, cancel, run history, usage, rerun, quick actions).
+  - name: agents
+    description: Agent CRUD, lifecycle (archive/restore), and workspace-wide agent aggregations (activity, run counts, working agents).
+  - name: agent-builder
+    description: Agent Builder session lifecycle — create/list/switch-runtime/autosave-draft for private configuration conversations that produce a draft agent.
+  - name: agent-env
+    description: Per-agent custom environment variables — audited reveal and replace, restricted to the agent owner or a workspace owner/admin.
+  - name: agent-skills
+    description: Workspace skill bindings on a specific agent — list, replace, add, toggle, remove.
+  - name: agent-mcp-servers
+    description: Workspace MCP server library entries bound to a specific agent — list, add, toggle, remove.
+  - name: dingtalk
+    description: DingTalk group presence observed for one agent's bot.
+  - name: activity
+    description: Assignee-usage frequency analytics for the calling user.
+  - name: labels
+    description: Attaching/detaching/listing labels on a resource (agent, skill).
+  - name: skills
+    description: Skill CRUD, search, import, refresh, and file sub-resources.
+  - name: squads
+    description: Squad CRUD and membership (polymorphic agent/member rows), leader-agent management, and derived live member status.
+  - name: runtimes
+    description: Agent runtime registry (list/update/delete), usage and task-activity rollups, and the daemon-mediated async flows for CLI update, model discovery, and local-skill discovery/import.
+  - name: Autopilots
+    description: Scheduled/webhook/manual automations that dispatch an agent or squad.
+  - name: Chat
+    description: Chat sessions, messages, pinned agents, and agent-facing channel reads.
+  - name: Inbox
+    description: Per-member notification inbox (list/read/archive).
+  - name: NotificationPreferences
+    description: Per-member notification delivery preferences.
+paths: {}
+components:
+  securitySchemes: {}
+  parameters: {}
+  schemas: {}

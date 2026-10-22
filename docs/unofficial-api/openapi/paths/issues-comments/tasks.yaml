@@ -1,0 +1,425 @@
+# Issue-scoped agent task execution surface: active task, cancel, run
+# history, usage, rerun, quick actions, squad-leader evaluation. Source:
+# server/internal/handler/daemon.go, task_lifecycle.go, quick_action.go,
+# squad.go (baseline revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+# IssueTaskResponse is a partial schema — the canonical, complete task
+# shape belongs to the agents/tasks domain ticket.
+
+/api/issues/{id}/active-task:
+  get:
+    operationId: getActiveTaskForIssue
+    summary: List an issue's currently-active agent tasks
+    description: A query failure degrades to an empty list rather than a 500 — this endpoint essentially never errors once the issue itself resolves.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActiveTaskListResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+
+/api/issues/{id}/tasks/{taskId}/cancel:
+  post:
+    operationId: cancelTask
+    summary: Cancel a specific agent task on an issue
+    description: A task UUID belonging to a different issue (even in the same workspace) is rejected as not-found, same as a genuinely unknown id.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: taskId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK — the cancelled task.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelTaskResponse'
+      '400':
+        description: 'Any error from the cancellation service (e.g. task not in a cancellable state) — message is the service''s own text, not a fixed string.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"task not found" — either the task id doesn''t exist, or it exists but belongs to a different issue.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/task-runs:
+  get:
+    operationId: listTasksByIssue
+    summary: List agent task runs for an issue, or for its whole issue family
+    description: >-
+      Two response shapes depending on `scope`: `family` returns a capped
+      (20-row), running-first coordination summary across the issue's
+      parent-rooted family with no attribution hydration; the default
+      (`issue`) returns the full execution-log rows for just this issue,
+      newest-first, with no cursor pagination.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: scope
+        in: query
+        schema: {type: string, enum: [issue, family], default: issue}
+        description: '`family` roots the query at the issue''s parent (or the issue itself if it has none) and implicitly forces in-flight-only semantics.'
+      - name: active
+        in: query
+        schema: {type: boolean, default: false}
+        description: '`issue` scope only; strict boolean parse (any other literal value is a 400). Ignored in effect under scope=family (which is always active-only).'
+    responses:
+      '200':
+        description: >-
+          OK — a bare JSON array (ActiveRunSummary[] for scope=family,
+          IssueTaskResponse[] otherwise). Response header
+          `X-Active-Runs-Truncated: true` is set on the family branch when
+          more than 20 rows existed.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/ActiveRunSummary'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/IssueTaskResponse'
+      '400':
+        description: '"scope must be ''issue'' or ''family''"; "invalid active parameter; expected boolean".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list tasks".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/usage:
+  get:
+    operationId: getIssueUsage
+    summary: Aggregate token/cost usage across all of an issue's agent tasks
+    description: A single flattened aggregate — no per-model/provider breakdown (unlike a task row's own `usage` array) and no separate currency field (cost is in fixed-point "USD ticks").
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: 'OK — zeroed counters for an issue with no tasks (not a 404).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueUsageSummaryResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to get issue usage".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/rerun:
+  post:
+    operationId: rerunIssue
+    summary: Re-dispatch a fresh agent run on an issue
+    description: >-
+      Without `task_id`, targets the issue's current assignee; a run in
+      Triage with no named source task is refused (naming a non-triage
+      source task is still allowed). The new task starts a fresh session
+      (no session resume).
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RerunIssueInput'
+      description: Optional — an empty/absent body preserves legacy "rerun current assignee" behavior.
+    responses:
+      '202':
+        description: Accepted
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTaskResponse'
+      '400':
+        description: '"invalid request body"; "invalid task_id"; or any other error from the rerun service (its own message text — e.g. "source task does not belong to this issue").'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: Dispatch blocked — the resolved actor cannot invoke the target agent, or the issue is in Triage with no source task named.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchBlockedResponse'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+
+/api/issues/{id}/quick-actions/{quickActionId}/run:
+  post:
+    operationId: runQuickAction
+    summary: Post a quick action's stored prompt as a comment and dispatch its bound target
+    description: >-
+      Takes no body — the quick action's stored prompt/target are used
+      verbatim, with no runtime interpolation. The response is a regular
+      CommentResponse whose `quick_action_id` is the marker a client uses to
+      render a collapsed quick-action card.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: quickActionId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuickActionRunResponse'
+      '400':
+        description: '"invalid quick action id"; "quick action is archived".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Issue is in Triage (checked before posting — a quick action is an instruction to act now), or the caller cannot invoke the bound target (the one and only invoke-permission check for quick actions).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchBlockedResponse'
+      '404':
+        description: '"issue not found", or "quick action not found" (also returned, instead of 403, for a private action owned by someone else — existence itself is not disclosed).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: Bound target (agent/squad) is archived, deleted, or its leader is archived.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchBlockedResponse'
+      '500':
+        description: '"failed to run quick action".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/quick-actions/{quickActionId}/render:
+  post:
+    operationId: renderQuickAction
+    summary: Preview what a quick action would post, without posting it
+    description: >-
+      Shares the exact rendering function RunQuickAction uses, so preview
+      and actual post are always identical. Unlike run, this endpoint does
+      not check Triage state and does not check whether the action is
+      archived — only the invoke-permission gate is shared between the two.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: quickActionId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuickActionRenderResponse'
+      '400':
+        description: '"invalid quick action id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: Caller cannot invoke the bound target.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchBlockedResponse'
+      '404':
+        description: '"issue not found", or "quick action not found" (also for a private action owned by someone else).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: Bound target is archived, deleted, or its leader is archived.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchBlockedResponse'
+
+/api/issues/{id}/squad-evaluated:
+  post:
+    operationId: recordSquadLeaderEvaluation
+    summary: Record a squad leader agent's evaluation outcome for its current task
+    description: >-
+      Agent-only, and specifically only the live squad leader (checked
+      twice: once against the claimed task's own agent_id, once against the
+      squad's *current* leader — the leader may have been swapped between
+      enqueue and claim). Writes one activity_log row; does not touch
+      comments directly (its effect is read elsewhere to suppress a
+      no-action comment for this task).
+    tags: [issues, tasks]
+    security:
+      - AgentTaskToken: []
+    parameters:
+      - $ref: '#/components/parameters/XAgentIDHeader'
+      - $ref: '#/components/parameters/XTaskIDHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier — the issue the task is expected to be running on.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SquadLeaderEvaluationInput'
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SquadLeaderEvaluationResponse'
+      '400':
+        description: >-
+          "invalid task id"; "invalid request body"; "outcome must be
+          'action', 'no_action', or 'failed'"; "task does not belong to
+          issue" (task lookup failed, or — after the ownership gate passes —
+          the task's real issue differs from the path issue, naming that
+          real issue id); "task is not a squad leader task"; "leader task
+          has no squad_id".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '403':
+        description: '"only the squad leader agent can record evaluations" — used identically whether the caller fails the task-ownership gate or the still-current-leader gate (the two cases are indistinguishable to the caller by design).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"issue not found"; "squad not found" (looked up after the ownership gate passes).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to record evaluation".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'

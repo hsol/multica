@@ -1,0 +1,1996 @@
+# Domain: 계정 부속 리소스 — tokens, me, attachments, webhooks,
+# projects, share-links, cli-token, upload-file (34 endpoints).
+# Top-level keys are path strings merged verbatim into the document's
+# "paths" object by scripts/merge.mjs — add operations here, not under a
+# nested "paths:" key.
+#
+# Security: middleware.Auth (server/internal/middleware/auth.go:~200)
+# accepts any of PersonalAccessToken (mul_) / AgentTaskToken (mat_) /
+# CloudNodePAT (mcn_) / BrowserSession (cookie) — see
+# components/securitySchemes.yaml. Endpoints inside the workspace-scoped
+# group (server/cmd/server/router.go:1986, middleware.RequireWorkspaceMember)
+# additionally require the X-Workspace-ID or X-Workspace-Slug header; the
+# user-scoped group (router.go:1639-1640) does not. Fully public routes
+# (no Multica auth at all) and the four externally-authenticated webhook
+# ingress routes are called out per-operation below.
+
+/api/me:
+  get:
+    operationId: getMe
+    summary: Get the authenticated user
+    description: server/internal/handler/auth.go:485-504 (`GetMe`). User-scoped; no workspace context required.
+    tags: [Me]
+    security: &userAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserResponse' }
+      '401':
+        description: Not authenticated, or the credential no longer maps to an existing user row.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              unauthenticated: { value: { error: "user not authenticated" } }
+              userGone: { value: { error: "user not found" } }
+      '500':
+        description: Failed to load the user row.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to load user" }
+  patch:
+    operationId: updateMe
+    summary: Update the authenticated user's profile
+    description: >-
+      server/internal/handler/auth.go:781-860 (`UpdateMe`). All request
+      fields are optional pointers — omit a field to leave it untouched.
+    tags: [Me]
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateMeRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserResponse' }
+      '400':
+        description: Invalid body, empty name, unsupported language, profile_description too long, or invalid timezone.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              nameRequired: { value: { error: "name is required" } }
+              unsupportedLanguage: { value: { error: "unsupported language" } }
+              descriptionTooLong: { value: { error: "profile_description exceeds 2000 characters" } }
+              invalidTimezone: { value: { error: "invalid timezone" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: avatar_url points at an attachment already bound to an issue/comment/chat.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "avatar_url must reference a standalone image upload, not a file attached to an issue, comment, or chat" }
+      '404':
+        description: User row lookup failed (any error, not narrowed to not-found).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not found" }
+      '500':
+        description: Failed to persist the update.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to update user" }
+
+/api/me/onboarding:
+  patch:
+    operationId: patchOnboarding
+    summary: Patch the onboarding questionnaire
+    description: >-
+      server/internal/handler/onboarding.go:226-310 (`PatchOnboarding`).
+      Body capped at 16 KiB. The questionnaire JSON is stored as-is with no
+      shape validation at this handler (see
+      components/schemas/account.yaml#OnboardingQuestionnaire for the
+      informal, analytics-only inner shape).
+    tags: [Me, Onboarding]
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PatchOnboardingRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserResponse' }
+      '400':
+        description: Invalid JSON body, or body exceeds 16 KiB.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid request body" }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Failed to persist onboarding state.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to update onboarding" }
+
+/api/me/onboarding/complete:
+  post:
+    operationId: completeOnboarding
+    summary: Mark onboarding complete
+    description: >-
+      server/internal/handler/onboarding.go:69-128 (`CompleteOnboarding`).
+      Idempotent — repeat calls still return 200 but skip first-completion
+      analytics. Body is entirely optional.
+    tags: [Me, Onboarding]
+    security: *userAuth
+    requestBody:
+      required: false
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CompleteOnboardingRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserResponse' }
+      '400':
+        description: Invalid body (non-EOF decode error), or invalid workspace_id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Failed to load the user or mark onboarding complete.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to complete onboarding" }
+
+/api/me/onboarding/cloud-waitlist:
+  post:
+    operationId: joinCloudWaitlist
+    summary: Join the Multica Cloud waitlist
+    description: >-
+      server/internal/handler/onboarding.go:321-372 (`JoinCloudWaitlist`).
+      Does NOT complete onboarding (pure side effect); repeat calls
+      overwrite the stored email/reason.
+    tags: [Me, Onboarding]
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/JoinCloudWaitlistRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserResponse' }
+      '400':
+        description: Invalid body, missing/too-long/invalid email, or reason too long.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              emailRequired: { value: { error: "email is required" } }
+              emailTooLong: { value: { error: "email is too long" } }
+              emailInvalid: { value: { error: "email is invalid" } }
+              reasonTooLong: { value: { error: "reason is too long" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Failed to record the waitlist entry.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to join waitlist" }
+
+/api/me/onboarding/runtime-bootstrap:
+  post:
+    operationId: bootstrapOnboardingRuntime
+    summary: '[DEPRECATED] Bootstrap onboarding with a runtime (desktop < v3 shim)'
+    description: >-
+      server/internal/handler/onboarding_shim.go:134-352. DEPRECATED — kept
+      only for desktop clients older than v3 (router.go:1657-1664); current
+      clients create the Helper agent + starter issue directly via generic
+      CreateAgent/CreateIssue and call only /api/me/onboarding/complete.
+      Creates (or reuses) a "Multica Helper" agent and a starter issue in
+      one transaction.
+    tags: [Me, Onboarding]
+    deprecated: true
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/BootstrapOnboardingRuntimeRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BootstrapOnboardingRuntimeResponse' }
+      '400':
+        description: Invalid body, missing/invalid workspace_id or runtime_id, starter_prompt too long, or runtime not found in workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              runtimeIdRequired: { value: { error: "runtime_id is required" } }
+              promptTooLong: { value: { error: "starter_prompt exceeds 2048 characters" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '402':
+        description: Workspace has reached its Cloud-entitlement issue-count limit.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueLimitReachedError' }
+      '403':
+        description: Not a member of the workspace, or the runtime is private and owned by someone else.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              notAMember: { value: { error: "not a member of this workspace" } }
+              privateRuntime: { value: { error: "this runtime is private; only its owner can create agents on it" } }
+      '500':
+        description: Any step of the onboarding transaction failed (agent/issue creation, allocation, commit, etc.).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              startFailed: { value: { error: "failed to start onboarding" } }
+              listAgentsFailed: { value: { error: "failed to list agents" } }
+              createAssistantFailed: { value: { error: "failed to create onboarding assistant" } }
+              createIssueFailed: { value: { error: "failed to create onboarding issue" } }
+              allocateFailed: { value: { error: "failed to allocate issue number" } }
+              loadUserFailed: { value: { error: "failed to load user" } }
+              markOnboardedFailed: { value: { error: "failed to mark onboarded" } }
+              starterStateFailed: { value: { error: "failed to record starter content state" } }
+              finishFailed: { value: { error: "failed to finish onboarding" } }
+
+/api/me/onboarding/no-runtime-bootstrap:
+  post:
+    operationId: bootstrapOnboardingNoRuntime
+    summary: '[DEPRECATED] Bootstrap onboarding without a runtime (desktop < v3 shim)'
+    description: >-
+      server/internal/handler/onboarding_shim.go:360-494. DEPRECATED, same
+      status as /api/me/onboarding/runtime-bootstrap. Creates a
+      "Connect a runtime to start using agents" starter issue assigned to
+      the calling member (self), not an agent.
+    tags: [Me, Onboarding]
+    deprecated: true
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/BootstrapOnboardingNoRuntimeRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BootstrapOnboardingNoRuntimeResponse' }
+      '400':
+        description: Invalid body, missing/invalid workspace_id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '402':
+        description: Workspace has reached its Cloud-entitlement issue-count limit.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueLimitReachedError' }
+      '403':
+        description: Not a member of the workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "not a member of this workspace" }
+      '500':
+        description: Any step of the onboarding transaction failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              loadUserFailed: { value: { error: "failed to load user" } }
+              createIssueFailed: { value: { error: "failed to create onboarding issue" } }
+              allocateFailed: { value: { error: "failed to allocate issue number" } }
+              markOnboardedFailed: { value: { error: "failed to mark onboarded" } }
+              starterStateFailed: { value: { error: "failed to record starter content state" } }
+              finishFailed: { value: { error: "failed to finish onboarding" } }
+
+/api/cli-token:
+  post:
+    operationId: issueCliToken
+    summary: Issue a fresh JWT for handoff to the CLI
+    description: >-
+      server/internal/handler/auth.go:750-774 (`IssueCliToken`). No request
+      body. Lets a cookie-authenticated browser session obtain a bearer
+      token to hand off to the CLI via the `cli_callback` redirect.
+    tags: [Me, Tokens]
+    security: *userAuth
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CliTokenResponse' }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          The user account is temporarily disabled
+          (`auth.ErrTemporarilyDisabledUser`). Exact message text is
+          defined in the `auth` package and was not independently
+          re-verified (소스에서 메시지 원문 미확인).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: User row lookup failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not found" }
+      '500':
+        description: Token generation failed for any other reason.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to generate token" }
+
+/api/tokens:
+  get:
+    operationId: listPersonalAccessTokens
+    summary: List the authenticated user's personal access tokens
+    description: >-
+      server/internal/handler/personal_access_token.go:113-130. Includes
+      expired-but-not-revoked tokens (no expiry filter). The raw secret is
+      never included.
+    tags: [Tokens]
+    security: *userAuth
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/PersonalAccessTokenResponse' }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Failed to list tokens.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list tokens" }
+  post:
+    operationId: createPersonalAccessToken
+    summary: Create a personal access token
+    description: >-
+      server/internal/handler/personal_access_token.go:60-111. The only
+      response in this API that ever returns the full raw secret
+      (`mul_<40 hex chars>`), and only once, here.
+    tags: [Tokens]
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreatePATRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePATResponse' }
+      '400':
+        description: Invalid body, or missing name.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              nameRequired: { value: { error: "name is required" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Token generation or persistence failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              generateFailed: { value: { error: "failed to generate token" } }
+              createFailed: { value: { error: "failed to create token" } }
+
+/api/tokens/current/renew:
+  post:
+    operationId: renewCurrentPersonalAccessToken
+    summary: Renew the PAT used to authenticate this request
+    description: >-
+      server/internal/handler/personal_access_token.go:159-253. Operates
+      on the PAT in this request's own `Authorization` header (re-read and
+      re-hashed), not on an id. Only renews (extends by 90 days) when 7
+      days or fewer remain; otherwise returns 200 with `renewed: false` as
+      a normal no-op. Only callable with a `mul_`-prefixed PAT — any other
+      credential (session cookie JWT, `mat_`, `mcn_`) is rejected with 400.
+    tags: [Tokens]
+    security: *userAuth
+    responses:
+      '200':
+        description: >-
+          OK. `renewed: false` on every no-op branch (never-expiring token,
+          more than 7 days remaining, or a concurrent renewal already won
+          the race) — not an error.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenewPATResponse' }
+      '400':
+        description: Authorization header missing/malformed, or not a mul_-prefixed PAT.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only personal access tokens can be renewed" }
+      '401':
+        description: Not authenticated, the token is no longer valid (revoked/expired), or it does not belong to the caller.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              unauthenticated: { value: { error: "user not authenticated" } }
+              tokenInvalid: { value: { error: "token is no longer valid" } }
+              tokenNotOwned: { value: { error: "token does not belong to caller" } }
+      '500':
+        description: Lookup or renewal update failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              lookupFailed: { value: { error: "failed to look up token" } }
+              renewFailed: { value: { error: "failed to renew token" } }
+
+/api/tokens/{id}:
+  delete:
+    operationId: revokePersonalAccessToken
+    summary: Revoke a personal access token
+    description: >-
+      server/internal/handler/personal_access_token.go:255-284.
+      Idempotent by design: a token id that does not exist, or that exists
+      but belongs to someone else, returns the same 204 as a genuine
+      revoke — the HTTP contract alone cannot distinguish these cases.
+    tags: [Tokens]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Revoked, or the id did not exist/belong to the caller (idempotent no-op).
+      '400':
+        description: '{id} is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid token id" }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Revoke update failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to revoke token" }
+
+/api/attachments/{id}:
+  get:
+    operationId: getAttachmentById
+    summary: Get attachment metadata
+    description: >-
+      server/internal/handler/file.go:671-748 (`GetAttachmentByID`).
+      Workspace-scoped. Always resolves `download_url`/`attachment_download_url`
+      in signed mode regardless of the caller's stable-URL capability
+      header, since this is the canonical re-sign point.
+    tags: [Attachments]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttachmentResponse' }
+      '400':
+        description: Missing workspace_id, or invalid attachment/workspace id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAttachmentId: { value: { error: "invalid attachment id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+      '404':
+        description: Attachment not found, or not in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "attachment not found" }
+  delete:
+    operationId: deleteAttachment
+    summary: Delete an attachment
+    description: >-
+      server/internal/handler/file.go:1414-1503 (`DeleteAttachment`).
+      Workspace-scoped. Only the uploader or a workspace admin/owner may
+      delete. An attachment captured into an immutable source-context copy
+      is reported as not-found rather than forbidden (deliberate
+      information hiding).
+    tags: [Attachments]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '204':
+        description: Deleted.
+      '400':
+        description: Missing workspace_id, or invalid attachment/workspace id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAttachmentId: { value: { error: "invalid attachment id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: Caller is neither the uploader nor a workspace admin/owner.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "not authorized to delete this attachment" }
+      '404':
+        description: Attachment not found, not in this workspace, captured into a source-context copy, or deleted concurrently under lock.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "attachment not found" }
+      '500':
+        description: Delete failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to delete attachment" }
+
+/api/attachments/{id}/content:
+  get:
+    operationId: getAttachmentContent
+    summary: Get inline text preview of an attachment's content
+    description: >-
+      server/internal/handler/file.go:1285-1340 (`GetAttachmentContent`).
+      Workspace-scoped. Streams raw bytes (not JSON) — always as
+      `Content-Type: text/plain; charset=utf-8` regardless of the
+      attachment's own content type, to prevent HTML re-interpretation.
+      Only a fixed allow-list of text-like content types/extensions is
+      previewable; capped at 2 MB.
+    tags: [Attachments]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: Raw text body, forced to text/plain; charset=utf-8, with an X-Original-Content-Type header carrying the real content type.
+        content:
+          text/plain:
+            schema: { type: string }
+      '400':
+        description: Missing workspace_id, or invalid attachment/workspace id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: File storage is not configured for this deployment.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "storage not configured", code: "storage_not_configured" }
+      '404':
+        description: Attachment not found, or the underlying storage object is missing.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              attachmentNotFound: { value: { error: "attachment not found" } }
+              objectNotFound: { value: { error: "attachment object not found" } }
+      '413':
+        description: Content exceeds the 2 MB inline-preview cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "file too large for inline preview" }
+      '415':
+        description: Content type/extension is not on the text-preview allow-list.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "preview not supported for this file type" }
+      '502':
+        description: Failed to read the attachment body from storage.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to read attachment body" }
+
+/api/attachments/{id}/download:
+  get:
+    operationId: downloadAttachment
+    summary: Download an attachment (authenticated)
+    description: >-
+      server/internal/handler/file.go:849-901 (`DownloadAttachment`).
+      User-scoped only (NOT workspace-scoped) — the handler self-resolves
+      the workspace from the attachment row and checks membership
+      internally, so this route works as a native `<img>`/`<video>` src
+      that cannot attach workspace headers. Looks the attachment up by ID
+      alone and returns a generic 404 for both "does not exist" and "not a
+      member" (IDOR defense). Behavior depends on the deployment's
+      configured download mode: redirects (302) in CloudFront/presign
+      mode, or streams bytes directly (200/206, with HTTP Range support)
+      in proxy mode.
+    tags: [Attachments]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: Proxy mode — streamed bytes with media-aware Content-Disposition (inline or attachment depending on content type).
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      '206':
+        description: Proxy mode, partial content for a Range request.
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      '302':
+        description: CloudFront or presign mode — redirect to a time-limited signed storage URL with forced attachment disposition.
+        headers:
+          Location:
+            schema: { type: string }
+      '400':
+        description: '{id} is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid attachment id" }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: File storage is not configured for this deployment.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "storage not configured", code: "storage_not_configured" }
+      '404':
+        description: Attachment not found by id, has no workspace, the caller is not a member of it, or the storage object itself is missing (all deliberately indistinguishable for the first three).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              attachmentNotFound: { value: { error: "attachment not found" } }
+              objectNotFound: { value: { error: "attachment object not found" } }
+      '416':
+        description: Well-formed but unsatisfiable Range request.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "requested range not satisfiable" }
+      '500':
+        description: CloudFront signer or presigner not configured for the resolved download mode, or an unexpected mode was resolved.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              cloudfrontNotConfigured: { value: { error: "cloudfront attachment downloads are not configured" } }
+              presignNotSupported: { value: { error: "attachment storage does not support presigned downloads" } }
+              invalidMode: { value: { error: "invalid attachment download mode" } }
+      '502':
+        description: Presign call failed, or a Range skip-to-start read failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              presignFailed: { value: { error: "failed to create download URL" } }
+              rangeReadFailed: { value: { error: "failed to read attachment range" } }
+
+/api/attachments/{id}/signed-download:
+  get:
+    operationId: downloadAttachmentWithCapability
+    summary: Download an attachment via a short-lived signed capability (public)
+    description: >-
+      server/internal/handler/attachment_capability.go:198-237
+      (`DownloadAttachmentWithCapability`). Fully public — no Multica auth
+      of any kind. The credential is `sig`/`exp`(/`dl`) in the query
+      string: an HMAC-SHA256 signature over
+      `version("v1")|attachmentId|exp[|intent("attachment")]`, keyed by
+      `SHA256("attachment-download-capability:" + JWTSecret)`, minted only
+      by the already-authenticated GET /api/attachments/{id} after its own
+      membership check passed. Membership is NOT re-checked at redemption
+      — the signature is the proof that it already happened. Always
+      proxy-streams bytes (never redirects), with HTTP Range support.
+      Intended for native download contexts (Electron downloadURL,
+      cross-site webview `<img>`) that cannot carry Multica auth headers.
+    tags: [Attachments]
+    security: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: exp
+        in: query
+        required: true
+        description: Unix timestamp (decimal string) the capability expires at. Minted 60s in the future; verification only checks `now <= exp` (no independent max-window re-derivation at redemption).
+        schema: { type: string }
+      - name: sig
+        in: query
+        required: true
+        description: Hex-encoded HMAC-SHA256 signature.
+        schema: { type: string }
+      - name: dl
+        in: query
+        required: false
+        description: 'When exactly "1", forces `Content-Disposition: attachment` instead of the media-aware default; any other value/absence is load-intent.'
+        schema: { type: string, enum: ["1"] }
+    responses:
+      '200':
+        description: Streamed bytes, Content-Disposition forced-attachment when dl=1 else media-aware.
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      '206':
+        description: Partial content for a Range request.
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      '400':
+        description: '{id} is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid attachment id" }
+      '403':
+        description: Capability verification failed (missing/invalid field, bad signature, expired, or wrong attachment id bound into the signed message) — one generic rejection for every cause by design. Also used when file storage is not configured.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidCapability: { value: { error: "invalid or expired download link" } }
+              storageNotConfigured: { value: { error: "storage not configured" } }
+      '404':
+        description: Attachment not found, or the underlying storage object is missing.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              attachmentNotFound: { value: { error: "attachment not found" } }
+              objectNotFound: { value: { error: "attachment object not found" } }
+      '416':
+        description: Well-formed but unsatisfiable Range request.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "requested range not satisfiable" }
+      '502':
+        description: Range skip-to-start read failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to read attachment range" }
+
+/api/upload-file:
+  post:
+    operationId: uploadFile
+    summary: Upload a file
+    description: >-
+      server/internal/handler/file.go:379-636 (`UploadFile`). User-scoped;
+      workspace context is optional (omit entirely for e.g. an avatar
+      upload — no DB row is created in that case, only the raw storage
+      upload). `multipart/form-data`, max 100 MB total body. The file part
+      must be named `file`. No content-type/extension allow-list beyond a
+      handful of sniffing overrides (.svg/.css/.js/.mjs/.json/.wasm).
+    tags: [Attachments]
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [file]
+            properties:
+              file:
+                type: string
+                format: binary
+              issue_id:
+                type: string
+                format: uuid
+                description: Links the upload to an issue in the current workspace.
+              comment_id:
+                type: string
+                format: uuid
+                description: Links the upload to a non-deleted comment in the current workspace.
+              chat_session_id:
+                type: string
+                description: Links the upload to a chat session; gated by `gatePublicChatSessionForUser` (exact failure status/message not independently re-verified — 소스에서 확인 불가).
+              task_id:
+                type: string
+                format: uuid
+                description: >-
+                  Agent/task-scoped upload. Requires the
+                  `X-Actor-Source: task_token` and `X-Task-ID` headers to
+                  already identify this exact task; the task must be a
+                  chat task.
+    responses:
+      '200':
+        description: >-
+          OK. Returns a full AttachmentResponse when a workspace+DB row was
+          created normally; returns the degraded shape instead when no
+          workspace context was given, or when the DB insert itself failed
+          after the bytes were already durably uploaded (id is empty in
+          that failure case).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/AttachmentResponse'
+                - $ref: '#/components/schemas/UploadFileDegradedResponse'
+      '400':
+        description: Multipart parse failure/too large, missing file field, file read error, invalid issue_id/comment_id/task_id format, or a task_id upload targeting a non-chat task.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              multipartInvalid: { value: { error: "file too large or invalid multipart form" } }
+              missingFile: { value: { error: "missing file field: http: no such file" } }
+              readFailed: { value: { error: "failed to read file" } }
+              invalidIssueId: { value: { error: "invalid issue_id" } }
+              invalidCommentId: { value: { error: "invalid comment_id" } }
+              invalidTaskId: { value: { error: "invalid task_id" } }
+              taskNotChat: { value: { error: "task_id upload requires a chat task" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          File upload storage not configured (ErrorCode), not a workspace
+          member, issue_id/comment_id not resolvable in this workspace, or
+          a task_id gate failed.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              notConfigured: { value: { error: "file upload not configured", code: "file_upload_not_configured" } }
+              notAMember: { value: { error: "not a member of this workspace" } }
+              invalidIssueId: { value: { error: "invalid issue_id" } }
+              invalidCommentId: { value: { error: "invalid comment_id" } }
+              taskTokenRequired: { value: { error: "task_id upload is only available from within an agent task" } }
+              taskMismatch: { value: { error: "task_id must match the request's task token" } }
+              invalidTaskId: { value: { error: "invalid task_id" } }
+              wrongAgent: { value: { error: "task_id upload requires the task's own agent" } }
+      '500':
+        description: Internal id generation, seek, or storage upload failure.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              internalError: { value: { error: "internal error" } }
+              readFailed: { value: { error: "failed to read file" } }
+              uploadFailed: { value: { error: "upload failed" } }
+
+/api/projects:
+  get:
+    operationId: listProjects
+    summary: List projects in the current workspace
+    description: >-
+      server/internal/handler/project.go:136-197 (`ListProjects`).
+      Workspace-scoped. Returns the entire filtered set ordered by
+      created_at desc — no pagination (`limit`/`offset`/cursor) is
+      supported by this endpoint.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: status
+        in: query
+        required: false
+        schema: { type: string, enum: [planned, in_progress, paused, completed, cancelled] }
+      - name: priority
+        in: query
+        required: false
+        schema: { type: string, enum: [urgent, high, medium, low, none] }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [projects, total]
+              properties:
+                projects:
+                  type: array
+                  items: { $ref: '#/components/schemas/ProjectResponse' }
+                total: { type: integer }
+      '400':
+        description: Invalid workspace_id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid workspace_id" }
+      '500':
+        description: Failed to list projects.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list projects" }
+  post:
+    operationId: createProject
+    summary: Create a project
+    description: >-
+      server/internal/handler/project.go:258-469 (`CreateProject`).
+      Workspace-scoped; any member may create. Bundling `resources[]`
+      makes the whole create transactional and changes the response shape.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateProjectRequest' }
+    responses:
+      '201':
+        description: Created. Bare ProjectResponse when `resources` was omitted/empty; CreateProjectWithResourcesResponse (includes a transient resources echo) when resources were bundled.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ProjectResponse'
+                - $ref: '#/components/schemas/CreateProjectWithResourcesResponse'
+      '400':
+        description: Invalid body, missing title, invalid lead_id/workspace_id/dates, invalid status/priority enum, invalid bundled resource, or a database constraint violation.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              titleRequired: { value: { error: "title is required" } }
+              invalidLeadId: { value: { error: "invalid lead_id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
+              invalidStartDate: { value: { error: "invalid start_date format, expected YYYY-MM-DD" } }
+              resourceTypeRequired: { value: { error: "resources[0].resource_type is required" } }
+              constraintViolation: { value: { error: "project create rejected: a field value failed a database constraint" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '409':
+        description: A bundled resource is already attached (unique violation on project_id+resource_type+resource_ref), or a bundled local_directory duplicates a daemon_id already used in the same request.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              alreadyAttached: { value: { error: "resources[0]: this resource is already attached" } }
+              duplicateDaemon: { value: { error: "resources[1]: duplicate local_directory for daemon (already at index 0); each daemon may attach at most one local_directory per project" } }
+      '422':
+        description: A bundled local_directory resource requests worktree mode on a daemon whose registered runtime doesn't advertise worktree support.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DaemonVersionUnsupportedError' }
+      '500':
+        description: Project or bundled-resource creation failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              createFailed: { value: { error: "failed to create project" } }
+              resourceAttachFailed: { value: { error: "failed to attach resource at index 0" } }
+              commitFailed: { value: { error: "failed to commit project create" } }
+
+/api/projects/search:
+  get:
+    operationId: searchProjects
+    summary: Search projects by title/description
+    description: >-
+      server/internal/handler/project.go:821-962 (`SearchProjects`).
+      Workspace-scoped. Hand-built ranked LIKE search (not the shared
+      cursor-pagination convention — uses endpoint-specific limit/offset).
+      8-second statement timeout.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: q
+        in: query
+        required: true
+        schema: { type: string }
+      - name: limit
+        in: query
+        required: false
+        description: Default 20, clamped to max 50. Invalid/non-positive values are silently ignored (default stands).
+        schema: { type: integer, default: 20, maximum: 50 }
+      - name: offset
+        in: query
+        required: false
+        description: Default 0. Invalid/negative values are silently ignored.
+        schema: { type: integer, default: 0, minimum: 0 }
+      - name: include_closed
+        in: query
+        required: false
+        description: 'Exact string match "true"; any other value (including absence) means false and excludes completed/cancelled projects.'
+        schema: { type: string, enum: ["true", "false"] }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [projects]
+              properties:
+                projects:
+                  type: array
+                  items: { $ref: '#/components/schemas/SearchProjectResponse' }
+      '400':
+        description: Missing q, or invalid workspace_id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              qRequired: { value: { error: "q parameter is required" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
+      '500':
+        description: Search query failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to search projects" }
+      '503':
+        description: Search exceeded the 8-second statement timeout.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "search timed out; please refine your query or try again" }
+
+/api/projects/{id}:
+  get:
+    operationId: getProject
+    summary: Get a project
+    description: server/internal/handler/project.go:199-221 (`GetProject`). Workspace-scoped.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectResponse' }
+      '400':
+        description: Invalid project id or workspace id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidProjectId: { value: { error: "invalid project id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+      '404':
+        description: Project not found, or not in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+  put:
+    operationId: updateProject
+    summary: Update a project
+    description: >-
+      server/internal/handler/project.go:471-598 (`UpdateProject`).
+      Workspace-scoped; any member may update. PATCH-like field semantics
+      via raw-JSON-key presence detection for description/icon/lead_type/
+      lead_id/start_date/due_date (see
+      components/schemas/account.yaml#UpdateProjectRequest). No
+      optimistic-concurrency/revision guard — last write wins.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateProjectRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectResponse' }
+      '400':
+        description: Invalid project/workspace id, body read/parse failure, invalid status/priority/lead_id/dates, or a database constraint violation.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidProjectId: { value: { error: "invalid project id" } }
+              bodyReadFailed: { value: { error: "failed to read request body" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidLeadId: { value: { error: "invalid lead_id" } }
+              constraintViolation: { value: { error: "project update rejected: a field value failed a database constraint" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: Project not found (checked before the body is even parsed).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '500':
+        description: Update failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to update project" }
+  delete:
+    operationId: deleteProject
+    summary: Delete a project
+    description: >-
+      server/internal/handler/project.go:600-671 (`DeleteProject`).
+      Workspace-scoped, but unlike every other project/resource endpoint
+      in this domain, requires the `owner` or `admin` workspace role — not
+      just plain membership. Transactionally clears chat-session project
+      references and project-scoped saved issue views before deleting.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '204':
+        description: Deleted.
+      '400':
+        description: Invalid project id or workspace id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: Caller is a member but not an owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "insufficient permissions" }
+      '404':
+        description: Project not found, not in this workspace, or caller is not even a member (reuses the same not-found message to avoid confirming the project's existence to non-members).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '500':
+        description: Any step of the delete transaction failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              txStartFailed: { value: { error: "failed to start transaction" } }
+              lockFailed: { value: { error: "failed to lock project" } }
+              clearChatFailed: { value: { error: "failed to clear project chat context" } }
+              deleteViewsFailed: { value: { error: "failed to delete project views" } }
+              deleteFailed: { value: { error: "failed to delete project" } }
+              commitFailed: { value: { error: "failed to commit project delete" } }
+
+/api/projects/{id}/resources:
+  get:
+    operationId: listProjectResources
+    summary: List a project's resources
+    description: >-
+      server/internal/handler/project_resource.go:529-544
+      (`ListProjectResources`). Workspace-scoped. No pagination; ordered
+      position asc, created_at asc.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resources, total]
+              properties:
+                resources:
+                  type: array
+                  items: { $ref: '#/components/schemas/ProjectResourceResponse' }
+                total: { type: integer }
+      '400':
+        description: Invalid project id or workspace id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: Project not found, or not in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '500':
+        description: Failed to list project resources.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list project resources" }
+  post:
+    operationId: createProjectResource
+    summary: Attach a resource to a project
+    description: >-
+      server/internal/handler/project_resource.go:547-625
+      (`CreateProjectResource`). Workspace-scoped; any member may attach.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateProjectResourceRequest' }
+    responses:
+      '201':
+        description: Created.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectResourceResponse' }
+      '400':
+        description: Invalid body, missing/invalid resource_type or resource_ref (shape depends on resource_type).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              resourceTypeRequired: { value: { error: "resource_type is required" } }
+              refRequired: { value: { error: "resource_ref is required" } }
+              unknownType: { value: { error: 'unknown resource_type "foo"' } }
+              invalidExecutionMode: { value: { error: 'local_directory: execution_mode must be "in_place" or "worktree", got "bogus"' } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: Project not found, or not in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '409':
+        description: This resource (project_id+resource_type+resource_ref) is already attached, or another local_directory already uses this daemon_id on the project.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              alreadyAttached: { value: { error: "this resource is already attached to the project" } }
+              daemonConflict: { value: { error: "this daemon already has a local_directory attached to the project; remove it before adding another" } }
+      '422':
+        description: execution_mode=worktree requested on a daemon whose registered runtime doesn't advertise worktree support.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DaemonVersionUnsupportedError' }
+      '500':
+        description: Resource creation failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to create project resource" }
+
+/api/projects/{id}/resources/{resourceId}:
+  put:
+    operationId: updateProjectResource
+    summary: Update a project resource
+    description: >-
+      server/internal/handler/project_resource.go:633-811
+      (`UpdateProjectResource`). Workspace-scoped; any member may update.
+      `resource_type` is immutable. A rename-only change to a
+      local_directory's embedded label suppresses the worktree-capability
+      gate. No optimistic-concurrency/revision guard.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: resourceId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateProjectResourceRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectResourceResponse' }
+      '400':
+        description: Invalid body, invalid resource_ref for the resource's existing type, label not string-or-null, or position not an integer.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              labelType: { value: { error: "label must be a string or null" } }
+              positionType: { value: { error: "position must be an integer" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: Project not found, or the resource does not exist / belongs to a different project.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              projectNotFound: { value: { error: "project not found" } }
+              resourceNotFound: { value: { error: "project resource not found" } }
+      '409':
+        description: Resource ref collides with an existing attachment, or another local_directory already uses this daemon_id on the project.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              alreadyAttached: { value: { error: "this resource is already attached to the project" } }
+              daemonConflict: { value: { error: "another local_directory on this daemon is already attached to the project" } }
+      '422':
+        description: execution_mode=worktree requested (non-rename-only change) on a daemon whose registered runtime doesn't advertise worktree support.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DaemonVersionUnsupportedError' }
+      '500':
+        description: Update failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to update project resource" }
+  delete:
+    operationId: deleteProjectResource
+    summary: Remove a resource from a project
+    description: >-
+      server/internal/handler/project_resource.go:861-900
+      (`DeleteProjectResource`). Workspace-scoped. Unlike DeleteProject,
+      requires only plain membership — no owner/admin gate; any workspace
+      member may delete any resource from any project.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: resourceId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '204':
+        description: Deleted.
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: Project not found, or the resource does not exist / belongs to a different project.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              projectNotFound: { value: { error: "project not found" } }
+              resourceNotFound: { value: { error: "project resource not found" } }
+      '500':
+        description: Delete failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to delete project resource" }
+
+/api/share-links/{code}:
+  get:
+    operationId: getShareLinkInfo
+    summary: Preview a workspace share link (public)
+    description: >-
+      server/internal/handler/share_link.go:240-260 (`GetShareLinkInfo`).
+      Fully public — no auth. Lets a not-yet-logged-in visitor see what
+      they'd be joining. Does not expose workspace_id, the code/id itself,
+      the inviter's email, expiry, or usage count/limit. Revoked, expired,
+      exhausted, and nonexistent links are all indistinguishable (same
+      404) — this handler has no 500 path.
+    tags: [Share Links]
+    security: []
+    parameters:
+      - name: code
+        in: path
+        required: true
+        description: Opaque string; server-generated codes are 24 lowercase hex chars, but any string is accepted and looked up as-is.
+        schema: { type: string }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShareLinkInfoResponse' }
+      '400':
+        description: Empty code.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "code is required" }
+      '404':
+        description: Link does not exist, is inactive/revoked, expired, or at its use-count limit (all indistinguishable).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "share link not found or expired" }
+
+/api/share-links/join:
+  post:
+    operationId: joinByShareLink
+    summary: Join a workspace via a share link
+    description: >-
+      server/internal/handler/share_link.go:264-457 (`JoinByShareLink`).
+      User-scoped (authenticated), NOT workspace-scoped — the target
+      workspace comes from the share-link code in the body, not a header.
+      No `{code}` path parameter; the code is a body field only. Settles a
+      matching pending email invitation in the same transaction if one
+      exists (using the share link's role, not the invitation's). Marks
+      the joining user onboarded as a side effect. Returns 200, not 201,
+      despite creating a new membership.
+    tags: [Share Links]
+    security: *userAuth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/JoinByShareLinkRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShareLinkJoinResponse' }
+      '400':
+        description: Invalid body, or empty code.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              codeRequired: { value: { error: "code is required" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: Link does not exist, is inactive/revoked, expired, or at its use-count limit at either the pre-check or the transactional claim (all indistinguishable).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "share link not found or expired" }
+      '409':
+        description: Caller is already a member of the target workspace (detected at pre-check, in-transaction re-check, or as a final unique-violation guard).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you are already a member of this workspace" }
+      '429':
+        description: Seat-capacity service is rate-limited (only reachable when seat capacity is enabled for this deployment).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "Member capacity is busy. Please retry shortly.", code: "seat_capacity_rate_limited" }
+      '500':
+        description: Any step of the join transaction failed (user load, tx begin/commit, membership creation, onboarding finalize, capacity bookkeeping).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              generic: { value: { error: "failed to join workspace" } }
+              loadUserFailed: { value: { error: "failed to load user" } }
+              createMembershipFailed: { value: { error: "failed to create membership" } }
+              onboardingFailed: { value: { error: "failed to finalize onboarding" } }
+      '503':
+        description: Seat-capacity could not be verified (capacity service unavailable; only reachable when seat capacity is enabled).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "Member capacity could not be verified. Please try again.", code: "seat_capacity_unavailable" }
+
+/api/webhooks/autopilots/{token}:
+  post:
+    operationId: handleAutopilotWebhook
+    summary: Inbound autopilot trigger webhook
+    description: >-
+      server/internal/handler/autopilot_webhook.go:347
+      (`HandleAutopilotWebhook`). Public ingress — no Multica auth. The
+      `{token}` path segment (format `awt_<43 url-safe-base64 chars>`) IS
+      the credential, identifying a `webhook_trigger` row. If that trigger
+      has a signing secret configured, the request must ALSO carry a valid
+      `X-Hub-Signature-256: sha256=<hex hmac-sha256>` header over the raw
+      body; without a configured secret, the bearer token alone suffices.
+      The request body is an arbitrary provider-defined JSON object or
+      array (제공자 측 payload — see the configured provider's own webhook
+      documentation); it is normalized server-side into the stable
+      WebhookEnvelope wrapper shown below, which is NOT what the caller
+      sends.
+    tags: [Webhooks]
+    security: []
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema: { type: string }
+      - name: X-Hub-Signature-256
+        in: header
+        required: false
+        description: Required only when the resolved trigger has a signing secret configured.
+        schema: { type: string }
+      - name: X-GitHub-Delivery
+        in: header
+        required: false
+        description: Dedupe key for the github provider.
+        schema: { type: string }
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            description: Provider-defined payload (JSON object or array; scalars are rejected). See the configured provider's own webhook documentation.
+    responses:
+      '200':
+        description: Admitted, ignored, skipped, or recognized as a duplicate delivery — all are 200.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/AutopilotWebhookAcceptedResponse'
+                - $ref: '#/components/schemas/AutopilotWebhookIgnoredResponse'
+                - $ref: '#/components/schemas/AutopilotWebhookSkippedResponse'
+                - $ref: '#/components/schemas/AutopilotWebhookDuplicateResponse'
+      '400':
+        description: Body is not valid JSON, is a bare scalar, is empty, or could not be read.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidJson: { value: { error: "invalid json: unexpected end of JSON input" } }
+              notObjectOrArray: { value: { error: "body must be a JSON object or array" } }
+              empty: { value: { error: "empty body" } }
+              readFailed: { value: { error: "failed to read request body" } }
+      '401':
+        description: Signature verification failed for a trigger with a configured secret.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutopilotWebhookRejectedResponse' }
+      '404':
+        description: Unknown token, or the resolved trigger/autopilot/workspace do not line up (deliberately generic to avoid leaking valid tokens).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "webhook not found" }
+      '413':
+        description: Body exceeds the 256 KiB cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "payload too large" }
+      '429':
+        description: Rate limited.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "rate limit exceeded" }
+        headers:
+          Retry-After:
+            schema: { type: string }
+      '500':
+        description: Internal failure (token/autopilot lookup, delivery persistence, envelope encoding, or admission).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              internalError: { value: { error: "internal error" } }
+              encodeFailed: { value: { error: "failed to encode envelope" } }
+              admitFailed: { value: { error: "failed to admit autopilot" } }
+
+/api/webhooks/github:
+  post:
+    operationId: handleGithubWebhook
+    summary: Inbound GitHub App webhook
+    description: >-
+      server/internal/handler/github.go:1077 (`HandleGitHubWebhook`).
+      Public ingress — no Multica auth. Verified via
+      `X-Hub-Signature-256: sha256=<hex hmac-sha256>` against a single
+      app-wide `GITHUB_WEBHOOK_SECRET`; if that env var is unset, ALL
+      webhooks are refused with 404 (refuse-closed), unlike the autopilot
+      webhook's not-required fallback. `installation`, `pull_request`, and
+      `check_suite`/`check_run`/`status` events are decoded into clean,
+      named internal structs (not opaque passthrough); `ping` is
+      special-cased; any other `X-GitHub-Event` value is acknowledged
+      without its payload ever being parsed.
+    tags: [Webhooks]
+    security: []
+    parameters:
+      - name: X-GitHub-Event
+        in: header
+        required: true
+        schema: { type: string, enum: [ping, installation, pull_request, check_suite, check_run, status] }
+      - name: X-Hub-Signature-256
+        in: header
+        required: true
+        schema: { type: string }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            description: >-
+              GitHub's own webhook payload shape for the given
+              X-GitHub-Event (제공자 측 payload — see GitHub's webhook event
+              documentation). `installation`, `pull_request`, and
+              check-suite/check-run/status payloads are read for specific
+              fields only (id/account, PR metadata, head SHA/PR numbers
+              respectively); all other fields and all other event types
+              are accepted but ignored.
+    responses:
+      '200':
+        description: '`event == "ping"` only.'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ok]
+              properties:
+                ok: { type: string, const: pong }
+      '202':
+        description: Accepted for every other event type, handled or not — no response body, and processing failures inside a per-event sub-handler are only logged, never surfaced here.
+      '400':
+        description: Failed to read the request body.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "read body failed" }
+      '401':
+        description: Signature verification failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid signature" }
+      '404':
+        description: GITHUB_WEBHOOK_SECRET is not configured on this deployment (refuse-closed).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "not found" }
+
+/api/webhooks/stripe:
+  post:
+    operationId: handleStripeWebhook
+    summary: Inbound Stripe billing webhook (raw forward to multica-cloud)
+    description: >-
+      server/internal/handler/cloud_billing.go:520
+      (`HandleCloudBillingStripeWebhook`). Public ingress — no Multica
+      auth, and this server does NOT itself verify the Stripe signature:
+      it checks only that the `Stripe-Signature` header is present, then
+      forwards the raw body bytes verbatim (no JSON parsing/whitespace
+      trimming at all) plus that header and the original Content-Type to
+      the upstream `multica-cloud` service's `/api/v1/billing/webhooks/stripe`
+      [sic] route, which owns STRIPE_WEBHOOK_SECRET and does the actual
+      verification. This handler's success response mirrors whatever the
+      upstream returns — status/body are not fixed here (소스에서 확인 불가
+      beyond "whatever multica-cloud sends back").
+    tags: [Webhooks]
+    security: []
+    parameters:
+      - name: Stripe-Signature
+        in: header
+        required: true
+        description: Presence-checked only by this server; the actual HMAC verification happens upstream in multica-cloud.
+        schema: { type: string }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            description: Stripe's own webhook event payload (제공자 측 payload — see Stripe's webhook documentation). Forwarded byte-for-byte, never parsed by this server.
+    responses:
+      '2XX':
+        description: Mirrors whatever the upstream multica-cloud service returned for this forwarded request.
+      '400':
+        description: Body read failed for a reason other than exceeding the size cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid request body" }
+      '401':
+        description: Stripe-Signature header missing or empty.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "missing Stripe-Signature header" }
+      '403':
+        description: The multica-cloud runtime integration is not configured for this deployment.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "cloud runtime is not configured", code: "cloud_runtime_not_configured" }
+      '413':
+        description: Body exceeds the 1 MiB cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "request body is too large" }
+      '429':
+        description: Rate limited by IP.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "rate limit exceeded" }
+
+/api/webhooks/vcs/{connectionId}:
+  post:
+    operationId: handleVcsWebhook
+    summary: Inbound VCS (Forgejo/Gitea/GitLab) webhook
+    description: >-
+      server/internal/handler/vcs_webhook.go:91 (`HandleVCSWebhook`).
+      Public ingress — no Multica auth. `{connectionId}` selects the
+      workspace/provider/decryption secret. Authenticated per-connection
+      by the resolved provider's own scheme: Forgejo/Gitea verify
+      `X-Gitea-Signature` as a bare hex HMAC-SHA256 of the raw body
+      (optional `sha256=` prefix tolerated); GitLab verifies
+      `X-Gitlab-Token` as a plaintext constant-time shared-token compare
+      (not an HMAC). Disabled integration, unconfigured secret store, and
+      unknown connection id are all indistinguishable (same 404). Event
+      type is classified from per-provider headers
+      (`X-Gitea-Event`/`X-GitHub-Event` fallback, or `X-Gitlab-Event`);
+      an unrecognized event is accepted and silently ignored, still
+      returning 202.
+    tags: [Webhooks]
+    security: []
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: X-Gitea-Signature
+        in: header
+        required: false
+        description: Forgejo/Gitea only — hex HMAC-SHA256 of the raw body.
+        schema: { type: string }
+      - name: X-Gitlab-Token
+        in: header
+        required: false
+        description: GitLab only — plaintext shared token.
+        schema: { type: string }
+      - name: X-Gitea-Event
+        in: header
+        required: false
+        schema: { type: string }
+      - name: X-Gitlab-Event
+        in: header
+        required: false
+        schema: { type: string, enum: ["Merge Request Hook", "Pipeline Hook"] }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            description: >-
+              Provider-defined payload — Forgejo/Gitea pull_request &
+              status webhook payloads, or GitLab Merge Request Hook /
+              Pipeline Hook payloads, depending on which provider
+              `connectionId` resolves to (제공자 측 payload, 상세는 각 제공자
+              문서 참조). Internally normalized per-provider into shared
+              PullRequestEvent/CIStatusEvent shapes before use.
+    responses:
+      '202':
+        description: Accepted — the only success path, used uniformly for both processed and silently-ignored (unrecognized) event types. No response body.
+      '400':
+        description: Invalid connectionId UUID, or the request body could not be read.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidConnectionId: { value: { error: "invalid connection id" } }
+              readFailed: { value: { error: "read body failed" } }
+      '401':
+        description: Signature/token verification failed for the resolved provider.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid signature" }
+      '404':
+        description: VCS integration disabled, secret store not configured, or connection id not found (all indistinguishable).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "unknown connection" }
+      '500':
+        description: Unrecognized provider string stored on the connection, or webhook-secret decryption failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              unknownProvider: { value: { error: "unknown provider" } }
+              secretError: { value: { error: "secret error" } }

@@ -1,0 +1,2565 @@
+# Domain schemas for issues/comments. Nested under
+# components/schemas/ per the merge script's convention (file basename is
+# irrelevant to the merge; the parent directory name "schemas" is what
+# routes these into components.schemas). Derived from
+# server/internal/handler/{issue,comment,issue_wakeup,issue_system_wakeup,
+# issue_table_*,issue_metadata,issue_reaction,reaction,label,property,
+# github,pr_auto_complete,subscriber,activity,issue_duplicate,issue_move,
+# issue_trigger,issue_limit,daemon,task_lifecycle,quick_action,squad}.go.
+#
+# Fields confirmed only by their json tag + Go type are typed precisely;
+# anything whose exact shape lives in a package not read for this ticket
+# (e.g. server/internal/service) is typed loosely (object, additionalProperties
+# true) with a description flagging the gap, per the parent ticket's "do not
+# guess" rule.
+
+IssueRefResponse:
+  type: object
+  description: Minimal issue reference, embedded in IssueResponse.duplicate_of.
+  required: [id, identifier, title, status]
+  properties:
+    id:
+      type: string
+      format: uuid
+    identifier:
+      type: string
+    title:
+      type: string
+    status:
+      type: string
+
+IssueReactionResponse:
+  type: object
+  description: >-
+    A single emoji reaction on an issue (issue_reaction.go). No format/allowlist
+    validation is enforced server-side on `emoji` — any non-empty string is
+    accepted and stored verbatim.
+  required: [id, issue_id, actor_type, actor_id, emoji, created_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+    actor_type:
+      type: string
+      enum: [member, agent]
+    actor_id:
+      type: string
+      format: uuid
+    emoji:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    issue_revision:
+      type: integer
+      format: int64
+      description: Only present when greater than 0.
+
+ReactionResponse:
+  type: object
+  description: A single emoji reaction on a comment (reaction.go). Same free-form emoji rule as IssueReactionResponse.
+  required: [id, comment_id, actor_type, actor_id, emoji, created_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    comment_id:
+      type: string
+      format: uuid
+    actor_type:
+      type: string
+      enum: [member, agent]
+    actor_id:
+      type: string
+      format: uuid
+    emoji:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    comment_revision:
+      type: integer
+      format: int64
+      description: Only present when greater than 0.
+
+AttachmentResponse:
+  type: object
+  description: >-
+    server/internal/handler/file.go:61-112 (`AttachmentResponse`), built by
+    `attachmentToResponse`. Shared attachment envelope, used by issue/comment
+    attachment lists, the standalone attachment-by-id endpoint, and the
+    account/webhook/project attachment surfaces (previously
+    duplicated in components/schemas/account.yaml; this is now the single
+    definition).
+  required:
+    - id
+    - workspace_id
+    - uploader_type
+    - uploader_id
+    - filename
+    - url
+    - download_url
+    - markdown_url
+    - content_type
+    - size_bytes
+    - created_at
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    issue_id:
+      type: [string, "null"]
+      format: uuid
+    comment_id:
+      type: [string, "null"]
+      format: uuid
+    chat_session_id:
+      type: [string, "null"]
+      format: uuid
+    chat_message_id:
+      type: [string, "null"]
+      format: uuid
+    uploader_type:
+      type: string
+      enum: [member, agent]
+    uploader_id:
+      type: string
+      format: uuid
+    filename:
+      type: string
+    url:
+      type: string
+      description: Raw storage object URL/location; may be private/non-durable.
+    download_url:
+      type: string
+      description: >-
+        Either the stable `/api/attachments/{id}/download` path, or (when the
+        server has CloudFront signing configured via `h.CFSigner` and the
+        caller's `X-Client-Capabilities` header doesn't request stable URLs) a
+        freshly CloudFront-signed URL with the configured TTL (default 30
+        minutes, file.go:40, 321-326).
+    attachment_download_url:
+      type: string
+      description: >-
+        Forced-`Content-Disposition: attachment` sibling of `download_url`.
+        Only ever populated by GET /api/attachments/{id} (never in list
+        contexts). Omitted/empty when not applicable to the current
+        storage/download mode.
+    markdown_url:
+      type: string
+      description: Durable, persistable URL suitable for embedding in markdown (`h.buildMarkdownURL`).
+    content_type:
+      type: string
+    size_bytes:
+      type: integer
+      format: int64
+    created_at:
+      type: string
+      format: date-time
+      description: 'Formatted `2006-01-02T15:04:05Z07:00` (RFC3339 with numeric offset).'
+
+LabelResponse:
+  type: object
+  required: [id, workspace_id, resource_type, name, description, color, usage_count, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    resource_type:
+      type: string
+      enum: [issue, agent, skill]
+    name:
+      type: string
+    description:
+      type: string
+    color:
+      type: string
+    usage_count:
+      type: integer
+      format: int64
+      description: >-
+        On the issue-scoped label endpoints in this ticket (ListLabelsForIssue,
+        AttachLabel, DetachLabel) this is always 0 — label.go's
+        `labelToResponse` (used for a plain db.IssueLabel row) never
+        populates it; only the top-level `/api/labels` catalog endpoint
+        (out of this ticket's scope) fills in a real count.
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+SourceContextDetail:
+  type: object
+  description: >-
+    Detail-only field populated on GetIssue when the issue has a captured
+    source context (e.g. created from an external channel/ingestion).
+    Several nested shapes (change_details, snapshot, source_author_state)
+    live in service.SourceContextSnapshot and related service-package types
+    not read for this ticket — typed loosely here rather than guessed.
+  required: [id, version, display_state]
+  properties:
+    id:
+      type: string
+      format: uuid
+    version:
+      type: integer
+    usage:
+      type: object
+      additionalProperties: true
+    captured_at:
+      type: string
+      format: date-time
+    display_state:
+      type: string
+    source_issue_state:
+      type: object
+      additionalProperties: true
+    comment_thread_state:
+      type: object
+      additionalProperties: true
+    anchor_comment_state:
+      type: object
+      additionalProperties: true
+    can_open_current_source:
+      type: boolean
+    change_reasons:
+      type: array
+      items:
+        type: string
+    change_details:
+      type: object
+      additionalProperties: true
+      description: Exact shape not re-derived from the service package for this ticket.
+    snapshot:
+      type: object
+      additionalProperties: true
+      description: service.SourceContextSnapshot — not re-derived from the service package for this ticket.
+    current_source:
+      type: object
+      additionalProperties: true
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        anchor_comment_id:
+          type: string
+          format: uuid
+        identifier:
+          type: string
+    source_author_state:
+      type: array
+      items:
+        type: object
+        additionalProperties: true
+
+IssueResponse:
+  type: object
+  description: >-
+    The shared issue envelope returned by nearly every endpoint in this
+    domain (issue.go:38-110, `IssueResponse`). `labels` is a pointer+omitempty
+    in Go: nil means "untouched" (field absent from the JSON), a non-nil
+    value (including an empty array) means "authoritative" — list endpoints
+    in this ticket always populate it (so it is always present and non-null
+    there), while some other call sites outside this ticket's scope may omit
+    it.
+  required:
+    - id
+    - workspace_id
+    - identifier
+    - title
+    - number
+    - status
+    - status_name
+    - priority
+    - creator_type
+    - creator_id
+    - position
+    - created_at
+    - updated_at
+    - revision
+    - metadata
+    - properties
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    identifier:
+      type: string
+      description: '`PREFIX-NUMBER`, e.g. `MUL-42`.'
+    title:
+      type: string
+    number:
+      type: integer
+      format: int32
+    description:
+      type: [string, "null"]
+    status:
+      type: string
+    status_category:
+      type: string
+      description: Only set by endpoints that call the status-category filler; omitted otherwise.
+    status_name:
+      type: string
+      description: Display name for `status`; always emitted (no omitempty in Go).
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, none]
+    assignee_type:
+      type: [string, "null"]
+      enum: [member, agent, squad, null]
+    assignee_id:
+      type: [string, "null"]
+      format: uuid
+    creator_type:
+      type: string
+      enum: [member, agent]
+    creator_id:
+      type: string
+      format: uuid
+    parent_issue_id:
+      type: [string, "null"]
+      format: uuid
+    duplicate_of:
+      allOf:
+        - $ref: '#/components/schemas/IssueRefResponse'
+      nullable: true
+      description: Only present when the issue is cancelled and marked as a duplicate of another issue.
+    project_id:
+      type: [string, "null"]
+      format: uuid
+    position:
+      type: number
+      format: double
+    stage:
+      type: [integer, "null"]
+      format: int32
+    start_date:
+      type: [string, "null"]
+      format: date
+    due_date:
+      type: [string, "null"]
+      format: date
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+    revision:
+      type: integer
+      format: int64
+    last_activity_at:
+      type: [string, "null"]
+      description: Nanosecond-precision timestamp string; nullable.
+    metadata:
+      type: object
+      additionalProperties: true
+      description: 'Always emitted (empty object if unset). Values are primitive only: string, number, or bool — see SetIssueMetadataKey.'
+    properties:
+      type: object
+      additionalProperties: true
+      description: Always emitted (empty object if unset). Keyed by property-definition UUID; per-type value shape is defined by the (out-of-scope) properties domain.
+    reactions:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueReactionResponse'
+      description: Omitted when empty.
+    attachments:
+      type: array
+      items:
+        $ref: '#/components/schemas/AttachmentResponse'
+      description: Omitted when empty.
+    labels:
+      type: array
+      items:
+        $ref: '#/components/schemas/LabelResponse'
+      description: Omitted (nil) at some call sites outside this ticket's scope; always present (possibly empty) on every list/detail endpoint documented in this ticket.
+    source_context:
+      allOf:
+        - $ref: '#/components/schemas/SourceContextDetail'
+      nullable: true
+      description: Detail-only — only ever populated by GET /api/issues/{id}.
+
+SearchIssueResponse:
+  description: GET /api/issues/search result item — IssueResponse plus match provenance.
+  allOf:
+    - $ref: '#/components/schemas/IssueResponse'
+    - type: object
+      required: [match_source]
+      properties:
+        match_source:
+          type: string
+          enum: [title, description, comment]
+        matched_snippet:
+          type: [string, "null"]
+        matched_description_snippet:
+          type: [string, "null"]
+        matched_comment_snippet:
+          type: [string, "null"]
+
+IssueAssigneeGroupResponse:
+  type: object
+  required: [id, issues, total]
+  properties:
+    id:
+      type: string
+      description: 'Synthetic group key, e.g. `assignee:member:<uuid>` or `assignee:unassigned`.'
+    assignee_type:
+      type: [string, "null"]
+      enum: [member, agent, squad, null]
+    assignee_id:
+      type: [string, "null"]
+      format: uuid
+    issues:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueResponse'
+    total:
+      type: integer
+      format: int64
+
+GroupedIssuesResponse:
+  type: object
+  required: [groups]
+  properties:
+    groups:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueAssigneeGroupResponse'
+
+IssueLimitUsageResponse:
+  type: object
+  required: [used, limit]
+  properties:
+    used:
+      type: integer
+      format: int64
+    limit:
+      type: integer
+      format: int64
+
+IssueLimitReachedResponse:
+  type: object
+  description: >-
+    402 envelope written by the shared writeIssueLimitReached helper
+    (issue.go) — distinct from the components/schemas/schemas.yaml ErrorCode
+    shape (separate helper, not writeErrorCode), so `issue_limit_reached` is
+    deliberately not in that shared enum.
+  required: [error, code, limit, policy_revision]
+  properties:
+    error:
+      type: string
+    code:
+      type: string
+      const: issue_limit_reached
+    limit:
+      type: integer
+      format: int64
+    policy_revision:
+      type: integer
+
+ActiveDuplicateIssueResponse:
+  type: object
+  description: 409 envelope from CreateIssue when service.ErrActiveDuplicate is returned (an active duplicate already exists; suppressed by `allow_duplicate`).
+  required: [error, code, issue]
+  properties:
+    error:
+      type: string
+    code:
+      type: string
+      const: active_duplicate_issue
+    issue:
+      $ref: '#/components/schemas/IssueResponse'
+
+InvalidIssuePropertyResponse:
+  type: object
+  description: >-
+    400 envelope from CreateIssue's property validation (parseIssueCreateProperties /
+    writeIssueCreatePropertyError) — bad property id, duplicate property id in
+    the request map, or a service.IssuePropertyValidationError /
+    service.ErrIssuePropertiesTooLarge failure. Exact additional fields beyond
+    error/code were not independently re-verified for this ticket.
+  required: [error, code]
+  properties:
+    error:
+      type: string
+    code:
+      type: string
+      const: invalid_issue_property
+
+AgentUnavailableResponse:
+  type: object
+  description: 422 envelope from QuickCreateIssue when the target agent is not ready to be invoked.
+  required: [error, code]
+  properties:
+    error:
+      type: string
+    code:
+      type: string
+      const: agent_unavailable
+    reason:
+      type: string
+    reason_code:
+      type: string
+
+DaemonVersionUnsupportedResponse:
+  type: object
+  description: 422 envelope from QuickCreateIssue when the target agent's daemon/CLI is too old for the requested feature (e.g. priority/due_date on quick-create).
+  required: [error, code, current_version, min_version, runtime_id]
+  properties:
+    error:
+      type: string
+    code:
+      type: string
+      const: daemon_version_unsupported
+    current_version:
+      type: string
+    min_version:
+      type: string
+    runtime_id:
+      type: string
+      format: uuid
+
+QuickCreateIssueResponse:
+  type: object
+  required: [task_id]
+  properties:
+    task_id:
+      type: string
+      format: uuid
+
+DispatchBlockedResponse:
+  type: object
+  description: >-
+    Shared "blocked dispatch" envelope (dispatchBlockedResponse) used by
+    RerunIssue, RunQuickAction and RenderQuickAction — distinct shape from
+    the shared ErrorCode schema: the machine-readable field here is named
+    `reason_code`, not `code`.
+  required: [error, reason_code]
+  properties:
+    error:
+      type: string
+    reason_code:
+      type: string
+      enum:
+        - invocation_not_allowed
+        - issue_in_triage
+        - target_unavailable
+        - queued
+        - coalesced
+        - deferred
+        - steered
+        - runtime_offline
+        - runtime_unusable
+        - runtime_access_denied
+        - runtime_profile_missing
+        - agent_runtime_required
+        - attribution_blocked
+        - already_active
+        - self_trigger_suppressed
+        - internal_error
+
+# --- Issue table (facets/groups/rows) request/response schemas ---
+
+IssueTableActorRef:
+  type: object
+  required: [type, id]
+  properties:
+    type:
+      type: string
+      enum: [member, agent, squad]
+    id:
+      type: string
+      format: uuid
+
+IssueTableParentRef:
+  type: object
+  properties:
+    id:
+      type: string
+      format: uuid
+    number:
+      type: integer
+      format: int32
+    identifier:
+      type: string
+    title:
+      type: string
+    status:
+      type: string
+
+IssueTablePropertyFilterOperatorValue:
+  type: object
+  description: 'Operator form of a property filter value (alternative to a plain JSON scalar).'
+  required: [op, value]
+  properties:
+    op:
+      type: string
+      enum: [contains, gt, gte, lt, lte, before, after]
+    value:
+      description: 'String for contains/before/after (before/after must be YYYY-MM-DD); numeric string/number for gt/gte/lt/lte.'
+
+IssueTableDateFilterRequest:
+  type: object
+  required: [field, start, end]
+  properties:
+    field:
+      type: string
+      enum: [created_at, updated_at]
+    start:
+      type: string
+      format: date-time
+    end:
+      type: string
+      format: date-time
+      description: Must be strictly after `start`.
+
+IssueTableFiltersRequest:
+  type: object
+  description: Shared filter object across table/groups, table/rows and table/facets.
+  properties:
+    statuses:
+      type: array
+      items:
+        type: string
+        minLength: 1
+        maxLength: 64
+    priorities:
+      type: array
+      items:
+        type: string
+        enum: [urgent, high, medium, low, none]
+    assignees:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableActorRef'
+      description: >-
+        Presence of this key (even an empty array) activates the assignee
+        filter, OR'd with include_no_assignee.
+    include_no_assignee:
+      type: boolean
+    creators:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableActorRef'
+    project_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    include_no_project:
+      type: boolean
+    project_statuses:
+      type: array
+      items:
+        type: string
+        enum: [planned, in_progress, paused, completed, cancelled]
+    label_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    properties:
+      type: object
+      description: >-
+        Keyed by property-definition UUID (max 20 keys, max 50 values per
+        key, max 256 compiled alternatives total). Each value is an array of
+        either a plain JSON string (exact match, or the sentinel "__none__"
+        meaning "property key absent") or an IssueTablePropertyFilterOperatorValue object.
+      additionalProperties:
+        type: array
+        items:
+          oneOf:
+            - type: string
+            - $ref: '#/components/schemas/IssueTablePropertyFilterOperatorValue'
+    date:
+      $ref: '#/components/schemas/IssueTableDateFilterRequest'
+    working_only:
+      type: boolean
+      description: Restrict to issues with a currently-running agent_task_queue row.
+    working_issue_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+      description: 'Presence of this key (even empty) restricts to exactly these ids; an empty list matches nothing.'
+    include_sub_issues:
+      type: boolean
+      description: 'When explicitly false, adds a parent_issue_id IS NULL constraint.'
+
+IssueTableSortRequest:
+  type: object
+  description: Only consumed by table/rows (groups and facets ignore it).
+  properties:
+    field:
+      type: string
+      description: >-
+        One of position (default) | title | created_at | updated_at |
+        last_activity | start_date | due_date | status | priority, or
+        `property:<propertyDefinitionId>` for a custom-property sort.
+    direction:
+      type: string
+      enum: [asc, desc]
+      description: 'Default asc (desc for last_activity). Ignored when the resolved sort field is position — position sort is always ascending.'
+
+IssueTableScope:
+  type: object
+  required: [kind]
+  properties:
+    kind:
+      type: string
+      enum: [workspace, project, assignee, creator, my]
+    assignee_types:
+      type: array
+      items:
+        type: string
+        enum: [member, agent, squad]
+      description: Only meaningful for kind=workspace or kind=project.
+    project_id:
+      type: string
+      format: uuid
+      description: Required when kind=project.
+    actor:
+      $ref: '#/components/schemas/IssueTableActorRef'
+      description: Required when kind=assignee or kind=creator.
+    relation:
+      type: string
+      enum: [assigned, created, involved, any]
+      description: 'Only meaningful for kind=my; default any. Requires an authenticated user.'
+
+IssueTableQuerySpec:
+  type: object
+  required: [scope]
+  properties:
+    scope:
+      $ref: '#/components/schemas/IssueTableScope'
+    filters:
+      $ref: '#/components/schemas/IssueTableFiltersRequest'
+    search:
+      type: string
+      description: 'Free text: every lowercased whitespace-split word must match the title (AND), OR''d with an exact issue-number match.'
+    sort:
+      $ref: '#/components/schemas/IssueTableSortRequest'
+
+IssueTableGroupSpec:
+  type: object
+  required: [kind]
+  properties:
+    category_format:
+      type: string
+      enum: ['', lifecycle]
+      description: 'Only legal non-empty value is "lifecycle", and only for kind=status_category or kind=compound with secondary=status_category.'
+    kind:
+      type: string
+      enum: [none, status, status_category, assignee, project, parent, compound, property]
+      description: 'kind=none is only valid on table/rows (ungrouped root listing), not table/groups.'
+    property_id:
+      type: string
+      format: uuid
+      description: Required when kind=property; must reference an existing, non-archived select or checkbox property.
+    include_empty:
+      type: boolean
+      description: Only meaningful for kind=property — include zero-count buckets for every known option plus "unset".
+    primary:
+      type: string
+      enum: [assignee, project, parent]
+      description: Required when kind=compound.
+    secondary:
+      type: string
+      enum: [status, status_category]
+      description: Required when kind=compound.
+    secondary_values:
+      type: array
+      items:
+        type: string
+      description: Only legal when kind=compound; restricts/filters which secondary cells are counted.
+
+IssueTablePageRequest:
+  type: object
+  properties:
+    limit:
+      type: integer
+      minimum: 1
+      maximum: 100
+      default: 50
+    cursor:
+      type: string
+      description: Opaque base64url-encoded cursor from a previous page's next_cursor.
+
+IssueTableGroupsRequest:
+  type: object
+  required: [query, group]
+  properties:
+    query:
+      $ref: '#/components/schemas/IssueTableQuerySpec'
+    group:
+      $ref: '#/components/schemas/IssueTableGroupSpec'
+    page:
+      $ref: '#/components/schemas/IssueTablePageRequest'
+
+IssueTableHierarchyRequest:
+  type: object
+  properties:
+    enabled:
+      type: boolean
+
+IssueTableRowsRequest:
+  type: object
+  required: [query, group]
+  properties:
+    query:
+      $ref: '#/components/schemas/IssueTableQuerySpec'
+    group:
+      $ref: '#/components/schemas/IssueTableGroupSpec'
+    group_key:
+      type: [string, "null"]
+      description: 'Opaque key from a table/groups descriptor. Required (non-blank) unless group.kind=none, in which case it must be absent/empty.'
+    hierarchy:
+      $ref: '#/components/schemas/IssueTableHierarchyRequest'
+    parent_id:
+      type: [string, "null"]
+      format: uuid
+      description: Only valid when hierarchy.enabled=true.
+    page:
+      $ref: '#/components/schemas/IssueTablePageRequest'
+
+IssueTableFacetSpec:
+  type: object
+  required: [kind]
+  properties:
+    kind:
+      type: string
+      enum: [status, priority, assignee, creator, project, label, working_agents, property]
+    property_id:
+      type: string
+      format: uuid
+      description: Required only when kind=property.
+
+IssueTableFacetsRequest:
+  type: object
+  required: [query, facets]
+  properties:
+    query:
+      $ref: '#/components/schemas/IssueTableQuerySpec'
+    facets:
+      type: array
+      minItems: 1
+      maxItems: 32
+      items:
+        $ref: '#/components/schemas/IssueTableFacetSpec'
+    include_total:
+      type: boolean
+      default: true
+
+IssueTableGroupValueResponse:
+  type: object
+  required: [kind]
+  properties:
+    kind:
+      type: string
+      enum: [status, assignee, project, parent, property]
+    status:
+      type: string
+    actor:
+      allOf:
+        - $ref: '#/components/schemas/IssueTableActorRef'
+      nullable: true
+    project_id:
+      type: [string, "null"]
+      format: uuid
+    parent_id:
+      type: [string, "null"]
+      format: uuid
+    parent:
+      allOf:
+        - $ref: '#/components/schemas/IssueTableParentRef'
+      nullable: true
+    property_id:
+      type: string
+      format: uuid
+    value:
+      description: 'String (select option id) or bool (checkbox), depending on the property type.'
+    value_state:
+      type: string
+      enum: [unset, unavailable, value]
+
+IssueTableGroupDescriptorResponse:
+  type: object
+  required: [key, value, count]
+  properties:
+    key:
+      type: string
+      description: 'Opaque group key for table/rows'' group_key, e.g. "status:todo", "assignee:unassigned", "project:none", "parent:<uuid>", "property:<propId>:value:<base64>", "status_category:<cat>".'
+    value:
+      $ref: '#/components/schemas/IssueTableGroupValueResponse'
+    count:
+      type: integer
+      format: int64
+    secondary_groups:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableGroupDescriptorResponse'
+      description: Only present for compound groups — one entry per secondary (status/category) value.
+
+IssueTableGroupsResponse:
+  type: object
+  required: [query_fingerprint, total, groups, next_cursor]
+  properties:
+    query_fingerprint:
+      type: string
+      description: '`sha256:<hex>`, a stable hash of workspace + normalized query.'
+    total:
+      type: integer
+      format: int64
+      description: Sum of visible_count across all groups (window function), not just this page.
+    groups:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableGroupDescriptorResponse'
+    next_cursor:
+      type: [string, "null"]
+
+IssueTableRowResponse:
+  type: object
+  required: [issue, direct_child_count]
+  properties:
+    issue:
+      $ref: '#/components/schemas/IssueResponse'
+    direct_child_count:
+      type: integer
+      format: int64
+      description: Count of direct children within the current hierarchy membership; 0 when hierarchy.enabled=false.
+
+IssueTableRowsResponse:
+  type: object
+  required: [query_fingerprint, group_key, parent_id, total, rows, branch_total, next_cursor]
+  properties:
+    query_fingerprint:
+      type: string
+    group_key:
+      type: [string, "null"]
+    parent_id:
+      type: [string, "null"]
+      format: uuid
+    total:
+      type: integer
+      format: int64
+      description: Only computed (full COUNT) when cursor is absent AND group.kind=none AND parent_id is absent; otherwise 0.
+    rows:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableRowResponse'
+    branch_total:
+      type: integer
+      format: int64
+      description: Equal to len(rows) for this page only — a legacy/compat field, not a branch-wide total.
+    next_cursor:
+      type: [string, "null"]
+
+IssueTableFacetValueResponse:
+  type: object
+  required: [key, count]
+  properties:
+    key:
+      type: string
+    count:
+      type: integer
+      format: int64
+
+IssueTableFacetResponse:
+  type: object
+  required: [kind, values]
+  properties:
+    kind:
+      type: string
+    property_id:
+      type: string
+      format: uuid
+    values:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableFacetValueResponse'
+      description: Sorted by key ascending; always non-null (possibly empty).
+
+IssueTableFacetsResponse:
+  type: object
+  required: [query_fingerprint, total, facets]
+  properties:
+    query_fingerprint:
+      type: string
+    total:
+      type: integer
+      format: int64
+      description: 'Count matching the ORIGINAL (unmodified) query; 0 if include_total=false.'
+    facets:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTableFacetResponse'
+      description: Same order/length as the request's `facets` array.
+
+UnsupportedGroupResponse:
+  type: object
+  description: 422 envelope shared by table/groups, table/rows and table/facets (writeIssueTableUnsupportedGroup).
+  required: [error, code, message]
+  properties:
+    error:
+      type: string
+      const: unsupported_group
+    code:
+      type: string
+      enum:
+        - group_kind_unsupported
+        - primary_group_unsupported
+        - secondary_group_unsupported
+        - property_not_found
+        - property_archived
+        - property_type_unsupported
+    message:
+      type: string
+
+CursorQueryMismatchResponse:
+  type: object
+  description: '409 envelope shared by table/groups and table/rows when a cursor does not match the current query/group/branch.'
+  required: [error, message]
+  properties:
+    error:
+      type: string
+      const: cursor_query_mismatch
+    message:
+      type: string
+
+QueryTimeoutResponse:
+  type: object
+  description: 504 envelope for table/groups, table/rows and table/facets when the 8s server-side query budget is exceeded.
+  required: [error, message]
+  properties:
+    error:
+      type: string
+      const: query_timeout
+    message:
+      type: string
+
+IssueTriggerPreviewItem:
+  type: object
+  required: [issue_id, agent_id, source]
+  properties:
+    issue_id:
+      type: string
+      format: uuid
+    agent_id:
+      type: string
+      format: uuid
+      description: Runnable agent id — the squad leader agent when the target is a squad.
+    source:
+      type: string
+      description: service.IssueRunTrigger's Source enum; exact string values live in the service package and were not re-derived for this ticket.
+
+IssueTriggerPreviewResponse:
+  type: object
+  required: [triggers, total_count]
+  properties:
+    triggers:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTriggerPreviewItem'
+      description: Always non-null; only issues that WOULD enqueue a run are listed.
+    total_count:
+      type: integer
+      description: Equal to the length of `triggers`.
+
+# --- Comments ---
+
+CommentTriggerOutcome:
+  type: object
+  required: [target_type, target_id, status, reason_code]
+  properties:
+    target_type:
+      type: string
+      enum: [agent, squad]
+    target_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+      enum: [queued, coalesced, deferred, blocked]
+    reason_code:
+      type: string
+
+CommentTriggerAgentResponse:
+  type: object
+  required: [id, name, source, reason]
+  properties:
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    avatar_url:
+      type: string
+    source:
+      type: string
+      enum: [issue_assignee, mention_agent, mention_squad_leader, thread_parent, conversation_continuation]
+    reason:
+      type: string
+      description: Human-readable sentence explaining why this agent would be triggered.
+
+CommentTriggerPreviewResponse:
+  type: object
+  required: [agents]
+  properties:
+    agents:
+      type: array
+      items:
+        $ref: '#/components/schemas/CommentTriggerAgentResponse'
+      description: Always present, empty array when none.
+    blocked:
+      type: array
+      items:
+        $ref: '#/components/schemas/CommentTriggerOutcome'
+      description: 'Explicit @agent/@squad mentions in the previewed content that will NOT trigger. Omitted when empty.'
+
+CommentResponse:
+  type: object
+  description: comment.go:28 — the shared comment envelope.
+  required: [id, issue_id, author_type, author_id, content, type, created_at, updated_at, revision]
+  properties:
+    id:
+      type: string
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+    author_type:
+      type: string
+      enum: [member, agent]
+    author_id:
+      type: string
+      format: uuid
+    content:
+      type: string
+    type:
+      type: string
+      enum: [comment, progress_update, status_change, system]
+      description: Only `comment` and `progress_update` are client-authorable; `status_change`/`system` are server-only.
+    parent_id:
+      type: [string, "null"]
+      format: uuid
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+    revision:
+      type: integer
+      format: int64
+    issue_revision:
+      type: integer
+      format: int64
+      description: Set on mutation responses (create/update/resolve/etc) when greater than 0.
+    resolved_at:
+      type: [string, "null"]
+      format: date-time
+    resolved_by_type:
+      type: [string, "null"]
+      enum: [member, agent, null]
+    resolved_by_id:
+      type: [string, "null"]
+      format: uuid
+    source_task_id:
+      type: string
+      format: uuid
+      description: Omitted unless the comment was authored by an agent task.
+    deleted_at:
+      type: [string, "null"]
+      format: date-time
+      description: Tombstone marker — set when the comment was deleted but kept as a parent placeholder for its replies.
+    quick_action_id:
+      type: string
+      format: uuid
+      description: Set only on a comment authored by RunQuickAction.
+    reactions:
+      type: array
+      items:
+        $ref: '#/components/schemas/ReactionResponse'
+    attachments:
+      type: array
+      items:
+        $ref: '#/components/schemas/AttachmentResponse'
+    trigger_outcomes:
+      type: array
+      items:
+        $ref: '#/components/schemas/CommentTriggerOutcome'
+      description: Omitted unless the write re-evaluated triggers (create, or a content-changing update).
+    reply_count:
+      type: integer
+      description: Only present under ListComments' roots_only mode.
+    last_activity_at:
+      type: string
+      format: date-time
+      description: Only present under ListComments' roots_only mode.
+    thread_resolved:
+      type: boolean
+      description: Only present on a resolved thread's root under ListComments' fold mode.
+    folded_count:
+      type: integer
+      description: Only present on a resolved thread's root under ListComments' fold mode.
+    content_truncated:
+      type: boolean
+      description: Only present under ListComments' summary mode.
+    supplements:
+      type: array
+      items:
+        type: object
+        additionalProperties: true
+      description: Task-supplement ("steering message") metadata — only present when steer_task_ids was used; exact nested shape belongs to the tasks domain, not re-derived here.
+    supplement_task_id:
+      type: string
+      format: uuid
+    supplement_status:
+      type: string
+    supplement_failure_reason:
+      type: string
+    supplement_delivered_at:
+      type: string
+      format: date-time
+
+# --- Wakeups ---
+
+IssueWakeupConditionIssueField:
+  type: object
+  required: [field]
+  properties:
+    field:
+      type: string
+      enum: [status, assignee, label, property]
+    value:
+      description: 'Required for field=status (non-empty string status key) and field=property (any non-null JSON value, canonicalized, <=1024 bytes).'
+    assignee_type:
+      type: string
+      enum: [member, agent, squad]
+      description: Required when field=assignee.
+    assignee_id:
+      type: string
+      format: uuid
+      description: Required when field=assignee.
+    label_id:
+      type: string
+      format: uuid
+      description: Required when field=label.
+    property_id:
+      type: string
+      format: uuid
+      description: Required when field=property.
+
+IssueWakeupCondition:
+  type: object
+  description: service.WakeupCondition — only valid when kind=event; mutually exclusive with event_types and all filter/schedule fields.
+  required: [type]
+  properties:
+    type:
+      type: string
+      enum: [issue_field, children_done, pull_request, other_issue]
+    issue_field:
+      $ref: '#/components/schemas/IssueWakeupConditionIssueField'
+      description: Required when type=issue_field.
+    stage:
+      type: integer
+      minimum: 1
+      maximum: 1000
+      description: Optional, only for type=children_done.
+    event:
+      type: string
+      enum: [checks_finished, merged]
+      description: Required when type=pull_request.
+    issue_id:
+      type: string
+      format: uuid
+      description: Required when type=other_issue; must exist in-workspace and differ from the current issue.
+    state:
+      type: string
+      enum: [done, ended, in_review]
+      description: Required when type=other_issue.
+    identifier:
+      type: string
+      readOnly: true
+      description: 'Server-filled display identifier for type=other_issue; not settable by clients.'
+
+IssueWakeupInput:
+  type: object
+  description: >-
+    service.WakeupInput — the body for POST (create) and PUT (full replace)
+    of an issue wakeup. Decoded with unknown-field rejection and a 32KB cap.
+  required: [instruction, kind]
+  properties:
+    agent_id:
+      type: string
+      format: uuid
+      description: 'Defaults to the caller''s own agent id when omitted and the caller is an agent actor; required otherwise.'
+    instruction:
+      type: string
+      minLength: 1
+      maxLength: 12000
+    kind:
+      type: string
+      enum: [event, at, every, cron]
+    mode:
+      type: string
+      enum: [once, continuous]
+      description: 'Defaults to continuous for kind=every/cron, once otherwise.'
+    event_types:
+      type: array
+      items:
+        type: string
+        enum:
+          - task.queued
+          - task.dispatched
+          - task.started
+          - task.deferred
+          - task.waiting_local_directory
+          - task.completed
+          - task.failed
+          - task.cancelled
+          - issue.updated
+          - issue.status_changed
+          - issue.assignee_changed
+          - issue.parent_changed
+          - issue.project_changed
+          - issue.labels_changed
+          - issue.properties_changed
+          - issue.metadata_changed
+          - comment.created
+          - comment.updated
+          - comment.deleted
+          - comment.resolved
+          - comment.unresolved
+          - reaction.added
+          - reaction.removed
+          - attachment.attached
+          - attachment.detached
+      description: 'Required for kind=event without a condition; must be empty for every other kind. issue.created/issue.deleted are rejected — a subscription cannot wake its own not-yet-existing or already-gone issue.'
+    filter_agent_id:
+      type: string
+      format: uuid
+      description: Legacy alias filter; see filter_actor_type for the preferred form.
+    filter_actor_type:
+      type: string
+      enum: [member, agent]
+      description: Must be paired with filter_actor_id; requires kind=event; mutually exclusive with filter_agent_id/filter_task_id; none of event_types may start with task.
+    filter_actor_id:
+      type: string
+      format: uuid
+    filter_task_id:
+      type: string
+      format: uuid
+      description: Must belong to this issue; requires all event_types to be task.* events.
+    parent_comment_id:
+      type: string
+      format: uuid
+      description: Must reference a non-deleted comment on this issue.
+    after_seconds:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 31536000
+      description: 'Exactly one of at/after_seconds required for kind=at.'
+    at:
+      type: string
+      format: date-time
+    interval_seconds:
+      type: integer
+      format: int64
+      minimum: 60
+      maximum: 31536000
+      description: 'Required for kind=every; mode must be continuous.'
+    cron_expression:
+      type: string
+      description: Required for kind=cron; must have a future occurrence under `timezone`.
+    timezone:
+      type: string
+      default: UTC
+    expires_at:
+      type: string
+      format: date-time
+      description: 'Mutually exclusive with expires_in_seconds; forbidden for kind=at; must be 1 second to 1 year in the future.'
+    expires_in_seconds:
+      type: integer
+      format: int64
+      minimum: 60
+      maximum: 31536000
+    on_timeout:
+      type: string
+      enum: [end, wake]
+      default: end
+      description: 'wake is only allowed for kind=event, and only meaningful when a deadline is set.'
+    condition:
+      $ref: '#/components/schemas/IssueWakeupCondition'
+    max_fires:
+      type: integer
+      format: int32
+      minimum: 1
+      maximum: 1000
+      description: Only allowed when mode=continuous.
+
+IssueWakeupEnableInput:
+  type: object
+  required: [revision]
+  properties:
+    revision:
+      type: integer
+      format: int64
+      minimum: 1
+      description: Optimistic-concurrency fence — must equal the rule's current revision.
+    at:
+      type: string
+      format: date-time
+      description: Only accepted when the rule's kind is `at`.
+    rearm:
+      type: boolean
+      description: Required (true) to re-enable a consumed one-shot (mode=once) rule.
+
+IssueWakeupInstructionInput:
+  type: object
+  required: [instruction, expected_instruction, revision]
+  properties:
+    instruction:
+      type: string
+      minLength: 1
+      maxLength: 12000
+    expected_instruction:
+      type: string
+      description: Must equal the rule's current instruction exactly (checked in addition to revision).
+    revision:
+      type: integer
+      format: int64
+      minimum: 1
+
+IssueWakeupCheckinInput:
+  type: object
+  required: [note]
+  properties:
+    note:
+      type: string
+      minLength: 1
+      maxLength: 500
+      description: Trimmed, 1-500 runes.
+
+IssueWakeup:
+  type: object
+  description: db.IssueWakeup — the row returned by create/replace/disable/enable.
+  required: [id, workspace_id, issue_id, instruction, kind, mode, enabled, revision, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+    agent_id:
+      type: [string, "null"]
+      format: uuid
+    created_by:
+      type: [string, "null"]
+      format: uuid
+    source_task_id:
+      type: [string, "null"]
+      format: uuid
+    parent_comment_id:
+      type: [string, "null"]
+      format: uuid
+    instruction:
+      type: string
+    kind:
+      type: string
+      enum: [event, at, every, cron]
+    mode:
+      type: string
+      enum: [once, continuous]
+    event_types:
+      type: array
+      items:
+        type: string
+    filter_agent_id:
+      type: [string, "null"]
+      format: uuid
+    filter_task_id:
+      type: [string, "null"]
+      format: uuid
+    filter_actor_type:
+      type: [string, "null"]
+      enum: [member, agent, null]
+    filter_actor_id:
+      type: [string, "null"]
+      format: uuid
+    interval_seconds:
+      type: [integer, "null"]
+      format: int64
+    cron_expression:
+      type: [string, "null"]
+    timezone:
+      type: string
+    next_fire_at:
+      type: [string, "null"]
+      format: date-time
+    enabled:
+      type: boolean
+    disabled_at:
+      type: [string, "null"]
+      format: date-time
+    revision:
+      type: integer
+      format: int64
+    last_task_id:
+      type: [string, "null"]
+      format: uuid
+    last_error:
+      type: [string, "null"]
+    expires_at:
+      type: [string, "null"]
+      format: date-time
+    expiry_seconds:
+      type: [integer, "null"]
+      format: int64
+    on_timeout:
+      type: [string, "null"]
+      enum: [end, wake, null]
+    timed_out_at:
+      type: [string, "null"]
+      format: date-time
+    system_rule:
+      type: boolean
+      description: True for a platform-owned rule (e.g. child_done) — not creatable/replaceable through these endpoints.
+    customized_at:
+      type: [string, "null"]
+      format: date-time
+    condition:
+      type: [object, "null"]
+      additionalProperties: true
+      description: Raw JSON of the stored IssueWakeupCondition, when kind=event with a condition.
+    condition_state:
+      type: string
+      description: Internal baseline/state string for condition evaluation.
+    max_fires:
+      type: [integer, "null"]
+      format: int32
+    fire_count:
+      type: integer
+      format: int32
+    paused_reason:
+      type: [string, "null"]
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+IssueWakeupListItem:
+  description: ListIssueWakeups row — IssueWakeup plus denormalized display fields, with private/inaccessible agent references redacted to null.
+  allOf:
+    - $ref: '#/components/schemas/IssueWakeup'
+    - type: object
+      properties:
+        agent_name:
+          type: [string, "null"]
+        filter_agent_name:
+          type: [string, "null"]
+        filter_actor_name:
+          type: [string, "null"]
+        last_task_status:
+          type: [string, "null"]
+        created_by_agent:
+          type: boolean
+        created_by_name:
+          type: [string, "null"]
+        source_agent_id:
+          type: [string, "null"]
+          format: uuid
+        source_agent_name:
+          type: [string, "null"]
+
+IssueWakeupRun:
+  type: object
+  required: [id, status, created_at, checkin_note, triggers, commented]
+  properties:
+    id:
+      type: string
+      format: uuid
+    status:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    started_at:
+      type: [string, "null"]
+      format: date-time
+    completed_at:
+      type: [string, "null"]
+      format: date-time
+    checkin_note:
+      type: string
+    triggers:
+      type: array
+      items:
+        type: string
+      description: Never null (forced to an empty array).
+    commented:
+      type: boolean
+
+SystemWakeupTarget:
+  type: object
+  properties:
+    type:
+      type: string
+      enum: [member, agent, squad]
+    id:
+      type: string
+      format: uuid
+    name:
+      type: string
+
+SystemWakeupResponse:
+  type: object
+  description: >-
+    issue_system_wakeup.go's systemWakeupResponse. Today the platform has
+    exactly one system rule (child_done), so this array has 0 or 1 elements;
+    it is empty whenever the issue is closed, has no children, or every
+    child is closed.
+  required: [rule, enabled, instruction, default_instruction, customized, staged, total, remaining, waiting, blocked, workspace_default]
+  properties:
+    id:
+      type: string
+      description: Empty until the rule row exists on this issue (lazily created on first sub-issue change or first edit).
+    revision:
+      type: integer
+      format: int64
+    rule:
+      type: string
+      const: child_done
+    enabled:
+      type: boolean
+    instruction:
+      type: string
+      description: Per-issue override; empty string if not customized.
+    default_instruction:
+      type: string
+      description: 'What runs actually receive when instruction is empty: issue override -> workspace default -> the built-in default text.'
+    customized:
+      type: boolean
+    paused_reason:
+      type: [string, "null"]
+    staged:
+      type: boolean
+    stage:
+      type: [integer, "null"]
+      format: int32
+    total:
+      type: integer
+    remaining:
+      type: integer
+    waiting:
+      type: array
+      items:
+        type: string
+      description: 'Up to 5 identifiers (PREFIX-number) of unfinished sub-issues; never null.'
+    target:
+      allOf:
+        - $ref: '#/components/schemas/SystemWakeupTarget'
+      nullable: true
+    blocked:
+      type: string
+      enum: ['', backlog, member_assignee, no_assignee]
+    workspace_default:
+      type: boolean
+
+IssueSystemWakeupUpdateInput:
+  type: object
+  description: service.SystemWakeupInput. Both fields are optional/nullable; omitting a field keeps its current value.
+  properties:
+    enabled:
+      type: [boolean, "null"]
+    instruction:
+      type: [string, "null"]
+      maxLength: 4000
+
+# --- Subscribers ---
+
+SubscriberResponse:
+  type: object
+  required: [issue_id, user_type, user_id, reason, created_at]
+  properties:
+    issue_id:
+      type: string
+      format: uuid
+    user_type:
+      type: string
+      enum: [member, agent]
+    user_id:
+      type: string
+      format: uuid
+    reason:
+      type: string
+      description: '"manual" for an explicit subscribe, or a rule-derived reason for an automatic one.'
+    created_at:
+      type: string
+      format: date-time
+
+SubscribeTargetInput:
+  type: object
+  description: 'Optional request body for subscribe/unsubscribe; both fields must be supplied together to override the default target (the caller).'
+  properties:
+    user_id:
+      type: string
+      format: uuid
+    user_type:
+      type: string
+      enum: [member, agent]
+
+SubscriptionStateResponse:
+  type: object
+  required: [subscribed]
+  properties:
+    subscribed:
+      type: boolean
+
+# --- Timeline ---
+
+TimelineEntry:
+  type: object
+  description: Merged comment/activity union row.
+  required: [type, id, actor_type, actor_id, created_at]
+  properties:
+    type:
+      type: string
+      enum: [activity, comment]
+    id:
+      type: string
+      format: uuid
+    actor_type:
+      type: string
+      enum: [member, agent]
+    actor_id:
+      type: string
+      format: uuid
+    actor_name:
+      type: string
+      description: Hydrated only for member actors; best-effort (silently omitted on lookup failure).
+    actor_avatar_url:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    action:
+      type: string
+      description: Activity-only.
+    details:
+      type: object
+      additionalProperties: true
+      description: Activity-only; raw JSON.
+    content:
+      type: string
+      description: Comment-only.
+    parent_id:
+      type: [string, "null"]
+      format: uuid
+      description: Comment-only.
+    updated_at:
+      type: string
+      format: date-time
+      description: Comment-only.
+    revision:
+      type: integer
+      format: int64
+      description: Comment-only.
+    comment_type:
+      type: string
+      description: Comment-only.
+    quick_action_id:
+      type: string
+      format: uuid
+      description: Comment-only; only for quick-action-authored comments.
+    reactions:
+      type: array
+      items:
+        $ref: '#/components/schemas/ReactionResponse'
+      description: Comment-only.
+    attachments:
+      type: array
+      items:
+        $ref: '#/components/schemas/AttachmentResponse'
+      description: Comment-only.
+    resolved_at:
+      type: [string, "null"]
+      format: date-time
+      description: Comment-only.
+    resolved_by_type:
+      type: [string, "null"]
+      description: Comment-only.
+    resolved_by_id:
+      type: [string, "null"]
+      format: uuid
+      description: Comment-only.
+    source_task_id:
+      type: string
+      format: uuid
+      description: Comment-only.
+    deleted_at:
+      type: [string, "null"]
+      format: date-time
+      description: Comment-only tombstone marker.
+    supplements:
+      type: array
+      items:
+        type: object
+        additionalProperties: true
+      description: Comment-only.
+    supplement_task_id:
+      type: string
+      format: uuid
+      description: Comment-only.
+    supplement_status:
+      type: string
+      description: Comment-only.
+    supplement_failure_reason:
+      type: string
+      description: Comment-only.
+    supplement_delivered_at:
+      type: string
+      format: date-time
+      description: Comment-only.
+
+TimelinePaginatedResponse:
+  type: object
+  description: Returned instead of a bare array whenever any of limit/before/after/around is present on the request.
+  required: [entries, next_cursor, prev_cursor, has_more_before, has_more_after]
+  properties:
+    entries:
+      type: array
+      items:
+        $ref: '#/components/schemas/TimelineEntry'
+      description: Descending order (unlike the default bare-array response, which is ascending).
+    next_cursor:
+      type: "null"
+      description: Always null — this endpoint does not implement forward cursoring despite the field's presence.
+    prev_cursor:
+      type: "null"
+      description: Always null.
+    has_more_before:
+      type: boolean
+      description: True iff comments or activities were hard-capped (2000 each).
+    has_more_after:
+      type: boolean
+      description: Always false.
+    target_index:
+      type: integer
+      description: Index of the entry matching the `around` query param, if found.
+
+# --- Pull requests ---
+
+GitHubPullRequestResponse:
+  type: object
+  required: [id, provider, workspace_id, repo_owner, repo_name, number, title, state, html_url, pr_created_at, pr_updated_at, checks_total, checks_passed, checks_failed, checks_running, checks_pending, failed_check_names, snapshot_stale, additions, deletions, changed_files]
+  properties:
+    id:
+      type: string
+      format: uuid
+    provider:
+      type: string
+      enum: [github, forgejo, gitea, gitlab]
+    workspace_id:
+      type: string
+      format: uuid
+    repo_owner:
+      type: string
+    repo_name:
+      type: string
+    number:
+      type: integer
+      format: int32
+    title:
+      type: string
+    state:
+      type: string
+    html_url:
+      type: string
+    branch:
+      type: [string, "null"]
+    author_login:
+      type: [string, "null"]
+    author_avatar_url:
+      type: [string, "null"]
+    merged_at:
+      type: [string, "null"]
+      format: date-time
+    closed_at:
+      type: [string, "null"]
+      format: date-time
+    pr_created_at:
+      type: string
+      format: date-time
+    pr_updated_at:
+      type: string
+      format: date-time
+    link_source:
+      type: string
+      enum: [manual, title, branch, auto]
+      description: Omitted when not applicable.
+    mergeable_state:
+      type: [string, "null"]
+    mergeable:
+      type: [string, "null"]
+      enum: [mergeable, conflicting, unknown, null]
+    merge_state_status:
+      type: [string, "null"]
+      enum: [clean, dirty, blocked, behind, unstable, draft, has_hooks, unknown, null]
+    snapshot_available:
+      type: boolean
+      description: Omitted when not applicable.
+    checks_rollup:
+      type: [string, "null"]
+      enum: [success, failure, pending, error, expected, null]
+    checks_conclusion:
+      type: [string, "null"]
+      enum: [passed, failed, pending, null]
+    checks_total:
+      type: integer
+      format: int64
+    checks_passed:
+      type: integer
+      format: int64
+    checks_failed:
+      type: integer
+      format: int64
+    checks_running:
+      type: integer
+      format: int64
+    checks_pending:
+      type: integer
+      format: int64
+    failed_check_names:
+      type: array
+      items:
+        type: string
+    snapshot_stale:
+      type: boolean
+    snapshot_fetched_at:
+      type: [string, "null"]
+      format: date-time
+    additions:
+      type: integer
+      format: int32
+    deletions:
+      type: integer
+      format: int32
+    changed_files:
+      type: integer
+      format: int32
+
+PRAutoCompleteResponse:
+  type: object
+  required: [state, pull_request_ids, issue_disabled, workspace_enabled, target_status]
+  properties:
+    state:
+      type: string
+      enum: [none, workspace_disabled, issue_disabled, terminal, triage, at_target, waiting, not_merged, all_merged]
+    pull_request_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    issue_disabled:
+      type: boolean
+    workspace_enabled:
+      type: boolean
+    target_status:
+      type: string
+
+IssuePullRequestsListResponse:
+  type: object
+  required: [pull_requests, auto_complete]
+  properties:
+    pull_requests:
+      type: array
+      items:
+        $ref: '#/components/schemas/GitHubPullRequestResponse'
+      description: Sorted newest-first by pr_created_at; merges native GitHub-mirrored PRs and other-VCS-provider PRs into one list.
+    auto_complete:
+      $ref: '#/components/schemas/PRAutoCompleteResponse'
+
+LinkIssuePullRequestInput:
+  type: object
+  description: 'At least one of url or pull_request_id (non-blank after trim) is required.'
+  properties:
+    url:
+      type: string
+      description: 'A pull/merge-request URL; normalized (query/fragment stripped, scheme defaulted to https) before lookup against already-synced PR rows. This endpoint links an already-mirrored PR — it does not create one by calling the external API live.'
+    pull_request_id:
+      type: string
+      format: uuid
+      description: Id of an already-listed/mirrored PR (e.g. to undo a previous unlink).
+
+SetIssuePRAutoCompleteInput:
+  type: object
+  required: [disabled]
+  properties:
+    disabled:
+      type: boolean
+      nullable: false
+      description: Required — both a decode failure and an explicit/omitted null are rejected identically.
+
+# --- Tasks (execution log, partial — full canonical shape belongs to the agents/tasks domain) ---
+
+TaskAttribution:
+  type: object
+  description: 'Partial — only fields observed via this ticket''s handlers (agent.go:573). The canonical/complete shape belongs to the agents domain.'
+  properties:
+    source:
+      type: string
+      enum: [direct_human, delegation, comment_source, rule_owner, owner_fallback, backfill, unattributed]
+    precise:
+      type: boolean
+    initiator:
+      type: object
+      additionalProperties: true
+      nullable: true
+    originator:
+      type: object
+      additionalProperties: true
+      nullable: true
+    evidence:
+      type: object
+      additionalProperties: true
+      nullable: true
+    rule_version_id:
+      type: string
+    delegated_from_task_id:
+      type: string
+      format: uuid
+    retry_of_task_id:
+      type: string
+      format: uuid
+    rerun_of_task_id:
+      type: string
+      format: uuid
+
+IssueTaskResponse:
+  type: object
+  description: >-
+    Partial AgentTaskResponse (agent.go:360, ~100 fields total) — the
+    execution-log task row shared across many non-issue domains (agents,
+    chat, autopilots). Only the fields this ticket's handlers are confirmed
+    to populate are listed; the complete canonical schema is out of scope
+    for this domain ticket and belongs to the agents/tasks domain ticket.
+    Not an exhaustive/strict object — additional fields exist.
+  required: [id, agent_id, issue_id, workspace_id, status, created_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    agent_id:
+      type: string
+      format: uuid
+    runtime_id:
+      type: [string, "null"]
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+    priority:
+      type: string
+    dispatched_at:
+      type: [string, "null"]
+      format: date-time
+    started_at:
+      type: [string, "null"]
+      format: date-time
+    completed_at:
+      type: [string, "null"]
+      format: date-time
+    result:
+      description: Decoded from stored JSON; shape is task-kind-specific.
+    error:
+      type: [string, "null"]
+    failure_reason:
+      type: [string, "null"]
+    branch_name:
+      type: [string, "null"]
+    attempt:
+      type: integer
+    max_attempts:
+      type: integer
+    parent_task_id:
+      type: [string, "null"]
+      format: uuid
+    is_leader_task:
+      type: boolean
+    created_at:
+      type: string
+      format: date-time
+    trigger_comment_id:
+      type: [string, "null"]
+      format: uuid
+    coalesced_comment_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    delivered_comment_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+      description: Always present (never omitted), even when empty.
+    cancelled_by_comment_change:
+      type: boolean
+    cancelled_by:
+      type: object
+      additionalProperties: true
+      nullable: true
+      description: TaskCancellationActor — not re-derived in full for this ticket.
+    kind:
+      type: string
+    attribution:
+      allOf:
+        - $ref: '#/components/schemas/TaskAttribution'
+      nullable: true
+      description: Always present pre-hydration; endpoints in this ticket call hydrateTaskAttributions to resolve initiator/originator display names.
+    usage:
+      type: array
+      items:
+        type: object
+        additionalProperties: true
+      description: 'Per-(provider, model) usage breakdown. Only populated by ListTasksByIssue when active=false; omitted elsewhere in this ticket''s endpoints (GetActiveTaskForIssue, CancelTask, RerunIssue do not hydrate it).'
+
+ActiveTaskListResponse:
+  type: object
+  required: [tasks]
+  properties:
+    tasks:
+      type: array
+      items:
+        $ref: '#/components/schemas/IssueTaskResponse'
+      description: 'Always an object with this key; a query failure degrades to an empty array rather than a 500.'
+
+ActiveRunSummary:
+  type: object
+  description: 'daemon.go''s cross-issue-family coordination read (scope=family) — a lighter projection than IssueTaskResponse, with no attribution hydration by design.'
+  required: [task_id, issue_id, issue_identifier, issue_title, agent_id, status, created_at]
+  properties:
+    task_id:
+      type: string
+      format: uuid
+    issue_id:
+      type: string
+      format: uuid
+    issue_identifier:
+      type: string
+    issue_title:
+      type: string
+    agent_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    started_at:
+      type: string
+      format: date-time
+      description: Omitted when the run hasn't started.
+
+IssueUsageSummaryResponse:
+  type: object
+  description: 'A single flattened aggregate across the whole issue — no per-model/provider breakdown (unlike IssueTaskResponse.usage).'
+  required:
+    - total_input_tokens
+    - total_output_tokens
+    - total_cache_read_tokens
+    - total_cache_write_tokens
+    - cost_usd_ticks
+    - uncosted_input_tokens
+    - uncosted_output_tokens
+    - uncosted_cache_read_tokens
+    - uncosted_cache_write_tokens
+    - task_count
+    - terminal_task_count
+    - metered_task_count
+    - unreported_task_count
+  properties:
+    total_input_tokens:
+      type: integer
+      format: int64
+    total_output_tokens:
+      type: integer
+      format: int64
+    total_cache_read_tokens:
+      type: integer
+      format: int64
+    total_cache_write_tokens:
+      type: integer
+      format: int64
+    cost_usd_ticks:
+      type: integer
+      format: int64
+      description: Aggregate cost in fixed-point "USD ticks" — no separate currency field; the unit is implicitly USD per the field name.
+    uncosted_input_tokens:
+      type: integer
+      format: int64
+      description: Input tokens from runs that reported usage but not cost (no price-table match, or still in flight).
+    uncosted_output_tokens:
+      type: integer
+      format: int64
+    uncosted_cache_read_tokens:
+      type: integer
+      format: int64
+    uncosted_cache_write_tokens:
+      type: integer
+      format: int64
+    task_count:
+      type: integer
+      format: int32
+      description: Legacy field — count of tasks with usage recorded.
+    terminal_task_count:
+      type: integer
+      format: int32
+    metered_task_count:
+      type: integer
+      format: int32
+    unreported_task_count:
+      type: integer
+      format: int32
+
+RerunIssueInput:
+  type: object
+  properties:
+    task_id:
+      type: string
+      format: uuid
+      description: 'If set, rerun targets the agent that ran this specific past task (validated to belong to this issue). If unset, rerun targets the issue''s current assignee.'
+
+CancelTaskResponse:
+  $ref: '#/components/schemas/IssueTaskResponse'
+
+QuickActionRunResponse:
+  $ref: '#/components/schemas/CommentResponse'
+
+QuickActionRenderResponse:
+  type: object
+  required: [content]
+  properties:
+    content:
+      type: string
+      description: The exact body a run of this action would post — shared rendering with RunQuickAction, so preview and actual post are always identical.
+
+SquadLeaderEvaluationInput:
+  type: object
+  required: [outcome, reason]
+  properties:
+    outcome:
+      type: string
+      enum: [action, no_action, failed]
+    reason:
+      type: string
+
+SquadLeaderEvaluationResponse:
+  type: object
+  required: [id, action, created_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    action:
+      type: string
+      const: squad_leader_evaluated
+    created_at:
+      type: string
+      format: date-time
+
+# --- Issue write requests (create/update/move/batch/quick-create) ---
+
+IssueCreatePropertiesInput:
+  type: object
+  description: 'Keyed by property-definition UUID; each value is an arbitrary JSON value whose shape is validated against that property''s type (out of this ticket''s scope).'
+  additionalProperties: true
+
+CreateIssueRequest:
+  type: object
+  required: [title]
+  properties:
+    title:
+      type: string
+      minLength: 1
+    description:
+      type: [string, "null"]
+    status:
+      type: string
+      default: todo
+      description: Resolved against the workspace's status catalog.
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, none]
+      default: none
+    assignee_type:
+      type: [string, "null"]
+      enum: [member, agent, squad, null]
+    assignee_id:
+      type: [string, "null"]
+      format: uuid
+    parent_issue_id:
+      type: [string, "null"]
+      format: uuid
+    project_id:
+      type: [string, "null"]
+      format: uuid
+    stage:
+      type: [integer, "null"]
+      format: int32
+      minimum: 1
+    start_date:
+      type: [string, "null"]
+      format: date
+    due_date:
+      type: [string, "null"]
+      format: date
+    attachment_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    label_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    properties:
+      $ref: '#/components/schemas/IssueCreatePropertiesInput'
+    origin_type:
+      type: string
+      enum: [quick_create]
+      description: Must be paired with origin_id.
+    origin_id:
+      type: string
+      format: uuid
+      description: Must be paired with origin_type.
+    allow_duplicate:
+      type: boolean
+      description: Bypasses the active-duplicate guard.
+
+QuickCreateIssueInput:
+  type: object
+  required: [prompt]
+  properties:
+    agent_id:
+      type: string
+      format: uuid
+      description: Exactly one of agent_id/squad_id is required.
+    squad_id:
+      type: string
+      format: uuid
+      description: Resolves to the squad's leader agent.
+    prompt:
+      type: string
+      minLength: 1
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, '']
+    due_date:
+      type: string
+      format: date
+    project_id:
+      type: string
+      format: uuid
+    parent_issue_id:
+      type: string
+      format: uuid
+    attachment_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+
+UpdateIssueRequest:
+  type: object
+  description: >-
+    All fields optional; for nullable fields, explicit JSON null clears the
+    value while an absent key leaves it untouched (COALESCE semantics) — the
+    handler inspects raw JSON key presence, not just the decoded pointer.
+  properties:
+    expected_revision:
+      type: integer
+      format: int64
+      minimum: 1
+      description: Optimistic-concurrency token; mismatch produces a 409 RevisionConflict.
+    title:
+      type: string
+    title_base:
+      type: string
+      description: Conflict-detection baseline — if set and differs from both the current and new title, produces a 409 EditConflict.
+    description:
+      type: [string, "null"]
+    description_base:
+      type: string
+      description: Merge metadata for channel-media preservation; no reject-on-mismatch.
+    status:
+      type: string
+    priority:
+      type: string
+      enum: [urgent, high, medium, low, none]
+    assignee_type:
+      type: [string, "null"]
+      enum: [member, agent, squad, null]
+    assignee_id:
+      type: [string, "null"]
+      format: uuid
+    position:
+      type: number
+      format: double
+    start_date:
+      type: [string, "null"]
+      format: date
+    due_date:
+      type: [string, "null"]
+      format: date
+    parent_issue_id:
+      type: [string, "null"]
+      format: uuid
+      description: Self-parent and cycles (10-hop ancestor walk) are rejected.
+    project_id:
+      type: [string, "null"]
+      format: uuid
+    stage:
+      type: [integer, "null"]
+      format: int32
+      minimum: 1
+    attachment_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+    suppress_run:
+      type: boolean
+      description: Skip the agent-run trigger this write would otherwise cause.
+    handoff_note:
+      type: string
+      description: Passed through to the dispatched run when suppress_run is false and a run is triggered.
+    duplicate_of_issue_id:
+      type: [string, "null"]
+      format: uuid
+      description: 'Write-only: marking sets status to cancelled atomically. Cannot combine with description/title_base/description_base/attachment_ids, and is rejected entirely in batch updates.'
+
+BatchUpdateIssuesInput:
+  type: object
+  required: [issue_ids, updates]
+  properties:
+    issue_ids:
+      type: array
+      minItems: 1
+      items:
+        type: string
+        format: uuid
+      description: Unparseable entries are silently skipped, not rejected.
+    updates:
+      allOf:
+        - $ref: '#/components/schemas/UpdateIssueRequest'
+      description: duplicate_of_issue_id is rejected (400) if present at all in a batch update.
+
+BatchUpdateIssuesResponse:
+  type: object
+  required: [updated]
+  properties:
+    updated:
+      type: integer
+      description: Count of issues actually updated; partial success (fewer than issue_ids.length) is normal, not an error.
+
+BatchDeleteIssuesInput:
+  type: object
+  required: [issue_ids]
+  properties:
+    issue_ids:
+      type: array
+      minItems: 1
+      items:
+        type: string
+        format: uuid
+      description: Unparseable or not-found entries are silently skipped.
+
+BatchDeleteIssuesResponse:
+  type: object
+  required: [deleted]
+  properties:
+    deleted:
+      type: integer
+
+MoveIssueInput:
+  type: object
+  description: >-
+    Ad hoc field map restricted to an allow-list; any other top-level key is
+    rejected with 400. before_id/after_id are the positional anchors (one,
+    both, or neither); their current position is read server-side to derive
+    the moved issue's new `position` value, which is then forwarded to the
+    PUT /api/issues/{id} write path (so UpdateIssueRequest's own validation
+    and error surface also apply to this endpoint, in addition to the
+    move-specific errors documented on this operation).
+  required: [before_id, after_id]
+  properties:
+    before_id:
+      type: [string, "null"]
+      format: uuid
+      description: Required key (value may be null); anchor whose position becomes the lower bound. Cannot equal the moved issue or equal after_id.
+    after_id:
+      type: [string, "null"]
+      format: uuid
+      description: Required key (value may be null); anchor whose position becomes the upper bound.
+    status:
+      type: string
+    assignee_type:
+      type: [string, "null"]
+      enum: [member, agent, squad, null]
+    assignee_id:
+      type: [string, "null"]
+      format: uuid
+    parent_issue_id:
+      type: [string, "null"]
+      format: uuid
+    project_id:
+      type: [string, "null"]
+      format: uuid
+      description: If present and non-null, must exist in this workspace.
+    expected_revision:
+      type: integer
+      format: int64
+
+IssueMoveStaleAnchorsResponse:
+  type: object
+  description: 'Plain writeError body (not the {code, ...} shape) for a 409 produced by stale/out-of-order/too-close move anchors.'
+  required: [error]
+  properties:
+    error:
+      type: string
+      enum:
+        - move anchors are stale or out of order
+        - move anchors are too close; refresh and retry
+        - move position is out of range

@@ -1,0 +1,651 @@
+# Issue list/search/grouping/batch endpoints that do not hang off /api/issues/{id}.
+# See docs/unofficial-api/README.md for the merge/lint contract this file
+# participates in. Source: server/internal/handler/issue.go,
+# issue_limit.go, issue_trigger.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+
+/api/issues/search:
+  get:
+    operationId: searchIssues
+    summary: Full-text search issues
+    description: >-
+      Agent-facing ranked search across title/description/comments, with
+      match provenance per result. Humans use the separate local search
+      index (/api/search-index) instead.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: q
+        in: query
+        required: true
+        schema:
+          type: string
+        description: Search text. Empty/missing is a 400.
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          default: 20
+          maximum: 50
+        description: Invalid or non-positive values are silently ignored (default kept).
+      - name: offset
+        in: query
+        schema:
+          type: integer
+          default: 0
+      - name: include_closed
+        in: query
+        schema:
+          type: boolean
+          default: false
+        description: When false, terminal-status issues are excluded.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issues]
+              properties:
+                issues:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/SearchIssueResponse'
+      '400':
+        description: '`q` missing/empty, or an invalid `workspace_id`.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: '"failed to resolve status categories" (terminal-status lookup failed) or "failed to search issues" (query error).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '503':
+        description: '"search timed out; please refine your query or try again" — Postgres statement timeout (SQLSTATE 57014).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/child-progress:
+  get:
+    operationId: getChildIssueProgress
+    summary: Sub-issue done/total counts, grouped by parent
+    description: One entry per parent issue id that has at least one child in this workspace.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [progress]
+              properties:
+                progress:
+                  type: array
+                  items:
+                    type: object
+                    required: [parent_issue_id, total, done]
+                    properties:
+                      parent_issue_id:
+                        type: string
+                        format: uuid
+                      total:
+                        type: integer
+                        format: int64
+                      done:
+                        type: integer
+                        format: int64
+      '400':
+        description: Invalid `workspace_id`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: '"failed to resolve status categories" or "failed to get child issue progress".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/children:
+  get:
+    operationId: listChildrenByParents
+    summary: List children for a batch of parent issue ids
+    description: Cross-parent batch read — the single-parent equivalent is GET /api/issues/{id}/children.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: parent_ids
+        in: query
+        schema:
+          type: string
+        description: 'Comma-separated parent issue UUIDs, max 200. Empty/absent short-circuits to `{"issues": []}` (not an error). A parent id from another workspace simply yields zero children for it, not an error.'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issues]
+              properties:
+                issues:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IssueResponse'
+      '400':
+        description: 'Invalid `workspace_id`; more than 200 comma-separated parts ("too many parent_ids"); or a non-UUID entry ("invalid parent_ids").'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: '"failed to list child issues".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/grouped:
+  get:
+    operationId: listGroupedIssues
+    summary: List issues grouped by assignee
+    description: Older grouping surface; the table-oriented equivalent is POST /api/issues/table/groups with group.kind=assignee.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: group_by
+        in: query
+        schema:
+          type: string
+          enum: [assignee]
+          default: assignee
+        description: Only `assignee` is supported today; any other value is a 400.
+      - name: limit
+        in: query
+        schema: {type: integer, default: 50, maximum: 100}
+      - name: offset
+        in: query
+        schema: {type: integer, default: 0}
+      - name: statuses
+        in: query
+        schema: {type: string}
+        description: Comma-separated status keys. Alias `status` also accepted.
+      - name: status_categories
+        in: query
+        schema: {type: string}
+        description: Comma-separated status categories, expanded to concrete status keys. Alias `status_category` also accepted.
+      - name: priorities
+        in: query
+        schema: {type: string}
+        description: Comma-separated priorities. Alias `priority` also accepted.
+      - name: assignee_types
+        in: query
+        schema: {type: string}
+        description: 'Comma-separated, each one of member|agent|squad.'
+      - name: assignee_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: assignee_ids
+        in: query
+        schema: {type: string}
+        description: Comma-separated UUIDs.
+      - name: creator_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: project_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: metadata
+        in: query
+        schema: {type: string}
+        description: JSON metadata filter.
+      - name: properties
+        in: query
+        schema: {type: string}
+        description: JSON properties filter.
+      - name: involves_user_id
+        in: query
+        schema: {type: string, format: uuid}
+        description: Widens to indirect agent/squad assignment (excludes direct member assignment by design).
+      - name: assignee_filters
+        in: query
+        schema: {type: string}
+        description: 'Comma-separated `type:uuid` pairs.'
+      - name: include_no_assignee
+        in: query
+        schema: {type: boolean}
+      - name: creator_filters
+        in: query
+        schema: {type: string}
+        description: 'Comma-separated `type:uuid` pairs.'
+      - name: project_ids
+        in: query
+        schema: {type: string}
+        description: Comma-separated UUIDs.
+      - name: include_no_project
+        in: query
+        schema: {type: boolean}
+      - name: label_ids
+        in: query
+        schema: {type: string}
+        description: Comma-separated UUIDs.
+      - name: date_field
+        in: query
+        schema: {type: string, enum: [created_at, updated_at]}
+        description: Must be supplied together with date_start and date_end, or not at all.
+      - name: date_start
+        in: query
+        schema: {type: string, format: date-time}
+      - name: date_end
+        in: query
+        schema: {type: string, format: date-time}
+        description: Must be strictly after date_start.
+      - name: group_assignee_type
+        in: query
+        schema: {type: string, enum: [none, member, agent, squad], default: none}
+      - name: group_assignee_id
+        in: query
+        schema: {type: string, format: uuid}
+        description: Required when group_assignee_type is not none.
+      - name: sort
+        in: query
+        schema:
+          type: string
+          default: position
+        description: 'position | title | created_at | updated_at | start_date | due_date | last_activity | status | priority | property:<definitionId>.'
+      - name: direction
+        in: query
+        schema: {type: string, enum: [asc, desc]}
+        description: Ignored when sort resolves to position (always ascending there).
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupedIssuesResponse'
+      '400':
+        description: >-
+          "unsupported group_by"; invalid `workspace_id`; any malformed
+          UUID/list/enum param (assignee_types, assignee_id, assignee_ids,
+          creator_id, project_id, involves_user_id, assignee_filters,
+          creator_filters, project_ids, label_ids, group_assignee_type,
+          group_assignee_id); malformed date_* combination; "invalid sort
+          value"; "invalid direction value".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: >-
+          "database is unavailable"; "failed to resolve status categories";
+          "failed to resolve sort" (property/status sort resolution
+          failure); "failed to list grouped issues" (query/scan/rows
+          failure).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/query:
+  post:
+    operationId: queryIssues
+    summary: POST twin of GET /api/issues for oversized filter sets
+    description: >-
+      Decodes a flat JSON object of string key/value pairs (max 1MB), the
+      exact same parameter names/string encodings as GET /api/issues'
+      query string, re-encodes them as a query string and delegates to
+      ListIssues — so every parameter, response shape and error documented
+      on GET /api/issues applies here identically, in addition to this
+      endpoint's own body-decode error below.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+            description: 'Same keys as GET /api/issues'' query parameters, each encoded as a string (e.g. {"ids": "uuid1,uuid2", "limit": "50"}).'
+    responses:
+      '200':
+        description: Identical shape to GET /api/issues.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issues, total]
+              properties:
+                issues:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IssueResponse'
+                total:
+                  type: integer
+                  format: int64
+      '400':
+        description: '"invalid request body" (decode failure or body over 1MB), or any error from the delegated GET /api/issues parameter validation.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: Any error surfaced by the delegated GET /api/issues handling.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/batch-update:
+  post:
+    operationId: batchUpdateIssues
+    summary: Apply the same update to a batch of issues
+    description: >-
+      Per-issue failures (parse error, not found, assignee/parent
+      validation failure) are silently skipped, not reported — only the
+      `updated` count changes. A shared-status-archived race aborts the
+      whole request early (409); issues already written before that point
+      remain updated.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BatchUpdateIssuesInput'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchUpdateIssuesResponse'
+      '400':
+        description: >-
+          "issue_ids is required"; "duplicate_of_issue_id is not supported
+          in batch updates"; invalid `priority`/`status`/`project_id`;
+          `issue_in_triage` code when parent_issue_id is touched and any
+          target issue is in Triage; "invalid request body".
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '409':
+        description: Shared target status was archived mid-flight (revision_conflict code).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '500':
+        description: '"failed to read request body"; "failed to validate issues"; "failed to validate project".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/batch-delete:
+  post:
+    operationId: batchDeleteIssues
+    summary: Delete a batch of issues
+    description: Unparseable/not-found/duplicate ids are silently excluded from the count, not reported as errors.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BatchDeleteIssuesInput'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchDeleteIssuesResponse'
+      '400':
+        description: '"invalid request body"; "issue_ids is required"; invalid `workspace_id`.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: '"failed to delete issues".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/limit-usage:
+  get:
+    operationId: getIssueLimitUsage
+    summary: Workspace issue-count entitlement usage
+    description: Returns 204 with no body for a workspace that is not currently limit-enforced.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: Workspace is currently limit-enforced.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueLimitUsageResponse'
+      '204':
+        description: Workspace is not currently limit-enforced (no body).
+      '400':
+        description: Missing/invalid `workspace_id`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to load issue limit usage".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/preview-trigger:
+  post:
+    operationId: previewIssueTrigger
+    summary: Dry-run which agents a prospective issue change would trigger
+    description: >-
+      Pure dry-run — no side effects, no writes. Re-applies the private-agent
+      visibility gate so a preview never discloses a private agent's
+      readiness to a caller who couldn't otherwise see it.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              issue_ids:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+                maxItems: 500
+                description: 'Used only when is_create=false. A malformed UUID or an id not found in this workspace is silently skipped, not an error.'
+              is_create:
+                type: boolean
+                description: When true, previews a not-yet-persisted issue built from assignee_type/assignee_id/status; issue_ids is ignored.
+              assignee_type:
+                type: [string, "null"]
+              assignee_id:
+                type: [string, "null"]
+                format: uuid
+              status:
+                type: [string, "null"]
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTriggerPreviewResponse'
+      '400':
+        description: '"workspace is required"; "invalid request body"; "too many issue_ids" (over 500); "invalid assignee_id"; "invalid workspace" (is_create=true branch only).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+
+/api/issues/quick-create:
+  post:
+    operationId: quickCreateIssue
+    summary: Enqueue an agent task that will itself run `multica issue create`
+    description: Asynchronous — does not create the issue synchronously; returns a task id.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QuickCreateIssueInput'
+    responses:
+      '202':
+        description: Accepted — task enqueued.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuickCreateIssueResponse'
+      '400':
+        description: >-
+          "invalid request body"; "prompt is required"; "priority must be
+          one of: urgent, high, medium, low"; "invalid due_date format,
+          expected YYYY-MM-DD"; "exactly one of agent_id or squad_id is
+          required"; invalid `workspace_id`; malformed `squad_id`/`agent_id`;
+          "squad is archived"; assignee-pair validation failures; malformed
+          `attachment_ids`; "project not found"; "parent issue not found in
+          this workspace".
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '402':
+        description: Workspace issue-count limit reached.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueLimitReachedResponse'
+      '403':
+        description: Caller not permitted to invoke the target agent (assignee-pair permission check).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"squad not found"; "agent not found" (race on reload after validation).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '422':
+        description: Target agent not ready/invokable, or the agent's daemon/CLI is too old for the requested fields.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/AgentUnavailableResponse'
+                - $ref: '#/components/schemas/DaemonVersionUnsupportedResponse'
+      '500':
+        description: '"failed to check agent runtime"; "failed to enqueue quick-create task".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'

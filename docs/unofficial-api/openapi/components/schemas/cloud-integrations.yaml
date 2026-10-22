@@ -1,0 +1,422 @@
+# Domain-specific schemas for the cloud/integrations domain (cloud-billing / cloud-subscriptions /
+# cloud-runtime / integrations / social bindings / misc infra). Per
+# docs/unofficial-api/README.md point 4, these merge into components.schemas
+# the same as the shared openapi/components/schemas.yaml, just split by
+# domain to avoid editing the Stage 1 file.
+#
+# cloud-billing / cloud-subscriptions request bodies are real Go structs
+# (server/internal/handler/cloud_billing.go) validated before the proxy call,
+# so those are documented precisely. Their 2xx RESPONSE bodies are NOT: both
+# domains proxy byte-for-byte to the external multica-cloud service
+# (cloudruntime.Do -> writeCloudRuntimeResponse, same file) and no Go struct
+# unmarshals the upstream reply anywhere in this repo — only a JSON-validity
+# check. CloudProxyResponse below documents that honestly instead of
+# inventing field names; see each operation's response description for the
+# specific upstream path it proxies to, if that's independently known from a
+# comment.
+
+CloudProxyResponse:
+  type: object
+  description: >-
+    Opaque pass-through. The handler forwards the upstream multica-cloud
+    HTTP response body byte-for-byte (writeCloudRuntimeResponse,
+    server/internal/handler/cloud_runtime.go ~line 178) — no local Go type
+    unmarshals it, so this repo's source does not define its field shape.
+    소스에서 확인 불가: 실제 필드는 multica-cloud 서비스 쪽에 있으며 이
+    레포에는 없음.
+  additionalProperties: true
+
+CloudSubscriptionCheckoutRequest:
+  type: object
+  description: >-
+    server/internal/handler/cloud_billing.go, cloudSubscriptionCheckoutRequest.
+  required: [interval]
+  properties:
+    interval:
+      type: string
+      enum: [month, year]
+      description: Rejected with 400 if neither value (handler ~line 211).
+    idempotency_key:
+      type: string
+      description: >-
+        Optional in the body; if omitted the handler falls back to the
+        `Idempotency-Key` header (requireCloudSubscriptionIdempotencyKey).
+        One of the two is required — 400 if both are empty. Max 255 bytes.
+  additionalProperties: false
+
+CloudSubscriptionSeatPurchasePreviewRequest:
+  type: object
+  description: >-
+    server/internal/handler/cloud_billing.go,
+    cloudSubscriptionSeatPurchasePreviewRequest.
+  required: [additional_seats]
+  properties:
+    additional_seats:
+      type: integer
+      description: Must be >= 1 (handler ~line 274); 400 otherwise.
+  additionalProperties: false
+
+CloudSubscriptionSeatPurchaseRequest:
+  type: object
+  description: >-
+    server/internal/handler/cloud_billing.go, cloudSubscriptionSeatPurchaseRequest.
+    This is the user-confirmed quote from a prior purchase-preview call, not a
+    fresh purchase request — Cloud re-verifies everything server-side before
+    charging.
+  required:
+    - additional_seats
+    - expected_current_seats
+    - expected_purchase_version
+    - accepted_proration_amount
+    - currency
+  properties:
+    additional_seats:
+      type: integer
+      description: Must be >= 1 (handler ~line 304).
+    expected_current_seats:
+      type: integer
+      description: Must be >= 1. Optimistic-concurrency check against Cloud's current count.
+    expected_purchase_version:
+      type: integer
+      format: int64
+      description: Must be >= 1.
+    accepted_proration_amount:
+      type: integer
+      format: int64
+      description: Must be >= 0. Minor-unit amount the user confirmed from the preview step.
+    currency:
+      type: string
+      description: >-
+        3-letter ASCII currency code (handler validates isASCIICurrency, does
+        NOT check against an ISO-4217 list); lowercased before forwarding.
+      minLength: 3
+      maxLength: 3
+    idempotency_key:
+      type: string
+      description: >-
+        Optional in the body; falls back to the `Idempotency-Key` header.
+        One of the two is required. Max 200 bytes (stricter than the
+        checkout-session limit of 255 — handler ~line 313).
+  additionalProperties: false
+
+ComposioConnectInitRequest:
+  type: object
+  description: server/internal/handler/integrations_composio.go, ComposioConnectInitRequest.
+  required: [toolkit_slug]
+  properties:
+    toolkit_slug:
+      type: string
+      description: >-
+        400 if blank; a slug the Composio integration doesn't support is
+        also a 400 ("toolkit not supported"). The MVP only wires one
+        toolkit (comment says Notion) — not independently re-verified
+        against the toolkit catalog from this ticket.
+  additionalProperties: false
+
+ComposioConnectInitResponse:
+  type: object
+  description: server/internal/handler/integrations_composio.go, ComposioConnectInitResponse.
+  required: [redirect_url]
+  properties:
+    redirect_url:
+      type: string
+      description: Hosted Composio Connect Link the frontend redirects the browser to.
+  additionalProperties: false
+
+ComposioConnectionResponse:
+  type: object
+  description: >-
+    server/internal/handler/integrations_composio.go,
+    ComposioConnectionResponse. One row of GET .../connections.
+  required: [id, toolkit_slug, status, connected_at]
+  properties:
+    id:
+      type: string
+    toolkit_slug:
+      type: string
+    status:
+      type: string
+      description: >-
+        Free-form string from the Composio service layer; no enum is
+        checked or converted in this handler, so the value set is not
+        verifiable from this file alone — 소스에서 확인 불가 (would require
+        reading server/internal/integrations/composio).
+    connected_at:
+      type: string
+    last_used_at:
+      type: string
+      nullable: true
+  additionalProperties: false
+
+ComposioToolkitResponse:
+  type: object
+  description: >-
+    server/internal/handler/integrations_composio.go, ComposioToolkitResponse.
+    One row of GET .../toolkits. Since MUL-4009 every entry is connectable
+    (the service pre-filters); `connectable` is kept for older-client
+    compatibility per the handler's own doc comment.
+  required: [slug, name, connectable]
+  properties:
+    slug:
+      type: string
+    name:
+      type: string
+    logo:
+      type: string
+    category:
+      type: string
+    connectable:
+      type: boolean
+      description: Always true as of MUL-4009 (filtering moved upstream of this handler).
+  additionalProperties: false
+
+RedeemLarkBindingTokenRequest:
+  type: object
+  description: server/internal/handler/lark.go, RedeemLarkBindingTokenRequest.
+  required: [token]
+  properties:
+    token:
+      type: string
+      description: 400 if empty. One-time token from the Lark bot's "you need to bind" reply card.
+  additionalProperties: false
+
+RedeemLarkBindingTokenResponse:
+  type: object
+  description: server/internal/handler/lark.go, RedeemLarkBindingTokenResponse.
+  required: [workspace_id, installation_id, lark_open_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+    installation_id:
+      type: string
+      format: uuid
+    lark_open_id:
+      type: string
+  additionalProperties: false
+
+RedeemSlackBindingTokenRequest:
+  type: object
+  description: server/internal/handler/slack.go, RedeemSlackBindingTokenRequest.
+  required: [token]
+  properties:
+    token:
+      type: string
+      description: 400 if empty.
+  additionalProperties: false
+
+RedeemSlackBindingTokenResponse:
+  type: object
+  description: server/internal/handler/slack.go, RedeemSlackBindingTokenResponse.
+  required: [workspace_id, installation_id, slack_user_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+    installation_id:
+      type: string
+      format: uuid
+    slack_user_id:
+      type: string
+  additionalProperties: false
+
+RedeemDingTalkBindingTokenRequest:
+  type: object
+  description: server/internal/handler/dingtalk.go, RedeemDingTalkBindingTokenRequest.
+  required: [token]
+  properties:
+    token:
+      type: string
+      description: 400 if empty.
+  additionalProperties: false
+
+RedeemDingTalkBindingTokenResponse:
+  type: object
+  description: server/internal/handler/dingtalk.go, RedeemDingTalkBindingTokenResponse.
+  required: [workspace_id, installation_id, dingtalk_user_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+    installation_id:
+      type: string
+      format: uuid
+    dingtalk_user_id:
+      type: string
+  additionalProperties: false
+
+RedeemWecomBindingTokenRequest:
+  type: object
+  description: server/internal/handler/wecom_web.go, RedeemWecomBindingTokenRequest.
+  required: [token]
+  properties:
+    token:
+      type: string
+      description: 400 if empty. Body is additionally size-capped (wecomBodyLimit) before decoding.
+  additionalProperties: false
+
+RedeemWecomBindingTokenResponse:
+  type: object
+  description: server/internal/handler/wecom_web.go, RedeemWecomBindingTokenResponse.
+  required: [workspace_id, installation_id, wecom_user_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+    installation_id:
+      type: string
+      format: uuid
+    wecom_user_id:
+      type: string
+  additionalProperties: false
+
+RedeemTelegramBindingTokenRequest:
+  type: object
+  description: server/internal/handler/telegram.go, RedeemTelegramBindingTokenRequest.
+  required: [token]
+  properties:
+    token:
+      type: string
+      description: 400 if empty.
+  additionalProperties: false
+
+RedeemTelegramBindingTokenResponse:
+  type: object
+  description: server/internal/handler/telegram.go, RedeemTelegramBindingTokenResponse.
+  required: [workspace_id, installation_id, telegram_user_id]
+  properties:
+    workspace_id:
+      type: string
+      format: uuid
+    installation_id:
+      type: string
+      format: uuid
+    telegram_user_id:
+      type: string
+  additionalProperties: false
+
+AppConfig:
+  type: object
+  description: >-
+    server/internal/handler/config.go, AppConfig. Served by the PUBLIC
+    GET /api/config — only ever put fields here that are safe for an
+    anonymous caller (per the handler's own doc comment).
+  properties:
+    cdn_domain:
+      type: string
+    cdn_signed:
+      type: boolean
+      description: Omitted (not just false) when CloudFront signing is disabled.
+    allow_signup:
+      type: boolean
+    google_client_id:
+      type: string
+    workspace_creation_disabled:
+      type: boolean
+      description: Omitted when false.
+    daemon_server_url:
+      type: string
+      description: Omitted on the official managed cloud and when unset.
+    daemon_app_url:
+      type: string
+      description: Omitted on the official managed cloud and when unset.
+    vcs_integration_available:
+      type: boolean
+      description: Omitted when false.
+    posthog_key:
+      type: string
+    posthog_host:
+      type: string
+    analytics_environment:
+      type: string
+    feature_flags:
+      type: object
+      additionalProperties:
+        type: boolean
+      description: >-
+        Only frontend-safe boolean flags (featureflags.EvaluateFrontendPublicFlags);
+        the full flag rule set is intentionally never exposed here.
+    local_worktree_supported:
+      type: boolean
+    agent_conversation_starters_supported:
+      type: boolean
+    issue_create_properties_supported:
+      type: boolean
+    comment_delete_keep_replies_supported:
+      type: boolean
+    server_version:
+      type: string
+      description: Only emitted on self-hosted deployments; omitted on the managed cloud.
+  additionalProperties: false
+
+RefreshSessionResponse:
+  type: object
+  description: server/internal/handler/session.go, RefreshSessionResponse.
+  required: [expires_at, renewed, check_again_in_seconds]
+  properties:
+    token:
+      type: string
+      description: >-
+        Present only for bearer/header-authenticated callers (Desktop,
+        mobile) that hold the session as a string. Cookie-authenticated
+        browsers get the renewed session via Set-Cookie and this field is
+        omitted.
+    expires_at:
+      type: string
+      description: RFC3339 timestamp (formatSessionExpiry).
+    renewed:
+      type: boolean
+      description: >-
+        false is a normal answer (caller asked outside the renewal window
+        or a non-fatal re-sign failure occurred), not an error.
+    check_again_in_seconds:
+      type: integer
+      description: Caller should wait this long before polling again (auth.SessionRenewCheckInterval).
+  additionalProperties: false
+
+LiveResponse:
+  type: object
+  description: server/cmd/server/health.go, liveResponse. Always HTTP 200 — process-up check only.
+  required: [status]
+  properties:
+    status:
+      type: string
+      const: ok
+    pid:
+      type: integer
+      description: Omitted if zero (never in practice — os.Getpid()).
+    commit:
+      type: string
+      description: Omitted if the build didn't stamp a commit.
+    started_at:
+      type: string
+      description: RFC3339; omitted only if startedAt was never set (construction-time only).
+  additionalProperties: false
+
+ReadinessResponse:
+  type: object
+  description: >-
+    server/cmd/server/health.go, readinessResponse. Backs both GET /readyz
+    and GET /healthz (identical handler, h.readyHandler). 200 when
+    status=ok; 503 otherwise (DB unreachable, or this binary's required
+    migrations aren't all applied). Response is cached per-process for up
+    to 3s (readinessCacheTTL) — a 503 can lag a just-completed migration by
+    that long.
+  required: [status, checks]
+  properties:
+    status:
+      type: string
+      enum: [ok, not_ready]
+    checks:
+      type: object
+      required: [db, migrations]
+      properties:
+        db:
+          type: string
+          enum: [ok, error]
+        migrations:
+          type: string
+          enum: [ok, error, unknown]
+          description: unknown when the db check itself already failed (migrations were never queried).
+      additionalProperties: false
+  additionalProperties: false

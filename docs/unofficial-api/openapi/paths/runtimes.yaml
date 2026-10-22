@@ -1,0 +1,1275 @@
+# Domain: runtimes — agent runtime registry, its usage/activity
+# rollups, and the three daemon-mediated async flows (CLI update, model
+# discovery, local-skill discovery/import). Source:
+# server/internal/handler/{runtime,runtime_update,runtime_models,
+# runtime_local_skills}.go; mount points server/cmd/server/router.go
+# ~line 2324-2354 (`r.Route("/api/runtimes", ...)`).
+#
+# Top-level keys are path strings merged verbatim into the document's
+# "paths" object by scripts/merge.mjs — do not nest under a "paths:" key.
+#
+# Scope note: these /api/runtimes/* routes are distinct from
+# /api/daemon/runtimes/* and the daemon-report sibling routes mounted
+# alongside them in router.go (ReportUpdateResult, ReportModelListResult,
+# ReportLocalSkillListResult, ReportLocalSkillImportResult,
+# ClaimTaskByRuntime, etc.) — those belong to a separate, out-of-scope
+# daemon-auth ticket and are not documented here.
+#
+# Workspace gate (applies to every operation below, ahead of any
+# handler-specific logic): all 17 operations sit inside the
+# `middleware.RequireWorkspaceMember(queries)` group
+# (server/cmd/server/router.go ~line 1986), which runs BEFORE the handler:
+#   1. Resolves a workspace id from (in priority order) an `mat_` task
+#      token's bound workspace, `X-Workspace-Slug` header, `?workspace_slug`
+#      query, `X-Workspace-ID` header, or `?workspace_id` query
+#      (server/internal/middleware/workspace.go `resolveWorkspaceUUID`).
+#   2. 400 `"workspace_id or workspace_slug is required"` if none of those
+#      produced a value.
+#   3. 403 `"task token is bound to a different workspace"` if the request
+#      authenticated with an `mat_` task token whose bound workspace
+#      disagrees with the one just resolved (MUL-2600).
+#   4. 401 `"user not authenticated"` if no `X-User-ID` is set (should not
+#      happen past the outer Auth middleware, but checked again here).
+#   5. 400 `"invalid workspace_id"` if the resolved id isn't a parseable UUID.
+#   6. 404 `"workspace not found"` if the authenticated user is not a member
+#      of that workspace (`GetMemberByUserAndWorkspace` failure).
+#
+# For every operation below scoped by a `{runtimeId}` path param, the
+# HANDLER then independently re-resolves workspace membership against the
+# runtime's OWN `workspace_id` column (not the header-resolved workspace),
+# via `requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime
+# not found")` — so passing a valid `X-Workspace-ID` for a workspace you do
+# belong to does not let you act on a `runtimeId` owned by a workspace you
+# are not a member of; that second check 404s with `"runtime not found"`
+# instead of `"workspace not found"`. The per-operation response tables
+# below list only the handler-level checks; the six outer-gate cases above
+# apply uniformly in addition and are not repeated per operation.
+
+/api/runtimes:
+  get:
+    operationId: listRuntimes
+    summary: List agent runtimes in a workspace
+    description: >-
+      server/internal/handler/runtime.go:902-944 (`ListAgentRuntimes`).
+      Response visibility depends on the caller's role: owners/admins see
+      every runtime in the workspace (including private ones, for
+      governance — rename/delete — even though the per-runtime read/usage
+      endpoints below still deny them the private runtime's data); plain
+      members see only public runtimes plus their own private ones
+      (`ListVisibleAgentRuntimes`). `?owner=me` overrides both branches and
+      restricts to runtimes owned by the caller regardless of role.
+    tags: [runtimes]
+    security: &runtimeAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: owner
+        in: query
+        required: false
+        schema:
+          type: string
+          enum: [me]
+        description: When exactly `"me"`, restrict the result to runtimes owned by the caller.
+    responses:
+      '200':
+        description: OK — a flat array, not wrapped in an envelope object.
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/AgentRuntimeResponse'
+      '400':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: '`"workspace not found"` — see the file-level "Workspace gate" note.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "workspace not found" }
+      '500':
+        description: '`"failed to list runtimes"` — any of the three list queries failed.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list runtimes" }
+
+/api/runtimes/{runtimeId}:
+  patch:
+    operationId: updateRuntime
+    summary: Update a runtime's visibility and/or display name
+    description: >-
+      server/internal/handler/runtime.go:489-626 (`UpdateAgentRuntime`).
+      Every request field is optional (a true PATCH); fields are validated
+      in full before any mutation is applied, so a bad value in one field
+      never leaves a partially-applied write. On any change, broadcasts
+      `daemon:register` (action "update") so connected clients refetch
+      runtime list/detail state.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID (validated before lookup); not necessarily the runtime's actual id if malformed.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateAgentRuntimeRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentRuntimeResponse' }
+      '400':
+        description: >-
+          `"invalid runtime_id"` (malformed path param); `"invalid JSON
+          body"` (decode failure — note this handler's wording differs from
+          most others' `"invalid request body"`); `"visibility must be
+          'private' or 'public'"`; `"custom name is too long"` (over 100
+          runes after trimming). Plus the file-level "Workspace gate" 400s.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+              invalidJsonBody: { value: { error: "invalid JSON body" } }
+              invalidVisibility: { value: { error: "visibility must be 'private' or 'public'" } }
+              customNameTooLong: { value: { error: "custom name is too long" } }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: >-
+          `"you can only edit your own runtimes"` (caller is neither a
+          workspace owner/admin nor this runtime's owner —
+          `canEditRuntime`), or `"only the runtime owner can change its
+          visibility"` (caller may edit the runtime at all, but is not its
+          owner and sent a `visibility` value that actually differs from
+          the current one — admins do NOT get this override, MUL-6126).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              notEditable: { value: { error: "you can only edit your own runtimes" } }
+              visibilityOwnerOnly: { value: { error: "only the runtime owner can change its visibility" } }
+      '404':
+        description: >-
+          `"runtime not found"` — the id doesn't resolve to a row, or the
+          caller is not a member of the runtime's actual workspace (see the
+          file-level note).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to update runtime"` — the visibility or custom-name write query failed.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to update runtime" }
+  delete:
+    operationId: deleteRuntime
+    summary: Delete a runtime (strict — refuses if any agent is still actively bound)
+    description: >-
+      server/internal/handler/runtime.go:991-1132 (`DeleteAgentRuntime`).
+      Refuses up front (before the transaction even opens) if any
+      non-archived agent is bound to the runtime, returning the blocking
+      agent list so the confirm dialog can render the cascade plan without
+      a second round trip; the user then confirms via POST
+      /api/runtimes/{runtimeId}/unbind-agents-and-delete, which reuses this
+      same teardown once the confirmed set is re-verified. Re-checks for
+      newly-bound agents again under a row lock inside the transaction
+      (agent/task inserts take a KEY SHARE lock through their runtime FK)
+      before actually tearing down, so a race between the pre-check and the
+      transaction cannot silently unbind an agent nobody confirmed.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    responses:
+      '200':
+        description: >-
+          Deleted. NOTE: this is a 200 with a body, not a 204 — unlike most
+          delete endpoints elsewhere in this API.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, const: ok }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid runtime_id" }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"you can only delete your own runtimes"` — caller is neither a workspace owner/admin nor this runtime''s owner.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you can only delete your own runtimes" }
+      '404':
+        description: '`"runtime not found"` — see the file-level note.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '409':
+        description: >-
+          Three distinct shapes, distinguished by `code`: an active
+          (non-archived) agent is still bound (`runtime_has_active_agents`,
+          checked both before and again inside the transaction); the
+          teardown found a non-terminal task that didn't drain in time
+          (`runtime_delete_not_drained`); or a cross-workspace agent binding
+          was detected (`runtime_delete_workspace_mismatch`, a data-integrity
+          guard, not an ordinary user-triggerable case). A profile-backed
+          runtime instance whose `runtime_profile` still exists is refused
+          here too, with a different, richer shape (see
+          `RuntimeProfileInstanceDeleteRefusal`) — checked and returned
+          BEFORE the active-agents check, so a profile-backed runtime with
+          zero bound agents still 409s rather than deleting.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RuntimeProfileInstanceDeleteRefusal'
+                - $ref: '#/components/schemas/RuntimeHasActiveAgentsResponse'
+                - $ref: '#/components/schemas/RuntimeDeleteConflict'
+      '500':
+        description: >-
+          `"failed to check runtime profile"`; `"failed to check runtime
+          dependencies"`; `"failed to delete runtime"` (tx begin/lock/final
+          delete/commit); `"failed to lock runtime"`; `"failed to lock
+          runtime dependencies"`.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/usage:
+  get:
+    operationId: getRuntimeUsage
+    summary: Get a runtime's daily token-usage trend
+    description: >-
+      server/internal/handler/runtime.go:112-130, 134-163
+      (`GetRuntimeUsage` / `listRuntimeUsage`). Daily-bucketed rollup from
+      `task_usage_hourly`, scoped to Daemon-executed tasks only (excludes a
+      user's local CLI usage of the same tool outside Multica). Read
+      access, not edit access: governance visibility (owner/admin seeing
+      every runtime row in LIST) does NOT extend here — a private runtime's
+      usage is readable only by its owner, even for a workspace owner/admin
+      (`requireRuntimeReadAccess` / `canUseRuntimeForAgent`, deliberately
+      separate from `canEditRuntime`).
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: days
+        in: query
+        required: false
+        schema: { type: integer, minimum: 1, maximum: 365, default: 90 }
+        description: >-
+          Cutoff window size. Out-of-range or non-integer values are
+          silently ignored in favor of the default (90) rather than
+          rejected with 400. Cutoff is anchored to start-of-day in the
+          resolved viewing timezone and yields N+1 calendar buckets
+          (today's partial bucket plus N full prior days) — deliberate
+          headroom for the runtime-detail page's prior-window delta
+          calculation, not an off-by-one to "fix".
+      - name: tz
+        in: query
+        required: false
+        schema: { type: string }
+        description: >-
+          IANA timezone for bucketing. Falls back to the authenticated
+          user's stored `timezone`, then `"UTC"`, if omitted or unparseable
+          — never errors on a bad value (`resolveViewingTZ`).
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/RuntimeUsageEntry'
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: >-
+          `"runtime not found"` — id doesn't resolve, caller isn't a member
+          of the runtime's workspace, OR (information-hiding by design) the
+          runtime is private and the caller is not its owner. All three
+          cases are indistinguishable on the wire so a private runtime id
+          cannot be probed for existence.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to list usage"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list usage" }
+
+/api/runtimes/{runtimeId}/usage/by-agent:
+  get:
+    operationId: getRuntimeUsageByAgent
+    summary: Get a runtime's token usage broken down by agent
+    description: >-
+      server/internal/handler/runtime.go:224-265 (`GetRuntimeUsageByAgent`).
+      No date bucketing in the response — `tz` only sets the cutoff
+      boundary (so "last 30 days" means 30 of the viewer's local calendar
+      days), unlike the dated trend returned by the sibling usage endpoint.
+      Same private-runtime read gate as GET .../usage.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: days
+        in: query
+        required: false
+        schema: { type: integer, minimum: 1, maximum: 365, default: 30 }
+        description: Cutoff window size; see GET .../usage for the exact cutoff-anchoring behavior (same `parseSinceParamInTZ` helper, different default).
+      - name: tz
+        in: query
+        required: false
+        schema: { type: string }
+        description: IANA timezone for the cutoff boundary only (no date bucketing here). See GET .../usage for the fallback chain.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/RuntimeUsageByAgentEntry'
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: '`"runtime not found"` — see GET .../usage for the three collapsed cases.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to list usage by agent"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list usage by agent" }
+
+/api/runtimes/{runtimeId}/usage/by-hour:
+  get:
+    operationId: getRuntimeUsageByHour
+    summary: Get a runtime's token usage broken down by hour-of-day
+    description: >-
+      server/internal/handler/runtime.go:296-335 (`GetRuntimeUsageByHour`).
+      Hour-of-day (0..23) bucketed in the resolved viewing timezone, since
+      the cutoff window. Hours with zero activity are omitted by the SQL —
+      clients fill the gap to render a continuous 0..23 axis. Same
+      private-runtime read gate as GET .../usage.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: days
+        in: query
+        required: false
+        schema: { type: integer, minimum: 1, maximum: 365, default: 30 }
+        description: Cutoff window size; same anchoring behavior as GET .../usage, 30-day default.
+      - name: tz
+        in: query
+        required: false
+        schema: { type: string }
+        description: IANA timezone for both the cutoff and the hour-of-day bucketing. See GET .../usage for the fallback chain.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/RuntimeUsageByHourEntry'
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: '`"runtime not found"` — see GET .../usage for the three collapsed cases.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to get usage by hour"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to get usage by hour" }
+
+/api/runtimes/{runtimeId}/activity:
+  get:
+    operationId: getRuntimeTaskActivity
+    summary: Get a runtime's hourly task-activity distribution
+    description: >-
+      server/internal/handler/runtime.go:166-194
+      (`GetRuntimeTaskActivity`). UNLIKE the three usage endpoints above,
+      this one takes NO `days`/cutoff parameter — it aggregates over the
+      runtime's entire task history, bucketed by hour-of-day in the
+      resolved viewing timezone. Same private-runtime read gate as GET
+      .../usage.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: tz
+        in: query
+        required: false
+        schema: { type: string }
+        description: IANA timezone for hour-of-day bucketing. See GET .../usage for the fallback chain (no cutoff is computed here, so `tz` only affects bucketing, not a window boundary).
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/RuntimeTaskActivityEntry'
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: '`"runtime not found"` — see GET .../usage for the three collapsed cases.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to get task activity"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to get task activity" }
+
+/api/runtimes/{runtimeId}/unbind-agents-and-delete:
+  post:
+    operationId: unbindAgentsAndDeleteRuntime
+    summary: Delete a runtime, unbinding every agent still bound to it (confirmed cascade)
+    description: >-
+      server/internal/handler/runtime.go:1174-1353
+      (`UnbindAgentsAndDeleteRuntime`). The confirmed counterpart to the
+      strict DELETE above: unbinds every user agent bound to the runtime
+      (active and archived — they survive, unbound, and need a new runtime
+      to run again; nothing of the user's is destroyed), pauses affected
+      Autopilots, cancels active tasks, detaches task history, hard-deletes
+      only the runtime's system agents, and finally deletes the runtime row
+      — all inside one transaction. Re-lists active agents under a row
+      lock inside the transaction and compares against
+      `expected_active_agent_ids`; a mismatch means the plan the user
+      confirmed is stale (someone added/archived an agent on this runtime
+      while the dialog was open) and the request is refused rather than
+      silently acting on a different set than what was shown. Prior to
+      MUL-5559 this archived the agents and then hard-deleted them,
+      destroying their conversations even though the dialog said "archive";
+      it no longer destroys anything the user owns.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UnbindAgentsAndDeleteRuntimeRequest' }
+    responses:
+      '200':
+        description: Deleted and torn down.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnbindAgentsAndDeleteRuntimeResponse' }
+      '400':
+        description: >-
+          `"invalid runtime_id"`; `"invalid request body"` (decode
+          failure); `"expected_active_agent_ids must be a list of valid
+          UUIDs"` (any entry fails UUID parsing). Plus the file-level
+          "Workspace gate" 400s.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidExpectedIds: { value: { error: "expected_active_agent_ids must be a list of valid UUIDs" } }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"you can only delete your own runtimes"` — caller is neither a workspace owner/admin nor this runtime''s owner.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you can only delete your own runtimes" }
+      '404':
+        description: '`"runtime not found"` — see the file-level note.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '409':
+        description: >-
+          The profile-backed-instance refusal (checked first, same as plain
+          DELETE); the confirmed plan went stale
+          (`runtime_delete_plan_changed`, carrying the fresh active-agent
+          list so the dialog can re-render for a fresh confirmation); or the
+          teardown found a non-terminal task that didn't drain in time
+          (`runtime_delete_not_drained`). Unlike plain DELETE, this
+          operation's teardown does not surface
+          `runtime_delete_workspace_mismatch` as a distinct 409 — any such
+          failure here falls through to the generic 500 below.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RuntimeProfileInstanceDeleteRefusal'
+                - $ref: '#/components/schemas/RuntimeHasActiveAgentsResponse'
+                - $ref: '#/components/schemas/RuntimeDeleteConflict'
+      '500':
+        description: >-
+          `"failed to check runtime profile"`; `"failed to start
+          transaction"`; `"failed to lock runtime"`; `"failed to lock
+          runtime dependencies"`; `"failed to enumerate active agents"`;
+          `"failed to unbind agents"` (non-drain teardown failure);
+          `"failed to delete runtime"`; `"failed to commit transaction"`.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/archive-agents-and-delete:
+  post:
+    operationId: archiveAgentsAndDeleteRuntime
+    summary: '[Legacy alias] Delete a runtime, unbinding every agent still bound to it'
+    description: >-
+      server/cmd/server/router.go ~line 2348-2352 and
+      server/internal/handler/runtime.go:1200
+      (`UnbindAgentsAndDeleteRuntime` — the exact same handler function as
+      POST .../unbind-agents-and-delete, byte-for-byte; this is a second
+      route bound to it, not a separate implementation). Kept only for
+      installed clients built against the pre-MUL-5559
+      archive-and-delete naming; current clients should use
+      POST .../unbind-agents-and-delete. Request/response bodies, status
+      codes and every error case are identical to that operation — see it
+      for full detail, including the success body's `agents_archived` field
+      (a deprecated mirror of `agents_unbound` kept specifically so clients
+      calling this legacy route still read the count under the name they
+      expect).
+    tags: [runtimes]
+    deprecated: true
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UnbindAgentsAndDeleteRuntimeRequest' }
+    responses:
+      '200':
+        description: Deleted and torn down. Identical shape to POST .../unbind-agents-and-delete.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnbindAgentsAndDeleteRuntimeResponse' }
+      '400':
+        description: Identical to POST .../unbind-agents-and-delete.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: Identical to POST .../unbind-agents-and-delete.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you can only delete your own runtimes" }
+      '404':
+        description: Identical to POST .../unbind-agents-and-delete.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '409':
+        description: Identical to POST .../unbind-agents-and-delete.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RuntimeProfileInstanceDeleteRefusal'
+                - $ref: '#/components/schemas/RuntimeHasActiveAgentsResponse'
+                - $ref: '#/components/schemas/RuntimeDeleteConflict'
+      '500':
+        description: Identical to POST .../unbind-agents-and-delete.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/update:
+  post:
+    operationId: initiateRuntimeUpdate
+    summary: Request a daemon-side CLI update for a runtime
+    description: >-
+      server/internal/handler/runtime_update.go:213-260 (`InitiateUpdate`).
+      Enqueues a pending `RuntimeUpdateRequest`; the daemon claims it on its
+      next heartbeat poll and reports the result back out-of-band (via the
+      daemon-auth'd `ReportUpdateResult`, out of scope for this domain).
+      Caller polls GET .../update/{updateId} to observe pending -> running
+      -> completed|failed|timeout. UNLIKE the model/local-skill initiate
+      endpoints below, this one does NOT check the runtime's online status
+      before enqueueing — an update requested for an offline runtime simply
+      sits `pending` until its 120-second timeout.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/InitiateRuntimeUpdateRequest' }
+    responses:
+      '200':
+        description: >-
+          Enqueued. NOTE: 200, not 201, despite creating a new pending
+          request record — consistent with the other two initiate endpoints
+          in this domain.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeUpdateRequest' }
+      '400':
+        description: >-
+          `"invalid runtime_id"`; `"invalid request body"`; `"target_version
+          is required"` (empty string). Plus the file-level "Workspace
+          gate" 400s.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              targetVersionRequired: { value: { error: "target_version is required" } }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"only runtime owners and workspace admins can update runtimes"` — same `canEditRuntime` gate as PATCH/DELETE, worded for this action.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only runtime owners and workspace admins can update runtimes" }
+      '404':
+        description: '`"runtime not found"` — see the file-level note, and the private-runtime information-hiding behavior documented on GET .../usage.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '409':
+        description: '`"an update is already in progress for this runtime"` — a pending or running update already exists for this runtime id.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "an update is already in progress for this runtime" }
+      '500':
+        description: >-
+          `"failed to start the update"` — any `UpdateStore.Create` failure
+          other than the in-progress conflict above (deliberately NOT
+          echoed to the client even though the underlying error is
+          available server-side: the Redis-backed store's own error text
+          can read like a user-actionable conflict when it is really an
+          infrastructure failure, which was survivable while the CLI hid
+          409 bodies but is not now that they're shown by default).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to start the update" }
+
+/api/runtimes/{runtimeId}/update/{updateId}:
+  get:
+    operationId: getRuntimeUpdate
+    summary: Poll the status of a runtime CLI-update request
+    description: >-
+      server/internal/handler/runtime_update.go:263-289 (`GetUpdate`).
+      Access is slightly wider than the usual edit gate: in addition to
+      `canEditRuntime` (workspace owner/admin, or the runtime's own owner),
+      the specific member who INITIATED this particular update may also
+      poll it even if they are later demoted from admin — scoped to this
+      one immutable request, not a standing grant. Other plain members
+      still cannot read another runtime's update status at all.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: updateId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Opaque 32-character lowercase-hex id returned as `id` by POST .../update — not a UUID.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeUpdateRequest' }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"only runtime owners, workspace admins, and the update initiator can view this update"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only runtime owners, workspace admins, and the update initiator can view this update" }
+      '404':
+        description: >-
+          `"runtime not found"` (runtime-level gate, see the file-level
+          note), or `"update not found"` (the `updateId` doesn't resolve to
+          a stored request, or resolves to one belonging to a different
+          runtime).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              runtimeNotFound: { value: { error: "runtime not found" } }
+              updateNotFound: { value: { error: "update not found" } }
+      '500':
+        description: '`"failed to load update: <err>"` — the update store read itself failed (distinct from a clean not-found).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/models:
+  post:
+    operationId: initiateRuntimeModelList
+    summary: Request the list of models a runtime's CLI can run
+    description: >-
+      server/internal/handler/runtime_models.go:346-391
+      (`InitiateListModels`). Requires the runtime be online — 503 if not.
+      Fast path (default, `force` omitted/false): if a catalog snapshot
+      younger than the server's serve window is cached
+      (`ModelCatalogCache`), it is returned immediately as an
+      already-`completed` synthetic request (`cached: true`); if that
+      snapshot is older than the revalidate threshold, a background refresh
+      is ALSO silently enqueued (nobody polls it — it only warms the cache
+      for the next open). Slow path (`force=true`, or no usable cache):
+      enqueues a real pending request the daemon claims on its next
+      heartbeat and nudges the daemon to heartbeat immediately rather than
+      waiting out its normal interval. No request body is read.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: force
+        in: query
+        required: false
+        schema: { type: string, enum: ['true'] }
+        description: >-
+          Exactly the literal string `"true"` skips the server-side cache
+          and always waits for a live daemon round trip; any other value
+          (including absent) takes the cache-first fast path.
+    responses:
+      '200':
+        description: >-
+          Either a synthetic already-`completed` response (cache hit — see
+          summary) or a freshly-enqueued `pending` request to poll via GET
+          .../models/{requestId}.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeModelListRequest' }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid runtime_id" }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: '`"runtime not found"` — see the file-level note and the information-hiding behavior documented on GET .../usage.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to enqueue model list request: <err>"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '503':
+        description: '`"runtime is offline"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime is offline" }
+
+/api/runtimes/{runtimeId}/models/{requestId}:
+  get:
+    operationId: getRuntimeModelListRequest
+    summary: Poll the status of a model-list discovery request
+    description: >-
+      server/internal/handler/runtime_models.go:460-479
+      (`GetModelListRequest`). Same read-access gate as the usage/activity
+      endpoints (`requireRuntimeReadAccess` — private-runtime information
+      hiding applies), not the narrower owner-only gate used by the
+      local-skill-import pair below.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: requestId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Opaque id returned as `id` by POST .../models (a random hex string normally; a synthetic value on a cache-hit response) — not guaranteed to be a UUID.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeModelListRequest' }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: >-
+          `"runtime not found"` (runtime-level gate), or `"request not
+          found"` (the `requestId` doesn't resolve, or resolves to a
+          request for a different runtime).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              runtimeNotFound: { value: { error: "runtime not found" } }
+              requestNotFound: { value: { error: "request not found" } }
+      '500':
+        description: '`"failed to load request: <err>"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/local-skills:
+  post:
+    operationId: initiateRuntimeLocalSkillList
+    summary: Request the list of skills (and MCP servers) found locally on a runtime
+    description: >-
+      server/internal/handler/runtime_local_skills.go:594-612
+      (`InitiateListLocalSkills`). Requires the runtime be online — 503 if
+      not. No caching layer here (unlike the sibling model-list endpoint):
+      every call enqueues a fresh pending request and nudges the daemon to
+      heartbeat immediately. Read-only discovery — this does not import
+      anything into the workspace; see POST .../local-skills/import for
+      that. Access gate is `requireRuntimeCapabilityReadAccess`: a private
+      runtime's capability inventory is readable by its owner only (no
+      admin override, same as the usage/model endpoints), but a PUBLIC
+      runtime's inventory is readable by any workspace member — narrower
+      than that is the local-skill-IMPORT pair below, which stays
+      owner-only even for a public runtime because import reads full skill
+      file contents off the owner's machine. No request body is read.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    responses:
+      '200':
+        description: Enqueued; poll via GET .../local-skills/{requestId}.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeLocalSkillListRequest' }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid runtime_id" }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: '`"runtime not found"` — see the file-level note; private-runtime information hiding applies.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to enqueue local skills request: <err>"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '503':
+        description: '`"runtime is offline"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime is offline" }
+
+/api/runtimes/{runtimeId}/local-skills/{requestId}:
+  get:
+    operationId: getRuntimeLocalSkillListRequest
+    summary: Poll the status of a local-skill (and MCP-server) discovery request
+    description: >-
+      server/internal/handler/runtime_local_skills.go:614-633
+      (`GetLocalSkillListRequest`). Same `requireRuntimeCapabilityReadAccess`
+      gate as the initiate endpoint above (owner-only for a private runtime,
+      any member for a public one).
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: requestId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Opaque 32-character lowercase-hex id returned as `id` by POST .../local-skills — not a UUID.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeLocalSkillListRequest' }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: >-
+          `"runtime not found"` (runtime-level gate), or `"request not
+          found"` (the `requestId` doesn't resolve, or belongs to a
+          different runtime).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              runtimeNotFound: { value: { error: "runtime not found" } }
+              requestNotFound: { value: { error: "request not found" } }
+      '500':
+        description: '`"failed to load request: <err>"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/local-skills/import:
+  post:
+    operationId: initiateRuntimeLocalSkillImport
+    summary: Import one locally-discovered skill from a runtime into the workspace
+    description: >-
+      server/internal/handler/runtime_local_skills.go:635-697
+      (`InitiateImportLocalSkill`). Requires the runtime be online — 503 if
+      not. Access gate is `requireRuntimeLocalSkillAccess`, STRICTLY
+      owner-only (no workspace owner/admin override, unlike `canEditRuntime`
+      elsewhere in this domain) because the import reads full skill file
+      contents off the owner's own machine — this holds even for a `public`
+      runtime, which only grants other members the ability to RUN agents on
+      it, not to pull files off it. `action: "overwrite"` only validates
+      that `target_skill_id` is a well-formed UUID at this step; existence
+      and creator-only overwrite permission are re-verified authoritatively
+      when the daemon later reports its result (the skill may have changed
+      between this call and that report), so this endpoint can enqueue a
+      request that still fails at report time for those reasons.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateRuntimeLocalSkillImportRequest' }
+    responses:
+      '200':
+        description: Enqueued; poll via GET .../local-skills/import/{requestId}.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeLocalSkillImportRequest' }
+      '400':
+        description: >-
+          `"invalid runtime_id"`; `"invalid request body"`; `"skill_key is
+          required"` (empty after trimming); `"invalid target_skill_id"`
+          (malformed UUID, only checked when `action` is `"overwrite"`);
+          `"invalid action"` (anything other than omitted/empty or
+          `"overwrite"`). Plus the file-level "Workspace gate" 400s.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              skillKeyRequired: { value: { error: "skill_key is required" } }
+              invalidTargetSkillId: { value: { error: "invalid target_skill_id" } }
+              invalidAction: { value: { error: "invalid action" } }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"insufficient permissions"` — caller is a workspace member but not this runtime''s owner (the strict owner-only gate described above; note a workspace owner/admin who is not the runtime''s owner is also refused here).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "insufficient permissions" }
+      '404':
+        description: '`"runtime not found"` — see the file-level note; private-runtime information hiding applies.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '500':
+        description: '`"failed to enqueue local skill import: <err>"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '503':
+        description: '`"runtime is offline"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime is offline" }
+
+/api/runtimes/{runtimeId}/local-skills/import/{requestId}:
+  get:
+    operationId: getRuntimeLocalSkillImportRequest
+    summary: Poll the status of a local-skill import request
+    description: >-
+      server/internal/handler/runtime_local_skills.go:699-718
+      (`GetLocalSkillImportRequest`). Same strict owner-only
+      `requireRuntimeLocalSkillAccess` gate as the initiate endpoint above.
+      A terminal `status: "conflict"` response (see
+      `RuntimeLocalSkillImportConflict`) is not an error — it means a
+      same-name skill already existed and the caller opted into the
+      structured-conflict contract; the caller is expected to re-submit a
+      new import with `action: "overwrite"` (if `can_overwrite` is true) or
+      a renamed `name`.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+      - name: requestId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Opaque 32-character lowercase-hex id returned as `id` by POST .../local-skills/import — not a UUID.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeLocalSkillImportRequest' }
+      '400':
+        description: '`"invalid runtime_id"`, plus the file-level "Workspace gate" 400s.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"insufficient permissions"` — caller is not this runtime''s owner (strict owner-only gate, no admin override).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "insufficient permissions" }
+      '404':
+        description: >-
+          `"runtime not found"` (runtime-level gate), or `"request not
+          found"` (the `requestId` doesn't resolve, or belongs to a
+          different runtime).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              runtimeNotFound: { value: { error: "runtime not found" } }
+              requestNotFound: { value: { error: "request not found" } }
+      '500':
+        description: '`"failed to load request: <err>"`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }

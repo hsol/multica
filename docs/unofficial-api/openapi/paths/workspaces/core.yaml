@@ -1,0 +1,556 @@
+# Domain: workspaces core — CRUD, members, leave.
+# Source: server/internal/handler/workspace.go, server/internal/handler/invitation.go
+# (CreateInvitation only), server/cmd/server/router.go:1639-1801.
+# Baseline revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe (tag v0.6.0).
+#
+# `DELETE /api/workspaces/{id}` (h.DeleteWorkspace, owner-only, router.go:1787)
+# was originally missing from this ticket's enumerated endpoint list — that
+# list was extracted by a brace-depth static parse of router.go, and this
+# route is registered via a single-line `r.With(...).Delete(...)` that never
+# opens its own `r.Group` block, which is why the parser missed it. Confirmed
+# and added to the ticket by PM; documented below as the 79th endpoint.
+#
+# Security: all operations require middleware.Auth (mul_ PAT / mat_ agent
+# task token / mcn_ Cloud Node PAT / browser session cookie — see
+# components/securitySchemes.yaml). Workspace scope comes from the `{id}` path
+# param via RequireWorkspaceMemberFromURL or RequireWorkspaceRoleFromURL, NOT
+# from X-Workspace-ID/X-Workspace-Slug headers — so no header parameters are
+# listed on these operations (unlike the header-scoped account/dashboard
+# domains).
+
+/api/workspaces:
+  get:
+    operationId: listWorkspaces
+    summary: List the authenticated user's workspaces
+    description: workspace.go:159-177 (`ListWorkspaces`). No pagination, query, or path params.
+    tags: [Workspaces]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/WorkspaceResponse'}}
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "user not authenticated"}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list workspaces"}
+  post:
+    operationId: createWorkspace
+    summary: Create a workspace
+    description: >-
+      workspace.go:202-320 (`CreateWorkspace`). Creates the workspace, adds
+      the caller as `owner`, and seeds 7 built-in issue statuses in one
+      transaction (MUL-6243).
+    tags: [Workspaces]
+    security: *auth
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CreateWorkspaceRequest'}
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceResponse'}
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "user not authenticated"}
+      '403':
+        description: Workspace creation disabled for this self-hosted instance (`DISABLE_WORKSPACE_CREATION`, #3433). Applies even to existing owners.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace creation is disabled for this instance"}
+      '400':
+        description: Invalid body, missing name/slug, bad slug format, reserved slug, or bad issue_prefix format.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              missing: {value: {error: "name and slug are required"}}
+              badSlug: {value: {error: "slug must contain only lowercase letters, numbers, and hyphens"}}
+              reservedSlug: {value: {error: "slug is reserved"}}
+              badPrefix: {value: {error: "issue prefix must be 1-10 uppercase letters or digits"}}
+      '409':
+        description: Slug already taken (unique violation).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace slug already exists"}
+      '500':
+        description: Any step of the creation transaction failed (begin, insert, add owner, seed issue statuses, or commit).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}:
+  get:
+    operationId: getWorkspace
+    summary: Get a workspace
+    description: workspace.go:179-192 (`GetWorkspace`). Requires workspace membership.
+    tags: [Workspaces]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceResponse'}
+      '400':
+        description: Invalid workspace id, or missing workspace_id/workspace_slug.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "user not authenticated"}
+      '403':
+        description: Caller authenticated with an agent task token bound to a different workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "task token is bound to a different workspace"}
+      '404':
+        description: Workspace does not exist, or caller is not a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace not found"}
+  put:
+    operationId: updateWorkspacePut
+    summary: Update a workspace (full-body form)
+    description: >-
+      workspace.go:373-497 (`UpdateWorkspace`). Identical handler to PATCH on
+      this path — despite the method, fields are still applied PATCH-style
+      (only non-null request fields change anything). Requires `owner` or
+      `admin`.
+    tags: [Workspaces]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UpdateWorkspaceRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, empty name, invalid repos entry, or bad issue_prefix format.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              emptyName: {value: {error: "name is required"}}
+              badRepo: {value: {error: "repos[0]: url is required"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is a member but not owner/admin, or `avatar_url` points at a non-standalone attachment.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              insufficientRole: {value: {error: "insufficient permissions"}}
+              badAvatar: {value: {error: "avatar_url must reference a standalone image upload, not a file attached to an issue, comment, or chat"}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Update failed.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+  patch:
+    operationId: updateWorkspacePatch
+    summary: Update a workspace (partial form)
+    description: Identical handler and behavior to `PUT /api/workspaces/{id}` above (workspace.go:373).
+    tags: [Workspaces]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UpdateWorkspaceRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceResponse'}
+      '400':
+        description: Same as PUT.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Same as PUT.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Update failed.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+  delete:
+    operationId: deleteWorkspace
+    summary: Delete a workspace
+    description: >-
+      workspace.go:1070-... (`DeleteWorkspace`). Requires `owner` — the
+      handler re-checks the role itself (`insufficient permissions` if not
+      owner) in addition to the router's `RequireWorkspaceRoleFromURL("owner")`
+      gate. Runs the entire teardown in one transaction bounded by a
+      transaction-local `lock_timeout` (`effectiveWorkspaceDeleteLockTimeout`),
+      locking the workspace row and then every chat_session row before
+      deleting anything, to avoid stranding a `chat_draft_restore` row with no
+      FK to follow its session's cascade (#5219, MUL-3515). Tasks are deleted
+      via bounded keyset pagination across owner kinds (agent/issue/runtime)
+      rather than loaded in full, since a single workspace's task set is
+      unbounded. On success: membership cache is invalidated for every
+      affected user, S3 objects for source-context attachments/intents are
+      deleted, `NotifyRuntimeGone` fires per runtime, `EventWorkspaceDeleted`
+      is published, and connected daemons are notified.
+    tags: [Workspaces]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted (full cascade teardown — members, issues, tasks, agents, runtimes, integrations, and every other workspace-scoped resource).
+      '400':
+        description: Invalid workspace id, or missing workspace_id/workspace_slug.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "user not authenticated"}
+      '403':
+        description: Caller authenticated with an agent task token bound to a different workspace, or caller is a member but not the owner (both the router gate and the handler's own re-check produce this).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              taskTokenMismatch: {value: {error: "task token is bound to a different workspace"}}
+              notOwner: {value: {error: "insufficient permissions"}}
+      '404':
+        description: Workspace does not exist, or caller is not a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace not found"}
+      '500':
+        description: Transaction begin/commit failed, or any non-lock-contention step of the teardown failed (dozens of named steps — see handler source for the full list; all collapse to this same message).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to delete workspace"}
+      '503':
+        description: A teardown step hit a transient, retryable lock failure (Postgres `lock_timeout` or a detected deadlock) — safe to retry.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace deletion is temporarily blocked by another operation, please try again"}
+
+/api/workspaces/{id}/members:
+  get:
+    operationId: listMembers
+    summary: List a workspace's members
+    description: workspace.go:510-536 (`ListMembersWithUser`). Requires membership.
+    tags: [Workspaces, Members]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/MemberWithUserResponse'}}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list members"}
+  post:
+    operationId: createInvitation
+    summary: Invite a member to the workspace
+    description: >-
+      invitation.go:61-... (`h.CreateInvitation`). Despite the URL, this
+      creates an INVITATION (response `InvitationResponse`), not a member
+      row — a member row is only created once the invitee calls `POST
+      /api/invitations/{id}/accept`. Requires `owner` or `admin`.
+    tags: [Workspaces, Members, Invitations]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CreateMemberRequest'}
+    responses:
+      '201':
+        description: Created (invitation)
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InvitationResponse'}
+      '400':
+        description: Invalid body, missing email, invalid role, or role=owner requested.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              emailRequired: {value: {error: "email is required"}}
+              badRole: {value: {error: "invalid member role"}}
+              ownerRole: {value: {error: "cannot invite as owner"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is a member but not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "insufficient permissions"}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: Invitee email already belongs to an existing member, or a live pending invitation already exists for this email.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              alreadyMember: {value: {error: "user is already a member"}}
+              pendingExists: {value: {error: "invitation already pending for this email"}}
+      '429':
+        description: Per-actor (10/10min), per-workspace (50/24h), or per-recipient (6/24h) invitation rate limit exceeded. Sets `Retry-After`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InvitationRateLimitedResponse'}
+      '503':
+        description: Seat-capacity backend unavailable, or the invitation rate-limiter backend unavailable. Sets `Retry-After` for the rate-limiter case.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            examples:
+              seatCapacity: {value: {error: "Member capacity could not be verified. Please try again.", code: seat_capacity_unavailable}}
+              rateLimiter: {value: {error: "invitation service temporarily unavailable", code: invitation_rate_limiter_unavailable}}
+      '500':
+        description: Expiring stale invitations, releasing their capacity, or the create/insert itself failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to create invitation"}
+
+/api/workspaces/{id}/members/{memberId}:
+  patch:
+    operationId: updateMember
+    summary: Change a member's role
+    description: >-
+      workspace.go:576-650 (`UpdateMember`). Requires `owner` or `admin`; only
+      an `owner` may touch an existing `owner` member or grant the `owner`
+      role; the sole remaining owner cannot be demoted.
+    tags: [Workspaces, Members]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: memberId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+        description: The member row id (not the user id).
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UpdateMemberRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MemberWithUserResponse'}
+      '400':
+        description: Invalid member id, invalid body, missing role, invalid role, or demoting the sole remaining owner.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              roleRequired: {value: {error: "role is required"}}
+              badRole: {value: {error: "invalid member role"}}
+              lastOwner: {value: {error: "workspace must have at least one owner"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Requester is not owner/admin, or (not owner) attempting to change an owner's role or grant owner.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "insufficient permissions"}
+      '404':
+        description: Member not found, or belongs to a different workspace than `id`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "member not found"}
+      '500':
+        description: Counting owners, updating the role, or reloading the user failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              update: {value: {error: "failed to update member"}}
+              reload: {value: {error: "failed to load member"}}
+  delete:
+    operationId: deleteMember
+    summary: Remove a member
+    description: >-
+      workspace.go:652-... (`DeleteMember`). Requires `owner` or `admin`; a
+      non-owner requester cannot remove an owner, and the sole remaining
+      owner can never be removed (even by another owner).
+    tags: [Workspaces, Members]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: memberId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Removed.
+      '400':
+        description: Invalid member id, or removing the sole remaining owner.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidId: {value: {error: "invalid member id"}}
+              lastOwner: {value: {error: "workspace must have at least one owner"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Target is an owner but requester is not an owner.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "insufficient permissions"}
+      '404':
+        description: Member not found, or belongs to a different workspace than `id`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "member not found"}
+      '500':
+        description: Counting owners or the delete itself failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to delete member"}
+
+/api/workspaces/{id}/leave:
+  post:
+    operationId: leaveWorkspace
+    summary: Leave a workspace
+    description: >-
+      workspace.go:713-... (`LeaveWorkspace`). Requires membership. The sole
+      remaining owner cannot leave.
+    tags: [Workspaces, Members]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Left the workspace.
+      '400':
+        description: The caller is the sole remaining owner.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace must have at least one owner"}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace not found"}
+      '500':
+        description: Counting owners, or the revoke-and-remove step, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to leave workspace"}

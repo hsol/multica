@@ -1,0 +1,863 @@
+# Domain schemas for "runtimes" — agent runtimes, their
+# usage/activity rollups, and the three daemon-mediated async flows (CLI
+# update, model discovery, local-skill discovery/import). Derived from
+# server/internal/handler/{runtime,runtime_update,runtime_models,
+# runtime_local_skills}.go. Nested under components/schemas/ per the merge
+# script's convention — the parent directory name "schemas" is what routes
+# these into components.schemas; the file's own basename is irrelevant.
+#
+# Names are prefixed `Runtime*` (or keep their exact Go type name, e.g.
+# AgentRuntimeResponse) to avoid colliding with same-named concepts in other
+# domains sharing this flat components.schemas namespace — a duplicate key
+# across domain files is a hard merge error, not a lint warning.
+#
+# Cross-domain references: AgentResponse (agents domain) and
+# SkillWithFilesResponse (skills domain) are $ref'd below but defined in
+# sibling tickets' schema files, not here.
+
+AgentRuntimeResponse:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:25-81 (`runtimeToResponse`). One
+    registered agent runtime (a daemon-hosted CLI install, e.g. Claude Code /
+    Codex / Hermes, or a Multica Cloud node).
+  required:
+    - id
+    - workspace_id
+    - daemon_id
+    - name
+    - custom_name
+    - runtime_mode
+    - provider
+    - launch_header
+    - status
+    - device_info
+    - metadata
+    - owner_id
+    - visibility
+    - profile_id
+    - last_seen_at
+    - created_at
+    - updated_at
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    daemon_id:
+      type: [string, 'null']
+      description: Null for a runtime that was never registered by a daemon heartbeat (e.g. a bare Cloud node row).
+    name:
+      type: string
+      description: Daemon-proposed display name (e.g. "Claude (host.local)").
+    custom_name:
+      type: [string, 'null']
+      description: >-
+        User-set display override (MUL-4217); null when the runtime still
+        uses its daemon-proposed `name`. Clients render `custom_name ??
+        name` and seed the rename field from this raw value.
+    runtime_mode:
+      type: string
+      description: >-
+        Not independently enumerated from source beyond its Go `string`
+        type and json tag; treat as an opaque, server-defined value rather
+        than an exhaustive client-side enum.
+    provider:
+      type: string
+      description: >-
+        Runtime/CLI identifier (e.g. `claude`, `codex`, `hermes`, `qwenpaw`,
+        `mcode` are named individually elsewhere in runtime_models.go
+        comments, but the full provider catalog itself was not
+        independently re-derived from source for this ticket — treat as an
+        open string, not a closed enum).
+    launch_header:
+      type: string
+      description: Computed display string from `agent.LaunchHeader(provider)`, not stored on the row.
+    status:
+      type: string
+      description: >-
+        Not a closed enum in this handler package; `"online"` and
+        `"offline"` are the two values branched on directly in source
+        (e.g. the `runtime is offline` 503 checks below, and the
+        profile-instance delete-refusal copy). Other daemon-reported
+        values may exist but were not found branched on here.
+    device_info:
+      type: string
+    metadata:
+      type: object
+      additionalProperties: true
+      description: >-
+        Daemon-reported free-form metadata. Always an object on the wire:
+        a null/unparseable stored value is normalized to `{}` before
+        serialization (`runtimeToResponse`), never returned as JSON `null`.
+    owner_id:
+      type: [string, 'null']
+      description: >-
+        Null for an "ownerless" runtime. `canUseRuntimeForAgent` refuses to
+        bind any agent to one of these regardless of `visibility` — task
+        claim needs an owner to mint the agent's task token.
+    visibility:
+      type: string
+      enum: [private, public]
+      description: >-
+        `private` (default) — only `owner_id` can bind/use agents on this
+        runtime, with no workspace owner/admin override (MUL-6126: running
+        an agent spends the owner's credentials and local files, which is
+        not an administrative decision). `public` — any workspace member
+        may bind/use it. See migration 083.
+    profile_id:
+      type: [string, 'null']
+      description: >-
+        Set when this runtime is one instance of a custom `runtime_profile`
+        (MUL-3284); null for a directly-registered, non-profile-backed
+        runtime. A profile-backed instance cannot be deleted directly while
+        its profile still exists — see DELETE /api/runtimes/{runtimeId}'s
+        409 response.
+    last_seen_at:
+      type: [string, 'null']
+      format: date-time
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+UpdateAgentRuntimeRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:462-477. Every field is optional;
+    only the fields present are validated and applied — this is a PATCH, not
+    a full replace. Fields not listed here (provider, daemon_id, status,
+    etc.) flow in from the daemon and are not user-editable through this
+    endpoint.
+  properties:
+    visibility:
+      type: string
+      enum: [private, public]
+      description: >-
+        Runtime-owner-only (`canSetRuntimeVisibility`) — narrower than the
+        rest of this request, which a workspace admin may also send. A
+        value equal to the runtime's current visibility is treated as a
+        no-op and is NOT permission-checked (tolerates a PATCH-as-PUT
+        client echoing the unchanged value back).
+    custom_name:
+      type: string
+      description: >-
+        Sets a display override. An empty or whitespace-only string clears
+        it (reverts to the daemon-proposed `name`) rather than being
+        rejected. Capped at 100 runes (`maxRuntimeCustomNameLen`) after
+        trimming.
+    apply_to_machine:
+      type: boolean
+      description: >-
+        When `true` alongside `custom_name`, applies the name to every
+        runtime sharing this runtime's `daemon_id` (one machine hosts one
+        runtime per provider) instead of just this one. Ignored when the
+        runtime has no `daemon_id`. A non-owner/admin member renaming by
+        machine only affects runtimes on that machine that they themselves
+        own; an owner/admin renames every runtime on the machine.
+
+RuntimeUsageEntry:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:87-106 (`RuntimeUsageResponse`). One
+    (date, provider, model) daily aggregate row from `task_usage_hourly`,
+    scoped to Daemon-executed tasks only (excludes a user's local CLI usage
+    of the same tool outside Multica).
+  required:
+    - runtime_id
+    - date
+    - provider
+    - model
+    - input_tokens
+    - output_tokens
+    - cache_read_tokens
+    - cache_write_tokens
+    - cost_usd_ticks
+    - uncosted_input_tokens
+    - uncosted_output_tokens
+    - uncosted_cache_read_tokens
+    - uncosted_cache_write_tokens
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+    date:
+      type: string
+      format: date
+      description: Projected into the viewer's resolved timezone, formatted `2006-01-02`.
+    provider:
+      type: string
+    model:
+      type: string
+    input_tokens: { type: integer, format: int64 }
+    output_tokens: { type: integer, format: int64 }
+    cache_read_tokens: { type: integer, format: int64 }
+    cache_write_tokens: { type: integer, format: int64 }
+    cost_usd_ticks:
+      type: integer
+      format: int64
+      description: >-
+        What the provider itself charged for the rows behind this
+        aggregate, in units of 1e-10 USD (migration 213).
+    uncosted_input_tokens:
+      type: integer
+      format: int64
+      description: >-
+        Tokens from rows the provider did NOT price. Paired with the three
+        `uncosted_*` fields below, these let the client report
+        authoritative cost + a client-side estimate for the uncosted
+        portion, so a window mixing both kinds of row stays whole.
+    uncosted_output_tokens: { type: integer, format: int64 }
+    uncosted_cache_read_tokens: { type: integer, format: int64 }
+    uncosted_cache_write_tokens: { type: integer, format: int64 }
+
+RuntimeUsageByAgentEntry:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:201-220
+    (`RuntimeUsageByAgentResponse`). One (agent, provider, model) aggregate
+    row, since the cutoff window, for the runtime-detail "Cost by agent"
+    tab. `provider` + `model` stay on the wire because cost is computed
+    client-side from a model pricing table (so pricing changes don't need a
+    server-side back-fill); `provider` disambiguates bare model ids that
+    collide across providers. The client groups by `agent_id` and sums.
+  required:
+    - agent_id
+    - provider
+    - model
+    - input_tokens
+    - output_tokens
+    - cache_read_tokens
+    - cache_write_tokens
+    - cost_usd_ticks
+    - uncosted_input_tokens
+    - uncosted_output_tokens
+    - uncosted_cache_read_tokens
+    - uncosted_cache_write_tokens
+    - task_count
+  properties:
+    agent_id:
+      type: string
+      format: uuid
+    provider: { type: string }
+    model: { type: string }
+    input_tokens: { type: integer, format: int64 }
+    output_tokens: { type: integer, format: int64 }
+    cache_read_tokens: { type: integer, format: int64 }
+    cache_write_tokens: { type: integer, format: int64 }
+    cost_usd_ticks: { type: integer, format: int64 }
+    uncosted_input_tokens: { type: integer, format: int64 }
+    uncosted_output_tokens: { type: integer, format: int64 }
+    uncosted_cache_read_tokens: { type: integer, format: int64 }
+    uncosted_cache_write_tokens: { type: integer, format: int64 }
+    task_count:
+      type: integer
+      format: int32
+
+RuntimeUsageByHourEntry:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:270-288
+    (`RuntimeUsageByHourResponse`). One (hour-of-day, model) aggregate row
+    for the "By hour" tab, bucketed in the viewer's resolved timezone. Hours
+    with zero activity are omitted by the SQL — the client fills the gap to
+    render a continuous 0..23 axis.
+  required:
+    - hour
+    - model
+    - input_tokens
+    - output_tokens
+    - cache_read_tokens
+    - cache_write_tokens
+    - cost_usd_ticks
+    - uncosted_input_tokens
+    - uncosted_output_tokens
+    - uncosted_cache_read_tokens
+    - uncosted_cache_write_tokens
+    - task_count
+  properties:
+    hour:
+      type: integer
+      minimum: 0
+      maximum: 23
+    model: { type: string }
+    input_tokens: { type: integer, format: int64 }
+    output_tokens: { type: integer, format: int64 }
+    cache_read_tokens: { type: integer, format: int64 }
+    cache_write_tokens: { type: integer, format: int64 }
+    cost_usd_ticks: { type: integer, format: int64 }
+    uncosted_input_tokens: { type: integer, format: int64 }
+    uncosted_output_tokens: { type: integer, format: int64 }
+    uncosted_cache_read_tokens: { type: integer, format: int64 }
+    uncosted_cache_write_tokens: { type: integer, format: int64 }
+    task_count:
+      type: integer
+      format: int32
+
+RuntimeTaskActivityEntry:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:183-191 (anonymous `HourlyActivity`
+    struct inside `GetRuntimeTaskActivity`). One (hour-of-day, task count)
+    row, bucketed in the viewer's resolved timezone, over the runtime's
+    entire history — unlike the three usage endpoints, this one takes no
+    `days` cutoff parameter.
+  required: [hour, count]
+  properties:
+    hour:
+      type: integer
+      minimum: 0
+      maximum: 23
+    count:
+      type: integer
+
+InitiateRuntimeUpdateRequest:
+  type: object
+  description: server/internal/handler/runtime_update.go:224-226 (anonymous request struct inside `InitiateUpdate`).
+  required: [target_version]
+  properties:
+    target_version:
+      type: string
+      description: Must be non-empty; the CLI version string the daemon should update to.
+
+RuntimeUpdateRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime_update.go:31-42 (`UpdateRequest`). A
+    pending/running/terminal CLI-update request, stored in `UpdateStore`
+    (in-memory single-node, or Redis for multi-node deploys so POST /
+    daemon-heartbeat-pop / daemon-report / UI poll agree on one lifecycle).
+    Lifecycle: `pending` (enqueued, not yet claimed by the daemon's next
+    heartbeat) -> `running` (claimed; the daemon is executing the update)
+    -> one of `completed` / `failed` / `timeout` (terminal). A pending
+    request left unclaimed for 120s, or a running one left unreported for
+    150s, is transitioned to `timeout` the next time it is read (lazily, on
+    `Get`/`HasPending`/`PopPending` — not by a background sweep). Records
+    are retained 5 minutes after creation regardless of terminal state.
+  required: [id, runtime_id, status, target_version, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      description: Opaque 32-character lowercase-hex id (`randomID()`), not a UUID.
+    runtime_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+      enum: [pending, running, completed, failed, timeout]
+    target_version:
+      type: string
+    output:
+      type: string
+      description: Present once `completed`; the daemon-reported update output.
+    error:
+      type: string
+      description: Present once `failed` or `timeout`.
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+RuntimeModelThinking:
+  type: object
+  description: >-
+    server/internal/handler/runtime_models.go:132-135 (`ModelThinking`).
+    Per-model reasoning-effort catalog discovered by the daemon
+    (claude, codex — MUL-2339). Absent on older daemons (pre-2026-05); the
+    UI then hides the thinking-level selector and the agent runs with the
+    runtime default.
+  required: [supported_levels]
+  properties:
+    supported_levels:
+      type: array
+      items:
+        $ref: '#/components/schemas/RuntimeThinkingLevel'
+    default_level:
+      type: string
+
+RuntimeThinkingLevel:
+  type: object
+  description: server/internal/handler/runtime_models.go:142-146 (`ThinkingLevel`). One entry in a model's reasoning-effort catalog.
+  required: [value, label]
+  properties:
+    value:
+      type: string
+      description: Literal token the daemon passes through to the underlying CLI.
+    label:
+      type: string
+    description:
+      type: string
+
+RuntimeModelServiceTier:
+  type: object
+  description: server/internal/handler/runtime_models.go:123-127 (`ModelServiceTier`).
+  required: [id, name]
+  properties:
+    id: { type: string }
+    name: { type: string }
+    description: { type: string }
+
+RuntimeModelEntry:
+  type: object
+  description: >-
+    server/internal/handler/runtime_models.go:97-105 (`ModelEntry`). A
+    selectable model. Every entry here is runnable; a model the runtime
+    named but will not run lives separately in
+    `RuntimeUnavailableModelEntry` and the two lists are disjoint by
+    invariant (older clients that don't know the unavailable list must
+    never be able to render one of its entries as pickable).
+  required: [id, label]
+  properties:
+    id: { type: string }
+    label: { type: string }
+    provider: { type: string }
+    default:
+      type: boolean
+      description: Tags the model the runtime advertises as its own preferred pick (e.g. Claude Code's shipped default).
+    thinking:
+      $ref: '#/components/schemas/RuntimeModelThinking'
+    service_tiers:
+      type: array
+      items:
+        $ref: '#/components/schemas/RuntimeModelServiceTier'
+    supports_explicit_standard_service_tier:
+      type: boolean
+
+RuntimeUnavailableModelEntry:
+  type: object
+  description: >-
+    server/internal/handler/runtime_models.go:107-121
+    (`UnavailableModelEntry`). A model the runtime named but will not run on
+    this host (e.g. Claude Code reporting a model that needs a newer CLI).
+    `reason` is the runtime's own upgrade hint, shown so the gap reads as
+    "your CLI is behind" rather than "Multica does not support this"
+    (MUL-6961). NEVER appears in `models` on the same response — see the
+    invariant on `RuntimeModelEntry`.
+  required: [id, label]
+  properties:
+    id: { type: string }
+    label: { type: string }
+    reason: { type: string }
+
+RuntimeModelListRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime_models.go:59-81 (`ModelListRequest`).
+    Pending/running/terminal model-discovery request. Lifecycle: `pending`
+    -> `running` -> `completed` | `failed` | `timeout` (same claim/report
+    pattern as `RuntimeUpdateRequest`, with its own thresholds: 30s pending
+    timeout, 60s running timeout, 2-minute store retention). A `completed`
+    response additionally carries `supported: false` for a provider that
+    ignores per-agent model selection entirely (the UI then disables its
+    model dropdown rather than silently accepting a value the backend will
+    drop) and MAY carry `cached: true` + `cached_at` when it was answered
+    from the server-side catalog cache (MUL-5444) instead of a live daemon
+    round trip — in that case `id` is a synthetic, store-backed-by-nothing
+    value since no client ever polls GET .../models/{requestId} for it
+    (status is never pending/running on a cache hit).
+  required: [id, runtime_id, status, supported, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      description: Opaque id (`randomID()` normally; synthetic on a cache-hit response), not guaranteed to be a UUID.
+    runtime_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+      enum: [pending, running, completed, failed, timeout]
+    models:
+      type: array
+      items:
+        $ref: '#/components/schemas/RuntimeModelEntry'
+    unavailable_models:
+      type: array
+      items:
+        $ref: '#/components/schemas/RuntimeUnavailableModelEntry'
+      description: Advisory display copy only — never a source of pickable values. Omitted by older daemons.
+    supported:
+      type: boolean
+    error:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+    cached:
+      type: boolean
+      description: True only on a cache-hit synthetic response; omitted (falsy) otherwise.
+    cached_at:
+      type: string
+      format: date-time
+      description: 'Present only alongside `cached: true`.'
+
+RuntimeLocalMcpServerSummary:
+  type: object
+  description: >-
+    server/internal/handler/runtime_local_skills.go:196-201
+    (`RuntimeLocalMcpServerSummary`). Deliberately non-secret: the daemon
+    reports only the configured server name, transport, and config scope —
+    command arguments, URLs, headers, and environment values never leave
+    the machine.
+  required: [name, enabled]
+  properties:
+    name: { type: string }
+    transport: { type: string }
+    source: { type: string }
+    enabled: { type: boolean }
+
+RuntimeLocalSkillSummary:
+  type: object
+  description: >-
+    server/internal/handler/runtime_local_skills.go:175-191
+    (`RuntimeLocalSkillSummary`). One skill the daemon discovered on the
+    runtime's local filesystem, not yet imported into the workspace.
+  required: [key, name, source_path, provider, file_count]
+  properties:
+    key: { type: string }
+    name: { type: string }
+    description: { type: string }
+    source_path: { type: string }
+    provider: { type: string }
+    root:
+      type: string
+      enum: [provider, universal, plugin]
+      description: >-
+        Discovery root: `provider` (the runtime's own skill directory, e.g.
+        `~/.claude/skills`), `universal` (the cross-tool `~/.agents/skills`
+        fallback), or `plugin` (contributed by an enabled runtime plugin).
+        Omitted (empty) by daemons that predate multi-root discovery — an
+        empty value means "unknown", not an origin to assert.
+    plugin:
+      type: string
+    can_disable:
+      type: boolean
+    file_count:
+      type: integer
+
+RuntimeLocalSkillListRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime_local_skills.go:203-215
+    (`RuntimeLocalSkillListRequest`). Pending/running/terminal
+    local-skill-and-MCP-inventory discovery request. Lifecycle: `pending`
+    -> `running` -> `completed` | `failed` | `timeout` (3-minute pending
+    timeout, 60s running timeout, 5-minute store retention — the pending
+    timeout is wide because old daemons pop only one import per ~15s
+    heartbeat cycle, see maxLocalSkillImportBatch).
+  required: [id, runtime_id, status, supported, mcp_supported, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      description: Opaque 32-character lowercase-hex id (`randomID()`), not a UUID.
+    runtime_id:
+      type: string
+      format: uuid
+    status:
+      type: string
+      enum: [pending, running, completed, failed, timeout]
+      description: >-
+        This request type never reaches `conflict` — that terminal state
+        is specific to `RuntimeLocalSkillImportRequest` below.
+    skills:
+      type: array
+      items:
+        $ref: '#/components/schemas/RuntimeLocalSkillSummary'
+    supported:
+      type: boolean
+    mcp_servers:
+      type: array
+      items:
+        $ref: '#/components/schemas/RuntimeLocalMcpServerSummary'
+    mcp_supported:
+      type: boolean
+    error:
+      type: string
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+CreateRuntimeLocalSkillImportRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime_local_skills.go:508-520
+    (`CreateRuntimeLocalSkillImportRequest`).
+  required: [skill_key]
+  properties:
+    skill_key:
+      type: string
+      description: Must be non-empty after trimming; identifies which locally-discovered skill to import.
+    name:
+      type: string
+      description: Override for the imported skill's name. Blank/whitespace-only is treated as absent.
+    description:
+      type: string
+      description: Override for the imported skill's description. Blank/whitespace-only is treated as absent.
+    action:
+      type: string
+      enum: ['', overwrite]
+      description: >-
+        Omitted / empty string is "create" (default): create a new skill,
+        surfacing a structured `conflict` if the name is already taken.
+        `overwrite` re-imports onto the existing skill named by
+        `target_skill_id` — only that skill's creator may overwrite it
+        (re-verified authoritatively when the daemon's result is reported,
+        not at this enqueue step).
+    target_skill_id:
+      type: string
+      format: uuid
+      description: Required, and validated as a UUID at enqueue time, when `action` is `overwrite`.
+    supports_conflict:
+      type: boolean
+      description: >-
+        Opts the caller into the structured-conflict contract (MUL-2800):
+        a same-name collision terminates the request as `status: conflict`
+        with structured metadata instead of `status: failed` with a plain
+        message. Omit this (older clients) to keep the legacy `failed`
+        behavior. An `overwrite` action implies this contract is active
+        even if the flag itself is omitted.
+
+RuntimeLocalSkillImportConflict:
+  type: object
+  description: >-
+    server/internal/handler/runtime_local_skills.go:51-58
+    (`LocalSkillImportConflict`). Attached to a
+    `RuntimeLocalSkillImportRequest` that terminated in `status: conflict`.
+  required: [existing_skill_id, can_overwrite]
+  properties:
+    existing_skill_id:
+      type: string
+      format: uuid
+    existing_created_by:
+      type: string
+      format: uuid
+      description: Omitted when the existing skill's creator is unset.
+    can_overwrite:
+      type: boolean
+      description: Reflects the creator-only re-import policy — true only when the caller is the existing skill's creator.
+
+RuntimeLocalSkillImportRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime_local_skills.go:217-237
+    (`RuntimeLocalSkillImportRequest`). Pending/running/terminal
+    local-skill-import request. Lifecycle: `pending` -> `running` ->
+    `completed` | `failed` | `timeout` | `conflict` (same timing thresholds
+    as `RuntimeLocalSkillListRequest`). `conflict` is a non-error terminal
+    state reached only when the initiating request set
+    `supports_conflict: true` (directly or implicitly via
+    `action: overwrite`) and a same-name skill already existed; otherwise a
+    same-name collision terminates as `failed` with
+    `"a skill with this name already exists"` instead, for backward
+    compatibility with clients predating MUL-2800.
+  required: [id, runtime_id, skill_key, status, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      description: Opaque 32-character lowercase-hex id (`randomID()`), not a UUID.
+    runtime_id:
+      type: string
+      format: uuid
+    skill_key:
+      type: string
+    name:
+      type: string
+      description: Echo of the request's name override, when provided.
+    description:
+      type: string
+      description: Echo of the request's description override, when provided.
+    action:
+      type: string
+      enum: ['', overwrite]
+    target_skill_id:
+      type: string
+      format: uuid
+      description: Present when `action` is `overwrite`.
+    supports_conflict:
+      type: boolean
+    status:
+      type: string
+      enum: [pending, running, completed, failed, timeout, conflict]
+    skill:
+      description: >-
+        Present once `completed`. Cross-domain reference: the full created/
+        overwritten skill, in the same shape GET/POST skill endpoints
+        return (skills domain schema, not defined in this file).
+      $ref: '#/components/schemas/SkillWithFilesResponse'
+    conflict:
+      $ref: '#/components/schemas/RuntimeLocalSkillImportConflict'
+      description: Present only once `status` is `conflict`.
+    error:
+      type: string
+      description: Present once `failed` or `timeout`.
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+
+UnbindAgentsAndDeleteRuntimeRequest:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:1158-1172
+    (`unbindAgentsAndDeleteRuntimeRequest`). `expected_active_agent_ids` is
+    the active-agent snapshot the front-end showed the user when the
+    confirmation dialog opened; the server re-lists active agents inside
+    the transaction and compares against this set, refusing with
+    `runtime_delete_plan_changed` if anything moved between dialog-open and
+    confirm (e.g. a teammate added or archived an agent on this runtime in
+    that window). Deliberately still scoped to "active agents on this
+    runtime" rather than widened — installed clients send exactly that
+    shape, and widening it would make every older client's request
+    mismatch and 409 forever.
+  properties:
+    expected_active_agent_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+      description: >-
+        May be omitted or empty — an empty set is a valid, meaningful plan
+        ("I confirmed there are no active agents"). Any entry that is not a
+        parseable UUID fails the whole request with 400, rather than
+        silently matching a different set.
+
+UnbindAgentsAndDeleteRuntimeResponse:
+  type: object
+  description: server/internal/handler/runtime.go:1343-1352. Success body for both the current and legacy (archive-agents-and-delete) routes.
+  required: [status, agents_unbound, tasks_cancelled, autopilots_paused, agents_archived]
+  properties:
+    status:
+      type: string
+      const: ok
+    agents_unbound:
+      type: integer
+      description: Count of user agents unbound from the runtime (they keep their configuration/chats and need a new runtime to run again).
+    tasks_cancelled:
+      type: integer
+    autopilots_paused:
+      type: integer
+    agents_archived:
+      type: integer
+      description: >-
+        Deprecated mirror of `agents_unbound`, kept for installed clients
+        built against the pre-MUL-5559 archive-and-delete contract. Same
+        count, same set of agents — they are no longer archived, only
+        unbound.
+
+RuntimeHasActiveAgentsResponse:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:1134-1156
+    (`runtimeHasActiveAgentsResponse`). Shared 409 body shape for two
+    distinct situations, distinguished by `code`: the strict DELETE's
+    initial refusal (`runtime_has_active_agents`), and the confirmed
+    cascade endpoint discovering the active-agent set changed since the
+    user's dialog snapshot (`runtime_delete_plan_changed`). NOT modeled via
+    the shared `ErrorCode` schema: both `code` values are genuinely absent
+    from that schema's enum (flagged in this ticket's final report) and
+    this shape additionally carries `active_agents`, which `ErrorCode` does
+    not have room for.
+  required: [error, code, active_agents]
+  properties:
+    error:
+      type: string
+      enum:
+        - 'cannot delete runtime: it has active agents bound to it. Reassign them or confirm unbinding them first.'
+        - 'the active agent set changed; please review and confirm again.'
+    code:
+      type: string
+      enum: [runtime_has_active_agents, runtime_delete_plan_changed]
+    active_agents:
+      type: array
+      items:
+        description: Cross-domain reference (agents domain schema, not defined in this file).
+        $ref: '#/components/schemas/AgentResponse'
+
+RuntimeDeleteConflict:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:1088-1105 (DeleteAgentRuntime) and
+    :1306-1314 (UnbindAgentsAndDeleteRuntime). Plain `{error, code}` 409
+    bodies for teardown-transaction failures that are not the active-agent
+    case above. `runtime_delete_not_drained` can be written by either
+    operation; `runtime_delete_workspace_mismatch` is only reachable from
+    the strict DELETE (its teardown is the only one that re-checks
+    cross-workspace agent bindings before the confirmed cascade's own
+    `TeardownRuntime` call runs). Neither `code` value is in the shared
+    `ErrorCode` schema's enum (flagged in this ticket's final report), so
+    this is a local schema rather than a `$ref`.
+  required: [error, code]
+  properties:
+    error:
+      type: string
+      enum:
+        - 'the runtime still has tasks in flight; retry in a moment.'
+        - 'the runtime has an invalid cross-workspace agent binding.'
+    code:
+      type: string
+      enum: [runtime_delete_not_drained, runtime_delete_workspace_mismatch]
+
+RuntimeProfileInstanceDeleteRefusal:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:717-811
+    (`profileInstanceDeleteRefusal`). 409 body written by both DELETE
+    endpoints when the runtime is still a live instance of a custom
+    `runtime_profile` (its `profile_id` points at a profile row that still
+    exists) — deleting it here would only let this one machine's row get
+    silently recreated by its own daemon, or (for the "delete the whole
+    profile instead" alternative the message warns against) take every
+    other machine registered under that profile down with it. `error` is a
+    composed, situation-dependent English sentence (online runtime / blocker
+    details unknown / blocked by bound agents or undrained tasks / fully
+    reclaimable automatically) — not enumerable as a fixed set of consts,
+    unlike the other conflict schemas in this file. `code` itself IS fixed.
+    Not in the shared `ErrorCode` enum (flagged in this ticket's final
+    report).
+  required:
+    - error
+    - code
+    - profile_id
+    - profile_name
+    - runtime_status
+    - last_seen_at
+    - auto_cleanup_after_days
+  properties:
+    error:
+      type: string
+      description: Composed sentence; see schema description. Always ends with the "deleting the profile instead affects every machine" scope warning.
+    code:
+      type: string
+      const: runtime_profile_instance_delete_unsupported
+    profile_id:
+      type: string
+      format: uuid
+    profile_name:
+      type: string
+    runtime_status:
+      type: string
+    last_seen_at:
+      type: [string, 'null']
+      format: date-time
+    auto_cleanup_after_days:
+      type: integer
+      description: Currently 7 (`service.OfflineRuntimeTTLDays()`), the offline-runtime retention-GC window.
+    active_agent_count:
+      type: integer
+      description: Present only when the blocker read succeeded (`known=true` internally) — absent, not zero, when it failed and the refusal fell back to cautious wording.
+    undrained_task_count:
+      type: integer
+      description: Present only alongside `active_agent_count` (same `known` gate).

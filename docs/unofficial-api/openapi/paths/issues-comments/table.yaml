@@ -1,0 +1,217 @@
+# Issue table query surface (grouping/rows/facets for the table view).
+# Source: server/internal/handler/issue_table_{group,rows,facets,query}.go
+# (baseline revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe). All three
+# operations run inside a REPEATABLE READ READ ONLY snapshot transaction, so
+# a single request's groups/rows/facets are mutually consistent even though
+# the three endpoints are called separately.
+
+/api/issues/table/groups:
+  post:
+    operationId: listIssueTableGroups
+    summary: Compute group headers (with counts) for the issue table view
+    description: >-
+      Body is decoded with unknown-field rejection; it must be exactly one
+      JSON object.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueTableGroupsRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTableGroupsResponse'
+      '400':
+        description: >-
+          Malformed/unknown-field JSON body; `page.limit` out of [1,100];
+          invalid cursor; any issueTableQuerySpec validation failure (bad
+          scope/filters/sort — see the schema descriptions);
+          `group.secondary_values` misuse; `category_format=lifecycle`
+          misuse; `group.kind=none` (not valid for group headers).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        description: Required when scope.kind=my and no user is authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: Cursor does not match this request's query fingerprint or group identity.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CursorQueryMismatchResponse'
+      '422':
+        description: Unsupported group kind/primary/secondary, or an unknown/archived/wrong-type property for group.kind=property.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnsupportedGroupResponse'
+      '500':
+        description: 'Snapshot/query/descriptor failures, or "database is unavailable".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '504':
+        description: The 8-second server-side query budget was exceeded.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryTimeoutResponse'
+
+/api/issues/table/rows:
+  post:
+    operationId: listIssueTableRows
+    summary: Page through issue rows within a (possibly grouped, possibly hierarchical) table view
+    description: >-
+      `group_key` is the opaque key returned by a `/table/groups` descriptor
+      and is required unless `group.kind=none`. `query.sort` is only
+      consumed here (groups/facets ignore it).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueTableRowsRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTableRowsResponse'
+      '400':
+        description: >-
+          Same query/group validation as table/groups, plus:
+          "parent_id requires hierarchy.enabled=true"; "group_key is
+          required"/"group_key must be empty when group.kind=none";
+          "invalid parent_id"; invalid cursor (missing row id, or a
+          sort-value parse failure for the resolved cast type); "invalid
+          query.sort.field"/"invalid query.sort.direction"; an invalid
+          `group_key` for the resolved group predicate (message varies per
+          group kind).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        description: Required when scope.kind=my and no user is authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: Cursor does not match this request's fingerprint, group_key, parent_id, or branch identity.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CursorQueryMismatchResponse'
+      '422':
+        description: Same unsupported-group/property cases as table/groups.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnsupportedGroupResponse'
+      '500':
+        description: 'Snapshot/query/scan/count failures, status-sort or property-sort resolution failures, or "database is unavailable".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '504':
+        description: The 8-second server-side query budget was exceeded.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryTimeoutResponse'
+
+/api/issues/table/facets:
+  post:
+    operationId: listIssueTableFacets
+    summary: Compute per-filter-dimension value counts for the issue table view
+    description: >-
+      Each requested facet's values are computed as if that facet's own
+      filter dimension were disjunctively removed from `query.filters` — "what
+      would you see if you toggled this facet on" — while `total` reflects
+      the original, fully-filtered query.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueTableFacetsRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTableFacetsResponse'
+      '400':
+        description: >-
+          Same query validation as table/groups; "facets must contain
+          between 1 and 32 entries"; "duplicate table facet"; "invalid
+          facets.property_id"; "invalid facets.kind".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        description: Required when scope.kind=my and no user is authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '422':
+        description: Unknown/archived/wrong-type property for a `property` facet.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnsupportedGroupResponse'
+      '500':
+        description: >-
+          Snapshot/batch-query/individual-facet-query/count failures;
+          "failed to resolve agent access" (working_agents facet); or
+          "database is unavailable".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '504':
+        description: The 8-second server-side query budget was exceeded.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryTimeoutResponse'

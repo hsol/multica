@@ -1,0 +1,526 @@
+# Issue CRUD + the top-level list. Source: server/internal/handler/issue.go,
+# issue_move.go (baseline revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+
+/api/issues:
+  get:
+    operationId: listIssues
+    summary: List issues with filters
+    description: >-
+      The table-oriented counterpart to this is POST /api/issues/table/rows;
+      this endpoint is the older, still-primary list surface. `open_only=true`
+      is a special branch that bypasses pagination and returns every
+      non-done/non-cancelled match in one response, with `total` equal to
+      the returned count rather than a true COUNT(*).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: priority
+        in: query
+        schema: {type: string}
+        description: Exact-match filter (not validated against the priority enum).
+      - name: assignee_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: assignee_ids
+        in: query
+        schema: {type: string}
+        description: Comma-separated UUIDs.
+      - name: creator_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: project_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: involves_user_id
+        in: query
+        schema: {type: string, format: uuid}
+      - name: metadata
+        in: query
+        schema: {type: string}
+        description: JSON metadata filter.
+      - name: properties
+        in: query
+        schema: {type: string}
+        description: JSON properties filter.
+      - name: date_field
+        in: query
+        schema: {type: string, enum: [created_at, updated_at]}
+      - name: date_start
+        in: query
+        schema: {type: string, format: date-time}
+      - name: date_end
+        in: query
+        schema: {type: string, format: date-time}
+      - name: open_only
+        in: query
+        schema: {type: boolean}
+        description: Special branch — see summary.
+      - name: limit
+        in: query
+        schema: {type: integer, default: 100, maximum: 100}
+        description: Only used outside open_only.
+      - name: offset
+        in: query
+        schema: {type: integer, default: 0}
+      - name: statuses
+        in: query
+        schema: {type: string}
+        description: Comma-separated. Alias `status` also accepted.
+      - name: status_categories
+        in: query
+        schema: {type: string}
+        description: Comma-separated, expanded via the status catalog. Alias `status_category` also accepted.
+      - name: priorities
+        in: query
+        schema: {type: string}
+        description: Comma-separated; overrides the singular `priority` filter when open_only=false.
+      - name: assignee_types
+        in: query
+        schema: {type: string}
+        description: 'Comma-separated, each one of member|agent|squad.'
+      - name: scheduled
+        in: query
+        schema: {type: boolean}
+        description: Restrict to issues with start_date or due_date set.
+      - name: sort
+        in: query
+        schema: {type: string, default: position}
+      - name: direction
+        in: query
+        schema: {type: string, enum: [asc, desc]}
+      - name: assignee_filters
+        in: query
+        schema: {type: string}
+        description: 'Comma-separated `type:uuid` pairs.'
+      - name: include_no_assignee
+        in: query
+        schema: {type: boolean}
+      - name: creator_filters
+        in: query
+        schema: {type: string}
+        description: 'Comma-separated `type:uuid` pairs.'
+      - name: project_ids
+        in: query
+        schema: {type: string}
+        description: Comma-separated UUIDs.
+      - name: include_no_project
+        in: query
+        schema: {type: boolean}
+      - name: label_ids
+        in: query
+        schema: {type: string}
+        description: Comma-separated UUIDs.
+      - name: ids
+        in: query
+        schema: {type: string}
+        description: >-
+          Comma-separated UUIDs. Presence is checked explicitly: an
+          explicitly-empty `ids=` restricts the result to nothing (not "no
+          filter") — load-bearing for the "agents-working" facet.
+      - name: top_level_only
+        in: query
+        schema: {type: boolean}
+        description: Filters to parent_issue_id IS NULL.
+      - name: q
+        in: query
+        schema: {type: string}
+        description: 'Table-local search: AND of per-word title LIKE, OR bare-number/identifier match. Distinct from GET /api/issues/search''s ranked global search.'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issues, total]
+              properties:
+                issues:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IssueResponse'
+                total:
+                  type: integer
+                  format: int64
+                  description: True COUNT(*) outside open_only; equal to len(issues) when open_only=true.
+      '400':
+        description: >-
+          Invalid `workspace_id`; malformed UUID param (assignee_id,
+          assignee_ids, creator_id, project_id, involves_user_id); malformed
+          metadata/properties filter JSON; malformed date_* combination;
+          "invalid assignee_types"; "invalid sort value"; "invalid direction
+          value"; malformed assignee_filters/creator_filters/project_ids/
+          label_ids/ids.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '500':
+        description: '"failed to list issues"; "failed to resolve status categories"; "failed to resolve sort"; "failed to count issues".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  post:
+    operationId: createIssue
+    summary: Create an issue
+    description: >-
+      Request JSON is decoded with duplicate-key rejection at every nesting
+      level (a repeated object key anywhere in the body is a 400 before
+      normal field validation runs).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateIssueRequest'
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueResponse'
+      '400':
+        description: >-
+          "invalid request body" (decode/duplicate-key failure); "title is
+          required"; invalid `workspace_id`; invalid status/priority (with
+          allowed-values list); "stage must be >= 1"; malformed
+          assignee_id/parent_issue_id/project_id/attachment_ids/label_ids;
+          "parent issue not found in this workspace"; assignee-pair
+          validation failures; invalid start_date/due_date format;
+          "origin_type and origin_id must be provided together";
+          "unsupported origin_type"; "project not found in this workspace";
+          "one or more labels not found in this workspace".
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/InvalidIssuePropertyResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '402':
+        description: Workspace issue-count limit reached.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueLimitReachedResponse'
+      '403':
+        description: Assignee-pair permission denied.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '409':
+        description: >-
+          An active duplicate issue already exists (suppressible with
+          `allow_duplicate`), or the target status was archived while the
+          request was in flight.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ActiveDuplicateIssueResponse'
+                - $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to create issue: <err>".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}:
+  get:
+    operationId: getIssue
+    summary: Get a single issue
+    description: The only endpoint in this domain that populates `source_context` (when the issue has one).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: >-
+          OK. Unlike list endpoints, this is the one place `source_context`
+          is populated (when present).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueResponse'
+      '400':
+        description: '"workspace_id is required".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to load issue source context" (any error other than "no rows found" while loading source_context).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  put:
+    operationId: updateIssue
+    summary: Update an issue
+    description: >-
+      Every nullable field distinguishes "absent" (leave unchanged) from
+      explicit JSON `null` (clear) by inspecting the raw request body, not
+      just the decoded Go value.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UpdateIssueRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueResponse'
+      '400':
+        description: >-
+          "failed to read request body"/"invalid request body"; `issue_in_triage`
+          code when parent_issue_id is touched on a triage-locked issue;
+          duplicate-mark validation failures (null value, self-duplicate,
+          non-cancelled-status conflict, combined with
+          description/attachments); "expected_revision must be a positive
+          integer"; invalid status/priority; malformed assignee_id;
+          malformed start_date/due_date; "an issue cannot be its own
+          parent"; "parent issue not found in this workspace"; "circular
+          parent relationship detected"; malformed parent/project UUID;
+          "project not found in this workspace"; "stage must be >= 1";
+          assignee-pair validation failures; malformed attachment_ids.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: Assignee-pair permission denied.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '409':
+        description: >-
+          Revision mismatch (expected_revision doesn't match, including a
+          race lost between load and write); the duplicate-mark target not
+          found / is itself a duplicate / has duplicates pointing at it;
+          title_base mismatch under lock; or the target status was archived
+          mid-flight.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RevisionConflict'
+                - $ref: '#/components/schemas/EditConflict'
+                - $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to update issue: <err>".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: deleteIssue
+    summary: Delete an issue
+    description: >-
+      Cancels all tasks for the issue, fails linked autopilot runs, detaches
+      (does not cascade-delete) direct children, clears duplicate marks
+      pointing at it, and deletes associated S3 objects.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '204':
+        description: Deleted — no body.
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to delete issue".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/children:
+  get:
+    operationId: listChildIssues
+    summary: List an issue's direct children
+    description: Direct children only — does not recurse into grandchildren.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issues]
+              properties:
+                issues:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IssueResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list child issues".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/move:
+  post:
+    operationId: moveIssue
+    summary: Reposition an issue relative to anchors, optionally with other field changes
+    description: >-
+      Computes a new `position` from `before_id`/`after_id` and forwards the
+      request (status/assignee/parent/project/expected_revision passed
+      through unmodified, position substituted) to the PUT /api/issues/{id}
+      write path — so that endpoint's own validation, response shape and
+      error surface apply here too, on top of the move-specific errors
+      below. Not transactional with the anchor resolution: stale/reordered
+      anchors are only caught at write time via the position-derivation
+      checks.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MoveIssueInput'
+    responses:
+      '200':
+        description: OK — same shape as PUT /api/issues/{id}.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueResponse'
+      '400':
+        description: >-
+          "failed to read request body"/"invalid request body";
+          "unsupported move field: <field>"; "before_id is required";
+          "after_id is required"; "before_id/after_id must be a UUID or
+          null"; "invalid before_id"/"invalid after_id"; "before_id cannot be
+          the moved issue"; "after_id cannot be the moved issue"; "move
+          anchors must be distinct"; "project not found in this workspace";
+          "move anchor not found in this workspace"; plus any error from the
+          delegated UpdateIssue write.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '409':
+        description: '"move anchors are stale or out of order"; "move anchors are too close; refresh and retry"; "move position is out of range"; or any 409 from the delegated UpdateIssue write (revision/edit conflict).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/IssueMoveStaleAnchorsResponse'
+                - $ref: '#/components/schemas/RevisionConflict'
+                - $ref: '#/components/schemas/EditConflict'
+      '500':
+        description: '"failed to encode move"; or any 500 from the project-exists/anchor-position lookups or the delegated UpdateIssue write.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '504':
+        description: Server-side query timeout on the project-exists or anchor-position lookup.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryTimeoutResponse'

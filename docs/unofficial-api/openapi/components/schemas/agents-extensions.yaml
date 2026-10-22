@@ -1,0 +1,428 @@
+# Schemas for the "agent extensions" domain: agent-builder
+# sessions, per-agent env, the runtime-local skill toggle, an agent's own
+# skill bindings, agent-scoped MCP server bindings, and Mika provisioning.
+# Paired with openapi/paths/agents/agent-extensions.yaml. Source baseline
+# revision: see openapi/openapi.yaml's info.description.
+#
+# Cross-domain dependency note (flagged for the orchestrator, not guessed
+# around): operations in the paired path file also reference
+# `#/components/schemas/AgentResponse` (expected from the concurrent
+# paths/agents/core.yaml ticket), `#/components/schemas/SkillSummaryResponse`
+# and `#/components/schemas/LabelResponse` (expected from the concurrent
+# paths/skills.yaml ticket), and `#/components/schemas/ChatSessionResponse`
+# (expected from the not-yet-split autopilots-chat-inbox domain, which owns
+# server/internal/handler/chat.go). None of those three are defined here or
+# anywhere in this snapshot yet — this file does not redefine them, per the
+# "don't touch another domain's schemas" rule, but the merge will only
+# resolve cleanly once those sibling tickets land matching names.
+#
+# WorkspaceMcpServerResponse below is a deliberate exception: it is the exact
+# wire shape server/internal/handler/workspace_mcp_api.go uses for BOTH the
+# four agent-scoped endpoints in this ticket's scope AND the out-of-scope
+# workspace-level MCP server library CRUD (ListWorkspaceMcpServers /
+# CreateWorkspaceMcpServer / UpdateWorkspaceMcpServer /
+# DeleteWorkspaceMcpServer) that belongs to a different, not-yet-written
+# domain file. No other file in this snapshot defines it, so it is defined
+# here to keep this ticket's responses fully specified; flagged for the
+# orchestrator to reconcile (dedupe or rename) against whichever domain
+# documents the workspace-level library, since scripts/merge.mjs hard-errors
+# on a duplicate component key.
+
+# --- Agent Builder sessions (server/internal/handler/agent_builder.go) ---
+
+CreateAgentBuilderSessionRequest:
+  type: object
+  description: Request for POST /api/agent-builder/sessions.
+  required: [runtime_id]
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+      description: Runtime the builder conversation executes on. Whitespace-trimmed; empty after trim is rejected.
+    model:
+      type: string
+      description: Optional runtime model id for the builder carrier. Empty means "whatever the runtime defaults to".
+  additionalProperties: false
+
+CreateAgentBuilderSessionResponse:
+  type: object
+  description: Response for POST /api/agent-builder/sessions.
+  required: [session_id, builder_agent_id, runtime_id]
+  properties:
+    session_id:
+      type: string
+      format: uuid
+    builder_agent_id:
+      type: string
+      format: uuid
+      description: The hidden `kind=system` carrier agent backing this conversation. Never appears in normal agent lists and cannot be selected as an assignee.
+    runtime_id:
+      type: string
+      format: uuid
+  additionalProperties: false
+
+AgentBuilderSessionSummary:
+  type: object
+  description: >-
+    One unfinished agent-creation conversation, as returned by GET
+    /api/agent-builder/sessions.
+  required:
+    - session_id
+    - title
+    - runtime_id
+    - created_at
+    - updated_at
+    - last_message_content
+    - last_message_role
+    - last_message_at
+  properties:
+    session_id:
+      type: string
+      format: uuid
+    title:
+      type: string
+    runtime_id:
+      type: string
+      format: uuid
+      description: >-
+        The carrier's current runtime. Client runtime pickers seed from this
+        field so the picker can never disagree with what answers the next
+        message (MUL-5163).
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+    last_message_content:
+      type: string
+      description: >-
+        The raw stored message, still in the builder's wire protocol — the
+        user side is a JSON envelope, the assistant side carries an
+        `<agent_draft>` block. Decoding is the client's job; the protocol is
+        owned by the agent-builder studio prompt, not this API.
+    last_message_role:
+      type: string
+    last_message_at:
+      type: string
+      format: date-time
+    draft:
+      description: >-
+        The stored configuration (opaque to the server; see migration 252).
+        Ships with the list rather than behind its own fetch because the
+        studio renders this list beside the conversation it switches
+        between. Absent when the conversation has only ever been driven by
+        the AI — the client then replays the last `<agent_draft>` block
+        instead.
+      type: object
+      additionalProperties: true
+  additionalProperties: false
+
+ListAgentBuilderSessionsResponse:
+  type: object
+  description: Response for GET /api/agent-builder/sessions.
+  required: [sessions]
+  properties:
+    sessions:
+      type: array
+      items:
+        $ref: '#/components/schemas/AgentBuilderSessionSummary'
+  additionalProperties: false
+
+SwitchAgentBuilderRuntimeRequest:
+  type: object
+  description: Request for PATCH /api/agent-builder/sessions/{sessionId}/runtime.
+  required: [runtime_id]
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+      description: Whitespace-trimmed; empty after trim is rejected.
+  additionalProperties: false
+
+SwitchAgentBuilderRuntimeResponse:
+  type: object
+  description: >-
+    Response for PATCH /api/agent-builder/sessions/{sessionId}/runtime. The
+    carrier's model is cleared on rebind (model ids are per-runtime) — the
+    new runtime resolves its own default; the response does not echo a model.
+  required: [runtime_id]
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+  additionalProperties: false
+
+SaveAgentBuilderDraftRequest:
+  type: object
+  description: >-
+    Request for PUT /api/agent-builder/sessions/{sessionId}/draft. The
+    studio's AgentDraft shape, opaque to the server (see migration 252) — no
+    field is read server-side. Whole-object last-write-wins: a conversation
+    has one editor on one screen, so a field-level merge could only
+    reconstruct a state the user never saw.
+  required: [draft]
+  properties:
+    draft:
+      description: >-
+        Must be non-empty and valid JSON; the raw bytes are capped at 256
+        KiB (`maxAgentBuilderDraftBytes`) — well above the create API's own
+        instruction-length cap, so the limit exists only to bound a
+        misbehaving client, not to constrain a legitimate draft.
+      type: object
+      additionalProperties: true
+  additionalProperties: false
+
+# --- Agent env (server/internal/handler/agent_env.go) ---
+
+AgentEnvResponse:
+  type: object
+  description: >-
+    Response for GET and PUT /api/agents/{id}/env. Deliberately distinct
+    from the generic Agent resource schema (`AgentResponse`) so secrets
+    cannot leak back into it by accident. Plaintext values are returned as
+    stored — NOT masked with the `****` sentinel in either the GET or the
+    PUT response; the sentinel is an input-only convention (see
+    UpdateAgentEnvRequest).
+  required: [agent_id, custom_env]
+  properties:
+    agent_id:
+      type: string
+      format: uuid
+    custom_env:
+      type: object
+      additionalProperties:
+        type: string
+      description: Never null — an agent with no custom env returns `{}`.
+  additionalProperties: false
+
+UpdateAgentEnvRequest:
+  type: object
+  description: >-
+    Request for PUT /api/agents/{id}/env. Whole-map replace, with one
+    per-key escape hatch: a value equal to the literal string `****`
+    (`envSentinel`) means "keep the existing value for this key" rather than
+    "set the value to four asterisks" — protects a UI that fetches a
+    partially-revealed map and PUTs it straight back from clobbering real
+    secrets with the literal mask. A `****` for a key that does not already
+    exist is silently dropped (the literal is never persisted). Omitting a
+    previously-set key removes it.
+  required: [custom_env]
+  properties:
+    custom_env:
+      type: object
+      additionalProperties:
+        type: string
+      description: 'A JSON `null` is treated the same as `{}` (clears every key).'
+      nullable: true
+  additionalProperties: false
+
+# --- Agent runtime-local skill toggle (server/internal/handler/agent_runtime_skills.go) ---
+
+SetAgentRuntimeSkillEnabledRequest:
+  type: object
+  description: >-
+    Request for PUT /api/agents/{id}/runtime-skills/enabled. Identifies one
+    skill discovered from the agent's CURRENTLY assigned local runtime — not
+    a workspace Skill resource (see SetAgentSkillsRequest for that). Only
+    `codex` and `claude` local runtimes support this control.
+  required: [runtime_id, root, key, enabled]
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+      description: Must equal the agent's current `runtime_id` (both on the pre-lock read and again under a row lock) or the request is rejected as stale.
+    root:
+      type: string
+      enum: [provider, universal, plugin]
+      description: '`plugin` is only valid when the runtime''s provider is `claude`; `provider`/`universal` clear any supplied `plugin`.'
+    key:
+      type: string
+      maxLength: 512
+      description: >-
+        A relative path, cleaned and slash-normalized server-side
+        (`filepath.Clean`). Rejected if it is `.`, `..`, absolute, or starts
+        with `../` — directory traversal is not representable.
+    name:
+      type: string
+      maxLength: 512
+      description: Display name, stored alongside the disable entry for UI convenience. Not identity-bearing (root/key/plugin/runtime_id/provider are).
+    plugin:
+      type: string
+      description: Required (non-empty) when `root` is `plugin`; ignored and cleared otherwise.
+    enabled:
+      type: boolean
+      description: '`false` adds this skill to the agent''s `disabled_runtime_skills` list (opt-out); `true` removes any existing entry for it (the default, opt-in state).'
+  additionalProperties: false
+
+# --- Mika (server/internal/handler/mika_agent.go) ---
+
+CreateMikaAgentRequest:
+  type: object
+  description: >-
+    Request for POST /api/agents/mika. The caller supplies only a runtime
+    and a language — `kind` and `system_key` are server-owned constants, so
+    no client input can forge Mika's identity or the one-per-workspace
+    invariant.
+  required: [runtime_id, language]
+  properties:
+    runtime_id:
+      type: string
+      format: uuid
+    language:
+      type: string
+      enum: [en, zh, ko, ja]
+      description: Selects Mika's stored (owner-editable) `description` at creation time only; ignored on an idempotent repeat call that returns the existing agent.
+    model:
+      type: string
+      description: Optional runtime model id. Empty means the runtime's default.
+    session_title:
+      type: string
+      description: >-
+        Names the onboarding conversation ONLY when this call is the one
+        that creates it (first call for this (workspace, member) pair).
+        The session's identity is (workspace, member, Mika), so a different
+        title on a later call reuses the existing session instead of
+        renaming or duplicating it.
+  additionalProperties: false
+
+MikaAgentResponse:
+  type: object
+  description: >-
+    Response for POST /api/agents/mika: the agent plus the caller's
+    onboarding conversation, returned together because both are produced
+    atomically and every caller needs both.
+  allOf:
+    - $ref: '#/components/schemas/AgentResponse'
+    - type: object
+      properties:
+        onboarding_session:
+          type: object
+          description: >-
+            Shape not documented here: it is the same chat-session response
+            used by the chat/inbox domain, which is a different, not-yet-landed
+            ticket (see this file's header). Left as an untyped object rather
+            than guessing its fields or `$ref`-ing a schema that does not
+            exist yet; replace with `$ref: '#/components/schemas/ChatSessionResponse'`
+            once that domain defines it.
+      description: >-
+        Always present on a 2xx response (absent only if the type were
+        constructed without it, which the handler never does) — the field
+        is `omitempty` only to protect a future caller of the struct, not
+        because this endpoint ever omits it.
+
+# --- Agent skill bindings (server/internal/handler/skill.go, agent-skill junction) ---
+
+SetAgentSkillsRequest:
+  type: object
+  description: >-
+    Request for PUT /api/agents/{id}/skills. Full replace: every skill_id
+    not in this list is unassigned, inside one transaction
+    (RemoveAllAgentSkills then re-add). An empty `skill_ids` clears every
+    binding.
+  required: [skill_ids]
+  properties:
+    skill_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+      description: Every id must resolve to a Skill in the agent's own workspace (checked before any write); duplicates are de-duplicated before validation.
+  additionalProperties: false
+
+AddAgentSkillsRequest:
+  type: object
+  description: >-
+    Request for POST /api/agents/{id}/skills/add. Additive only — existing
+    bindings this agent already has are left untouched; re-adding an
+    already-bound skill is a harmless no-op (`AddAgentSkill` has no
+    uniqueness conflict handling visible at this layer, but the junction
+    table's primary key makes a repeat insert fail — see the 500 branch
+    below, which is the one surprising edge this endpoint has relative to
+    its additive framing).
+  required: [skill_ids]
+  properties:
+    skill_ids:
+      type: array
+      items:
+        type: string
+        format: uuid
+      description: Every id must resolve to a Skill in the agent's own workspace.
+  additionalProperties: false
+
+# --- Agent MCP server bindings (server/internal/handler/workspace_mcp_api.go) ---
+#
+# WorkspaceMcpServerResponse: see the file-level comment above for why this
+# is defined here rather than deferred to another domain.
+
+WorkspaceMcpServerResponse:
+  type: object
+  description: >-
+    The intentionally non-secret shape of one workspace MCP server library
+    entry. Deliberately excludes `url` / `command` / `args` / `headers` /
+    `env` — any of those routinely carries a bearer credential (even a
+    Composio-style session URL is one on its own) — mirroring the daemon's
+    own redaction line for the same reason.
+  required: [id, workspace_id, name, transport, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+    workspace_id:
+      type: string
+      format: uuid
+    name:
+      type: string
+    transport:
+      type: string
+      description: >-
+        One of `stdio` / `http` derived from an explicit or inferred
+        `type`/`command`/`url` in the stored config, `unknown` if neither is
+        present or the config is unparseable, or — for an explicit `type`
+        this server does not recognise (e.g. `sse`, or a future client's
+        invention) — that value passed through verbatim rather than
+        collapsed to `http`/`stdio`. Never reconstructed lossily: an
+        unrecognised explicit type would otherwise round-trip through a form
+        that silently rewrites the entry to a different protocol.
+    enabled:
+      type: boolean
+      nullable: true
+      description: >-
+        Only meaningful (and only present) on the agent-scoped responses
+        this ticket covers — reflects this binding's toggle. Omitted by the
+        workspace-level library listing (out of this ticket's scope), which
+        describes the entry itself, not an assignment.
+    agent_count:
+      type: integer
+      format: int64
+      nullable: true
+      description: >-
+        How many live (non-archived) agents this entry is assigned to. Only
+        the out-of-scope workspace library listing populates this; every
+        agent-scoped response in this ticket omits it.
+    created_at:
+      type: string
+      format: date-time
+    updated_at:
+      type: string
+      format: date-time
+  additionalProperties: false
+
+AddAgentMcpServerRequest:
+  type: object
+  description: Request for POST /api/agents/{id}/mcp-servers. Names an existing workspace MCP library entry to attach — this is the only way a library entry reaches an agent.
+  required: [server_id]
+  properties:
+    server_id:
+      type: string
+      format: uuid
+  additionalProperties: false
+
+SetAgentMcpServerEnabledRequest:
+  type: object
+  description: Request for PUT /api/agents/{id}/mcp-servers/{serverId}/enabled. Flips the binding's toggle without dropping it.
+  required: [enabled]
+  properties:
+    enabled:
+      type: boolean
+  additionalProperties: false

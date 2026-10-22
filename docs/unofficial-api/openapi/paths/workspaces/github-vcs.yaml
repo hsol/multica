@@ -1,0 +1,375 @@
+# Domain: GitHub integration + self-hosted VCS (Forgejo/Gitea/GitLab).
+# Source: server/internal/handler/github.go, vcs.go, router.go:1692-1801.
+
+/api/workspaces/{id}/github/installations:
+  get:
+    operationId: listGitHubInstallations
+    summary: List the workspace's GitHub App installations
+    description: >-
+      github.go:715-743 (`ListGitHubInstallations`). Member-visible so the
+      Integrations tab renders for non-admins; for a plain member
+      `installation_id` is stripped to `null` and a `can_manage` hint is
+      added so the UI can gate connect/disconnect affordances.
+    tags: [Workspaces, GitHub]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [installations, configured, repository_browse_configured, can_manage]
+              properties:
+                installations: {type: array, items: {$ref: '#/components/schemas/GitHubInstallationResponse'}}
+                configured: {type: boolean}
+                repository_browse_configured: {type: boolean}
+                can_manage: {type: boolean}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list installations"}
+
+/api/workspaces/{id}/github/connect:
+  get:
+    operationId: gitHubConnect
+    summary: Get the GitHub App installation/setup URL
+    description: >-
+      github.go:465-494 (`GitHubConnect`). Requires `owner` or `admin`.
+      Always answers 200 with a JSON URL for the client to navigate to
+      itself — NOT a 302 redirect (the actual OAuth/App-setup redirect is a
+      separate, out-of-scope callback route).
+    tags: [Workspaces, GitHub]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: return_to
+        in: query
+        required: false
+        schema: {type: string, enum: [github, repositories], default: github}
+    responses:
+      '200':
+        description: "OK (`url` is empty string and `configured: false` when the GitHub App is not configured on this deployment)."
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GitHubConnectResponse'}
+      '400':
+        description: Invalid workspace id, or invalid `return_to` value.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidId: {value: {error: "invalid workspace id"}}
+              invalidReturnTo: {value: {error: "invalid return target"}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Signing the OAuth state failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to sign state"}
+
+/api/workspaces/{id}/github/installations/{installationId}/repositories:
+  get:
+    operationId: listGitHubInstallationRepositories
+    summary: Browse an installation's accessible repositories
+    description: >-
+      github.go:750-798 (`ListGitHubInstallationRepositories`). Requires
+      `owner` or `admin`. Mints a short-lived, `metadata:read`-scoped
+      installation token for the browse call and discards it immediately
+      after.
+    tags: [Workspaces, GitHub]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: page
+        in: query
+        required: false
+        schema: {type: integer, default: 1, minimum: 1, maximum: 100000}
+      - name: per_page
+        in: query
+        required: false
+        schema: {type: integer, default: 100, minimum: 1, maximum: 100}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GitHubRepositoriesResponse'}
+      '400':
+        description: Invalid workspace/installation id, or `page`/`per_page` out of range.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin, or repository browsing is not configured on this deployment.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "GitHub repository browsing is not configured", code: github_repository_browsing_not_configured}
+      '404':
+        description: No GitHub installation with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "github installation not found"}
+      '500':
+        description: Loading the installation row failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to load github installation"}
+      '502':
+        description: The GitHub API call itself failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list github repositories"}
+
+/api/workspaces/{id}/github/installations/{installationId}:
+  delete:
+    operationId: deleteGitHubInstallation
+    summary: Disconnect a GitHub App installation
+    description: >-
+      github.go:941-963 (`DeleteGitHubInstallation`). Requires `owner` or
+      `admin`. Broadcasts `EventGitHubInstallationDeleted` on success.
+      UNCONFIRMED whether deleting an id that does not exist (or belongs to
+      another workspace) is still answered with 204 — the delete query's
+      affected-row handling was not independently re-verified in this pass.
+    tags: [Workspaces, GitHub]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Disconnected.
+      '400':
+        description: Invalid workspace id or installation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Delete failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to remove installation"}
+
+/api/workspaces/{id}/vcs/connections:
+  get:
+    operationId: listVCSConnections
+    summary: List the workspace's self-hosted VCS connections
+    description: >-
+      vcs.go:110-148 (`ListVCSConnections`). Member-visible. On a deployment
+      where the self-hosted VCS feature is off entirely
+      (`h.cfg.VCSIntegrationEnabled == false`), answers 200 immediately with
+      an empty list and `available: false` rather than an error — this is a
+      product boundary distinct from `configured` (encryption key present).
+    tags: [Workspaces, VCS]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connections, available, configured, can_manage]
+              properties:
+                connections: {type: array, items: {$ref: '#/components/schemas/VCSConnectionResponse'}}
+                available: {type: boolean, description: "False when this deployment does not offer self-hosted VCS at all."}
+                configured: {type: boolean, description: "Whether the at-rest secret-encryption key is set."}
+                can_manage: {type: boolean}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list connections"}
+  post:
+    operationId: connectVCS
+    summary: Connect a self-hosted VCS instance (Forgejo/Gitea/GitLab)
+    description: >-
+      vcs.go:160-253 (`ConnectVCS`). Requires `owner` or `admin`. Validates
+      the instance URL + access token against the live provider, mints a
+      webhook secret, encrypts and stores both secrets; reconnecting the same
+      instance ROTATES the webhook secret via upsert.
+    tags: [Workspaces, VCS]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ConnectVCSRequest'}
+    responses:
+      '200':
+        description: Connected (or reconnected — the webhook secret is rotated either way).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/VCSConnectResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, unsupported provider, missing instance_url/access_token, non-absolute-http(s) instance_url, or the provider rejected the access token.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              unsupported: {value: {error: "unsupported provider"}}
+              missing: {value: {error: "instance_url and access_token are required"}}
+              badUrl: {value: {error: "instance_url must be an absolute http(s) URL"}}
+              rejectedToken: {value: {error: "the provider rejected the access token"}}
+      '403':
+        description: VCS integration not configured (encryption key unset) on this deployment.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "VCS integration is not configured", code: vcs_not_configured}
+      '404':
+        description: VCS integration not available on this deployment (self-host feature off).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "vcs integration is not available on this deployment"}
+      '500':
+        description: Secret generation/encryption/storage step failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '502':
+        description: 'Reaching the instance failed: TLS trust failure, hostname mismatch, certificate validation failure, or another connectivity error (message varies by cause).'
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/vcs/connections/{connectionId}:
+  delete:
+    operationId: deleteVCSConnection
+    summary: Disconnect a self-hosted VCS connection
+    description: >-
+      vcs.go:278-299 (`DeleteVCSConnection`). Requires `owner` or `admin`.
+      UNCONFIRMED: unlike `ConnectVCS`/`RotateVCSConnectionWebhook`, this
+      handler has no `isVCSAvailable`/`isVCSConfigured` check in front of it —
+      deletion appears to be allowed even when the VCS feature is disabled on
+      this deployment, but no comment confirms this is intentional.
+      Broadcasts `EventVCSConnectionDeleted` on success.
+    tags: [Workspaces, VCS]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: connectionId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Disconnected.
+      '400':
+        description: Invalid workspace id or connection id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Delete failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to remove connection"}
+
+/api/workspaces/{id}/vcs/connections/{connectionId}/rotate-webhook:
+  post:
+    operationId: rotateVCSConnectionWebhook
+    summary: Rotate a VCS connection's webhook secret
+    description: >-
+      vcs.go:304-357 (`RotateVCSConnectionWebhook`). Requires `owner` or
+      `admin`. Only the webhook secret changes — the stored access token is
+      untouched. UNCONFIRMED: the handler publishes
+      `EventVCSConnectionCreated` (not a dedicated "rotated" event) on
+      success; no comment explains the reuse.
+    tags: [Workspaces, VCS]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: connectionId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: Rotated — new `webhook_secret` returned in plaintext (one-time).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/VCSConnectResponse'}
+      '400':
+        description: Invalid workspace id or connection id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: VCS integration not configured (encryption key unset).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "VCS integration is not configured", code: vcs_not_configured}
+      '404':
+        description: VCS integration not available on this deployment, or no connection with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              notAvailable: {value: {error: "vcs integration is not available on this deployment"}}
+              notFound: {value: {error: "vcs connection not found"}}
+      '500':
+        description: Secret generation/encryption/update step failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}

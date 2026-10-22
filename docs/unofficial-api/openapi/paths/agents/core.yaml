@@ -1,0 +1,1274 @@
+# Domain: agents core — /api/agents CRUD/lifecycle, agent task
+# history, agent<->label attach/detach, agent DingTalk group presence, the
+# workspace-wide agent/task aggregations, and the two user-facing task
+# endpoints that sit in the same route group. Source:
+# server/internal/handler/agent.go, agent_access.go, dingtalk.go, label.go,
+# activity.go, daemon.go, chat.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+#
+# Every operation in this file sits inside the single `r.Group` wrapped with
+# `middleware.RequireWorkspaceMember(queries)` at
+# server/cmd/server/router.go ~1985-1986 (confirmed: no further
+# RequireHumanActor / RequireWorkspaceRole wraps any of the 19 routes here).
+# That middleware (server/internal/middleware/workspace.go:161-265) is the
+# SAME gate behind every operation below, so its error surface is spelled out
+# once here instead of 19 times:
+#
+#   400 — "workspace_id or workspace_slug is required" (no X-Workspace-ID /
+#         X-Workspace-Slug header and no workspace_id/workspace_slug query
+#         param at all), or "invalid workspace_id" (an identifier was given
+#         but is not a parseable UUID — this is the fallback UUID path; a
+#         bad SLUG resolves to the 404 below instead).
+#   401 — "user not authenticated" (no X-User-ID header reached the
+#         middleware, i.e. the upstream Auth middleware found no valid
+#         credential at all).
+#   403 — "task token is bound to a different workspace" (an AgentTaskToken
+#         (mat_) request's resolved workspace does not match the workspace
+#         the token itself is bound to; MUL-2600). Not reachable for a
+#         PersonalAccessToken / BrowserSession caller.
+#   404 — "workspace not found" (a slug was given but matched no workspace,
+#         OR a workspace id resolved but the caller is not a member of it —
+#         both collapse to the same message/status so membership can't be
+#         probed).
+#
+# Every operation's `parameters`/`security` below additionally reflects this;
+# operation-specific 400/403/404 causes are layered on top where they exist.
+
+/api/agents:
+  get:
+    operationId: listAgents
+    summary: List agents in the workspace
+    description: >-
+      server/internal/handler/agent.go:1114-1225 (`ListAgents`). Every
+      response row passes the same view gate as GetAgent
+      (memberAllowedToViewAgent, agent_access.go:192-203): a regular member
+      sees their own agents, every agent they are workspace owner/admin for,
+      and a public_to agent only when on its invocation allow-list — a
+      private agent owned by someone else is silently dropped from the list
+      rather than erroring. Agent actors (AgentTaskToken callers) bypass this
+      filter entirely to preserve A2A collaboration.
+    tags: [agents]
+    security: &agentsAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters: &wsHeaders
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: include_archived
+        in: query
+        schema: { type: boolean, default: false }
+        description: 'Literal string "true" switches to ListAllAgents (includes archived rows); any other value (including absent) uses ListAgents (active only).'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/AgentResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: >-
+          "failed to list agents"; "failed to load agent runtime
+          availability"; "failed to load agent skills"; "internal error"
+          (GetWorkspace failed while checking the always-redact-secrets
+          setting — written via a raw writeJSON call, same `{"error": ...}`
+          body shape); "failed to load agent invocation targets".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              listFailed: { value: { error: "failed to list agents" } }
+              availabilityFailed: { value: { error: "failed to load agent runtime availability" } }
+              skillsFailed: { value: { error: "failed to load agent skills" } }
+              redactCheckFailed: { value: { error: "internal error" } }
+              targetsFailed: { value: { error: "failed to load agent invocation targets" } }
+  post:
+    operationId: createAgent
+    summary: Create an agent
+    description: >-
+      server/internal/handler/agent.go:1383-1654 (`CreateAgent`). The
+      calling user becomes the agent's owner. Avatar, invocation permission,
+      thinking_level/service_tier, and skill attachment are all validated
+      and written in a single DB transaction with the agent row.
+    tags: [agents]
+    security: *agentsAuth
+    parameters: *wsHeaders
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateAgentRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "invalid
+          request body"; "name is required"; "description must be 255
+          characters or fewer"; "runtime_id is required";
+          conversation_starters validation ("conversation_starters must
+          contain at most 3 items", "conversation_starters[N].label is
+          required", "conversation_starters[N].prompt is required",
+          "conversation_starters[N].label must be 80 characters or fewer",
+          "conversation_starters[N].prompt must be 4000 characters or
+          fewer"); "max_concurrent_tasks must be between 1 and 50"; "invalid
+          runtime_id" (malformed UUID, or it doesn't resolve to a runtime in
+          this workspace); invocation-permission validation ("visibility
+          must be 'private' or 'workspace'", "permission_mode must be
+          'private' or 'public_to'", "member invocation target requires
+          target_id", "member invocation target_id is not a valid uuid",
+          "team invocation target requires target_id", "team invocation
+          target_id is not a valid uuid", "invocation target_type must be
+          'workspace', 'member', or 'team'"); thinking_level rejection
+          (parametrized on provider/value — see
+          agent.go:2413-2469,2531-2543); "service_tier %q is not a
+          recognised value for runtime %q"; thinking-needs-explicit-model
+          rejection (agent.go:2380-2385); "skill does not belong to this
+          workspace"; "invalid skill_ids".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: >-
+          Common workspace-gate 403 (see file header), plus: "this runtime
+          is private; only its owner can create agents on it"
+          (canUseRuntimeForAgent); "avatar_url must reference a standalone
+          image upload, not a file attached to an issue, comment, or chat".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '409':
+        description: 'Unique constraint on (workspace_id, name) — a name already held by an active OR archived agent in this workspace.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: 'an agent named "QA Bot" already exists in this workspace' }
+      '500':
+        description: >-
+          "failed to start agent create transaction"; "failed to create
+          agent: <err>" (any other DB failure); "failed to save agent
+          access"; "failed to attach agent skill"; "failed to commit agent
+          create".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}:
+  get:
+    operationId: getAgent
+    summary: Get a single agent
+    description: >-
+      server/internal/handler/agent.go:1227-1295 (`GetAgent`). The `id` path
+      param is a plain UUID — unlike issues, there is no `PREFIX-NUMBER`
+      resolution for agents (`loadAgentForUser`, handler.go:1186-1219).
+    tags: [agents]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "workspace_id
+          is required" (loadAgentForUser's own check, reached only when the
+          middleware let an edge case through); "invalid agent id"; "invalid
+          workspace id".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: >-
+          Private-agent gate: the caller is not the agent's owner, not a
+          workspace owner/admin, and (for a public_to agent) not on its
+          invocation allow-list (`canAccessPrivateAgent`,
+          agent_access.go:145-167). Lets the front-end render an explicit
+          "no access" placeholder instead of a 404.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you do not have access to this agent" }
+      '404':
+        description: >-
+          Common workspace-gate 404 (see file header), or "agent not found"
+          (id doesn't resolve in this workspace, or resolves to a non-"user"
+          kind agent — e.g. a squad's synthetic row).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: >-
+          "failed to load agent runtime availability"; "internal error"
+          (GetWorkspace failed while checking the always-redact-secrets
+          setting); "failed to load agent skills"; "failed to load agent
+          invocation targets".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  put:
+    operationId: updateAgent
+    summary: Update an agent
+    description: >-
+      server/internal/handler/agent.go:1882-2335 (`UpdateAgent`). Only the
+      agent owner or a workspace owner/admin may call this
+      (`canManageAgent`, agent.go:1867-1880); invocation-permission fields
+      (permission_mode / invocation_targets / visibility) are additionally
+      OWNER-ONLY — see UpdateAgentRequest.
+    tags: [agents]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateAgentRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "workspace_id
+          is required"; "invalid agent id"; "invalid workspace id"; "invalid
+          request body"; "custom_env is no longer accepted on this endpoint;
+          use PUT /api/agents/{id}/env (or `multica agent env set`)" (the
+          field is present at all, any value including null); "description
+          must be 255 characters or fewer"; "invalid runtime_id"; same
+          invocation-permission validation messages as POST /api/agents;
+          "max_concurrent_tasks must be between 1 and 50"; thinking_level /
+          service_tier rejection messages (same parametrized set as POST
+          /api/agents, both for an explicit new value and for an existing
+          value carried over across a runtime change — see
+          agent.go:2064-2196); thinking-needs-explicit-model rejection.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: >-
+          Common workspace-gate 403 (see file header), plus: "only the
+          agent owner can manage this agent" (canManageAgent); "this runtime
+          is private; only its owner can move agents onto it"; "only the
+          agent owner can change access (permission_mode /
+          invocation_targets)" (a non-owner — including an admin — submitted
+          a REAL change to permission_mode/invocation_targets/visibility; a
+          no-op resubmit of the unchanged value is silently tolerated
+          instead, see UpdateAgentRequest).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '409':
+        description: >-
+          Unique constraint on (workspace_id, name) — the name can still be
+          held by an ARCHIVED agent (the constraint does not exclude
+          archived rows), so this is the only signal a rename collided
+          rather than the request failing outright.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: 'an agent named "QA Bot" already exists in this workspace' }
+      '500':
+        description: >-
+          "failed to update agent: <err>"; "failed to clear mcp_config:
+          <err>"; "failed to clear thinking_level: <err>"; "failed to clear
+          service_tier: <err>"; "failed to clear composio_toolkit_allowlist:
+          <err>"; "failed to update invocation targets: <err>"; "failed to
+          load agent invocation targets"; "failed to load agent skills";
+          "failed to resolve runtime for thinking_level validation"; "failed
+          to resolve runtime for service_tier validation".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/archive:
+  post:
+    operationId: archiveAgent
+    summary: Archive an agent
+    description: >-
+      server/internal/handler/agent.go:2545-2601 (`ArchiveAgent`). Same
+      manage gate as UpdateAgent. Cancels every pending/active task for the
+      agent as part of the same operation (best-effort — a cancellation
+      failure is logged but does not fail the archive). No request body.
+    tags: [agents]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "workspace_id
+          is required"; "invalid agent id"; "invalid workspace id"; "this
+          agent is built into Multica and cannot be archived" (a system
+          agent — non-empty system_key).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "only the agent owner can manage this agent".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '409':
+        description: 'The agent is already archived.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent is already archived" }
+      '500':
+        description: '"failed to archive agent"; "failed to load agent skills".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/restore:
+  post:
+    operationId: restoreAgent
+    summary: Restore an archived agent
+    description: server/internal/handler/agent.go:2603-2637 (`RestoreAgent`). Same manage gate as UpdateAgent. No request body.
+    tags: [agents]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header), plus: "workspace_id is required"; "invalid agent id"; "invalid workspace id".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "only the agent owner can manage this agent".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '409':
+        description: 'The agent is not currently archived.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent is not archived" }
+      '500':
+        description: '"failed to restore agent"; "failed to load agent skills".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/cancel-tasks:
+  post:
+    operationId: cancelAgentTasks
+    summary: Bulk-cancel every active task for an agent
+    description: >-
+      server/internal/handler/agent.go:2639-2675 (`CancelAgentTasks`).
+      Cancels every queued/dispatched/running task for the agent; powers the
+      agents-list "Cancel all tasks" row action. Same manage gate as
+      UpdateAgent. A `running` task on the daemon side will not actually
+      halt for up to ~5 seconds (the daemon polls task status on that
+      interval) even though the DB row flips to cancelled immediately — see
+      daemon/daemon.go:919-942. No request body.
+    tags: [tasks]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelAgentTasksResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header), plus: "workspace_id is required"; "invalid agent id"; "invalid workspace id".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "only the agent owner can manage this agent".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to cancel tasks".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/tasks:
+  get:
+    operationId: listAgentTasks
+    summary: List an agent's task run history
+    description: >-
+      server/internal/handler/agent.go:2684-2769 (`ListAgentTasks`). Shares
+      the same private-agent view gate as GetAgent
+      (`canAccessPrivateAgent`) — run history is part of that same "can
+      this caller even see this agent" boundary. Cursor-paginated by
+      (created_at, id) descending; a page beyond the limit is detected by
+      fetching one extra row server-side. This ticket owns the canonical,
+      complete definition of the returned `AgentTaskResponse` schema — see
+      its component description for which fields this endpoint actually
+      populates versus leaves absent (most of the ~100 JSON fields on that
+      struct are claim-only, set only by the unrelated daemon task-claim
+      endpoint).
+    tags: [tasks]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: include_usage
+        in: query
+        schema: { type: string, enum: ["true", "false"], default: "false" }
+        description: >-
+          When "true", hydrates each task's `usage` array from a dedicated
+          per-agent usage query (`hydrateAgentTaskUsage`,
+          daemon.go:5721-5745). Any value other than "true"/"false"/absent
+          is a 400.
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 200, default: 200 }
+        description: >-
+          defaultAgentTasksLimit = maxAgentTasksLimit = 200
+          (agent.go:2681-2682) — NOT the shared LimitParam's 50/200
+          default/max. A value above 200 is silently clamped down (not
+          rejected); a value below 1, or non-integer, is a 400.
+      - name: before
+        in: query
+        schema: { type: string }
+        description: >-
+          Opaque cursor in the form `<RFC3339Nano created_at>|<task uuid>`
+          (`transcriptCursor`/`parseTranscriptCursor`,
+          chat_history.go:159-185), taken from the `X-Agent-Tasks-Next-Cursor`
+          response header of a previous page. NOT the shared NextCursorParam
+          shape used elsewhere in this API (those are endpoint-opaque but
+          differently encoded; do not interchange cursors across
+          endpoints).
+    responses:
+      '200':
+        description: >-
+          OK. When a further page exists, the `X-Agent-Tasks-Next-Cursor`
+          header (HeaderAgentTasksNextCursor, agent.go:2679) carries the
+          cursor for the next `before`; its absence means this is the last
+          page. The body stays a bare JSON array for installed-client
+          compatibility — the cursor travels only on the header, never in
+          the body.
+        headers:
+          X-Agent-Tasks-Next-Cursor:
+            schema: { type: string }
+            description: 'Absent on the last page.'
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/AgentTaskResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "workspace_id
+          is required"; "invalid agent id"; "invalid workspace id";
+          "include_usage must be true or false"; "limit must be a positive
+          integer"; "invalid before cursor".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "you do not have access to this agent" (same private-agent gate as GetAgent).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to list agent tasks"; "failed to list agent task usage" (only reachable with include_usage=true).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/dingtalk/groups:
+  get:
+    operationId: listDingTalkGroupsForAgent
+    summary: List DingTalk groups one agent's bot has been observed in
+    description: >-
+      server/internal/handler/dingtalk.go:247-273 (`ListDingTalkGroupsForAgent`),
+      delegating to the shared `listDingTalkGroups` (dingtalk.go:275-473).
+      Reuses the Agent detail view gate (`canAccessPrivateAgent`): if the
+      caller cannot open this agent, they cannot infer its DingTalk group
+      activity either. When this deployment has no DingTalk integration
+      configured (`h.DingTalkInstall == nil`), responds 200 with an empty
+      result rather than an error.
+    tags: [dingtalk]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: activity
+        in: query
+        schema: { type: string, enum: [inactive] }
+        description: >-
+          Only "inactive" is accepted when present (anything else is a
+          400). Switches from the default "active in the last 90 days"
+          projection to a separate, paginated inactive-groups query scoped
+          to one installation.
+      - name: installation_id
+        in: query
+        schema: { type: string, format: uuid }
+        description: 'Required when activity=inactive (a 400 otherwise); ignored for the default active-groups view.'
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        description: >-
+          Only consulted when activity=inactive (dingTalkInactivePageSize=20
+          default, dingTalkInactiveMaxPage=100 max, dingtalk.go:69-71); a
+          value outside [1, 100] is a 400. Ignored for the default view,
+          which is unpaginated.
+      - name: offset
+        in: query
+        schema: { type: integer, minimum: 0, default: 0 }
+        description: 'Only consulted when activity=inactive; a negative value is a 400.'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ListDingTalkGroupsResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "workspace_id
+          is required"; "invalid agent id"; "invalid workspace id";
+          "activity must be inactive when provided"; "installation_id is
+          required for inactive groups"; "invalid installation_id"; "limit
+          must be between 1 and 100"; "offset must be a non-negative
+          integer".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "you do not have access to this agent" (same private-agent gate as GetAgent).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: >-
+          "failed to authorize dingtalk group installation"; "failed to
+          list dingtalk groups"; "failed to count inactive dingtalk
+          groups"; "failed to list dingtalk bot identities".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/labels:
+  get:
+    operationId: listLabelsForAgent
+    summary: List labels attached to an agent
+    description: server/internal/handler/label.go:576-589 (`ListLabelsForAgent`). No manage gate — any workspace member who can load the agent can read its labels.
+    tags: [labels]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [labels]
+              properties:
+                labels:
+                  type: array
+                  items: { $ref: '#/components/schemas/AgentLabelResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header), plus: "workspace_id is required"; "invalid agent id"; "invalid workspace id".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to list agent labels".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: attachLabelToAgent
+    summary: Attach an existing label to an agent
+    description: >-
+      server/internal/handler/label.go:591-618 (`AttachLabelToAgent`). Same
+      manage gate as UpdateAgent. Responds with the agent's full,
+      freshly-re-listed label set (delegates to ListLabelsForAgent) rather
+      than just the attached label.
+    tags: [labels]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AttachLabelRequest' }
+    responses:
+      '200':
+        description: OK — same shape as GET /api/agents/{id}/labels.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [labels]
+              properties:
+                labels:
+                  type: array
+                  items: { $ref: '#/components/schemas/AgentLabelResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header), plus: "workspace_id is required"; "invalid agent id"; "invalid workspace id"; "label_id is required" (missing/malformed body or empty label_id); "invalid label_id".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "only the agent owner can manage this agent".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: >-
+          Common workspace-gate 404 (see file header), "agent not found", or
+          "agent label not found" (label_id doesn't resolve in this
+          workspace, or resolves to a label whose resource_type is not
+          "agent").
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to attach agent label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/labels/{labelId}:
+  delete:
+    operationId: detachLabelFromAgent
+    summary: Detach a label from an agent
+    description: >-
+      server/internal/handler/label.go:620-637 (`DetachLabelFromAgent`).
+      Same manage gate as UpdateAgent. Idempotent at the DB level (detaching
+      a label that isn't currently attached does not error); responds with
+      the agent's full, freshly-re-listed label set.
+    tags: [labels]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: labelId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK — same shape as GET /api/agents/{id}/labels.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [labels]
+              properties:
+                labels:
+                  type: array
+                  items: { $ref: '#/components/schemas/AgentLabelResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header), plus: "workspace_id is required"; "invalid agent id"; "invalid workspace id"; "invalid label id".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header), or "only the agent owner can manage this agent".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header), or "agent not found".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to detach agent label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agent-activity-30d:
+  get:
+    operationId: getWorkspaceAgentActivity30d
+    summary: Get per-agent daily task activity for the last 30 days
+    description: >-
+      server/internal/handler/agent.go:2964-3009
+      (`GetWorkspaceAgentActivity30d`). Single workspace-wide read backing
+      both the Agents-list sparkline (trailing 7 of the 30 buckets) and the
+      agent detail "Last 30 days" panel — anchored on `completed_at`. Rows
+      for an agent the caller cannot access
+      (`accessibleAgentIDs`, agent_access.go:297+, same visibility rule as
+      ListAgents) are silently dropped, not errored. Empty days are omitted
+      by the server rather than sent as zero-valued buckets.
+    tags: [agents]
+    security: *agentsAuth
+    parameters: *wsHeaders
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/AgentActivityBucket' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to get agent activity"; "failed to resolve agent access".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agent-run-counts:
+  get:
+    operationId: getWorkspaceAgentRunCounts
+    summary: Get 30-day total run counts per agent
+    description: >-
+      server/internal/handler/agent.go:2926-2962
+      (`GetWorkspaceAgentRunCounts`). Backs the Agents-list RUNS column.
+      Same single-fetch pattern and access filtering as
+      GetWorkspaceAgentActivity30d.
+    tags: [agents]
+    security: *agentsAuth
+    parameters: *wsHeaders
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/AgentRunCount' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to get agent run counts"; "failed to resolve agent access".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agent-task-snapshot:
+  get:
+    operationId: listWorkspaceAgentTaskSnapshot
+    summary: Get the workspace-wide active + last-outcome task snapshot
+    description: >-
+      server/internal/handler/agent.go:3011-3053
+      (`ListWorkspaceAgentTaskSnapshot`). Returns two kinds of rows mixed
+      into one array: every currently ACTIVE task
+      (queued/dispatched/running/waiting_local_directory) in the workspace
+      — the presence signal every client derives agent working-state from —
+      plus, per agent, its most recent OUTCOME task (completed/failed
+      only; cancelled is deliberately excluded so a procedural cancel never
+      masks a prior failure). Per-agent filtering (which rows the caller may
+      see at all) happens client-side against this snapshot using the same
+      accessibleAgentIDs visibility as ListAgents; this ticket owns the
+      canonical AgentTaskResponse schema returned here (see that schema's
+      description for which fields this endpoint populates).
+    tags: [tasks]
+    security: *agentsAuth
+    parameters: *wsHeaders
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/AgentTaskResponse' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to list agent task snapshot"; "failed to resolve agent access".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/working-agents:
+  get:
+    operationId: listWorkspaceWorkingAgents
+    summary: List currently-working agents in the workspace
+    description: >-
+      server/internal/handler/agent.go:2804-2924
+      (`ListWorkspaceWorkingAgents`). Independent of issue filters or Table
+      pagination; backs the issues-header "agents working" chip and its
+      assignee-id Table filter. `type` narrows to one work source;
+      `scope=mine` (issue work only) further narrows to the caller's
+      selected My-Issues relation; `parent` narrows to one issue's direct
+      children. Rows for an agent the caller cannot access are silently
+      dropped (same accessibleAgentIDs visibility as ListAgents) — a
+      private/non-allow-listed agent is never exposed by name, avatar,
+      count, or even presence.
+    tags: [agents]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: type
+        in: query
+        schema: { type: string, enum: [issue, autopilot, chat] }
+        description: 'Omitted selects the all-sources projection.'
+      - name: scope
+        in: query
+        schema: { type: string, enum: [mine] }
+        description: 'Only "mine" is accepted when present; requires type=issue (or type omitted — scope=mine itself forces the issue source). Cannot be combined with `parent`.'
+      - name: relation
+        in: query
+        schema: { type: string, enum: [assigned, created, involved, any], default: any }
+        description: 'Only meaningful with scope=mine (a 400 otherwise); defaults to "any" when scope=mine is set but relation is omitted.'
+      - name: parent
+        in: query
+        schema: { type: string, format: uuid }
+        description: 'Narrows to one issue''s direct children. Requires type=issue; cannot be combined with scope. Omitted/absent applies no narrowing (workspace-wide).'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/WorkspaceWorkingAgent' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "invalid type:
+          must be issue, autopilot, or chat"; "relation requires
+          scope=mine"; "scope=mine requires type=issue"; "invalid relation:
+          must be assigned, created, involved, or any"; "invalid scope: must
+          be mine"; "parent requires type=issue"; "parent cannot be combined
+          with scope"; "invalid parent".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: >-
+          Common workspace-gate 401 (see file header), or "user not
+          authenticated" (requireUserID's own check, reached only with
+          scope=mine).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to list workspace working agents"; "failed to resolve agent access".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/assignee-frequency:
+  get:
+    operationId: getAssigneeFrequency
+    summary: Get the caller's assignee-usage frequency
+    description: >-
+      server/internal/handler/activity.go:407-475
+      (`GetAssigneeFrequency`). Scoped to the AUTHENTICATED CALLER only (no
+      way to query another user's frequency): combines how often this user
+      has changed an issue's assignee to each target
+      (assignee_changed activity rows) with how often they created an issue
+      already assigned to that target. Powers assignee-picker "recent /
+      frequent" ordering. No query parameters.
+    tags: [activity]
+    security: *agentsAuth
+    parameters: *wsHeaders
+    responses:
+      '200':
+        description: 'OK. Sorted by frequency descending.'
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/AssigneeFrequencyEntry' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: 'Common workspace-gate 404 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '500':
+        description: '"failed to get assignee frequency".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/tasks/{taskId}/messages:
+  get:
+    operationId: listTaskMessagesByUser
+    summary: List a task's execution messages
+    description: >-
+      server/internal/handler/daemon.go:5783-5851
+      (`ListTaskMessagesByUser`). User-facing (not daemon auth) counterpart
+      to the daemon's own task-message ingest. Verifies the task belongs to
+      the caller's workspace by resolving the task's OWN workspace
+      (`ResolveTaskWorkspaceIDChecked`, which covers issue-linked,
+      chat-linked, and run_only/autopilot-linked tasks alike) and comparing
+      it against the request's resolved workspace — a mismatch is reported
+      as 404, identical to a genuinely nonexistent task, so a task in
+      another workspace cannot be distinguished from one that doesn't
+      exist. Unlike the other operations in this file there is no separate
+      private-agent view gate here — any member of the task's workspace may
+      read its messages.
+    tags: [tasks]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: taskId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: since
+        in: query
+        schema: { type: integer }
+        description: >-
+          Exclusive lower bound on `seq`; when present, uses
+          ListTaskMessagesSince instead of the full ListTaskMessages. A
+          non-integer value is a 400.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/TaskMessagePayload' }
+      '400':
+        description: 'Common workspace-gate 400s (see file header), plus: "invalid task_id"; "invalid since parameter".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: 'Common workspace-gate 403 (see file header).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: >-
+          Common workspace-gate 404 (see file header), or "task not found"
+          (the task id doesn't exist, or its resolved workspace does not
+          match the caller's — the two cases are deliberately
+          indistinguishable).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "task not found" }
+      '500':
+        description: >-
+          "failed to load task" (GetAgentTask failed for a reason other than
+          not-found, or ResolveTaskWorkspaceIDChecked failed); "failed to
+          list task messages".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/tasks/{taskId}/cancel:
+  post:
+    operationId: cancelTaskByUser
+    summary: Cancel a task as its owning user
+    description: >-
+      server/internal/handler/chat.go:1760-1904 (`CancelTaskByUser`).
+      Tenancy is enforced uniformly through the task's owning agent
+      (`GetAgentTaskInWorkspace`) rather than its optional issue/chat/
+      autopilot source FK — this is what makes run_only autopilot tasks and
+      pre-link quick-create tasks (whose issue does not exist yet)
+      cancellable at all (MUL-2827). On top of tenancy, two distinct privacy
+      gates layer on: a CHAT task may only be cancelled by the member who
+      opened that conversation (even though the workspace is shared); every
+      other task (issue / autopilot / quick_create) is gated by the same
+      `canAccessPrivateAgent` check used by the Agent Activity tab and the
+      workspace task snapshot, so cancellation is never more permissive than
+      the surface that exposes the task in the first place. Supports an
+      optional "cancel a still-QUEUED chat task and either restore or
+      discard its pending draft" mode via `expected_status`/
+      `chat_session_id`/`queue_action`.
+    tags: [tasks]
+    security: *agentsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: taskId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: expected_status
+        in: query
+        schema: { type: string, enum: [queued] }
+        description: >-
+          Only "queued" is accepted when present (a 400 otherwise). Switches
+          to the queued-only cancel path, which additionally requires
+          `chat_session_id` and `queue_action`, and fails with 409 instead of
+          succeeding if the task is no longer queued by the time the cancel
+          runs (a dispatch race).
+      - name: chat_session_id
+        in: query
+        schema: { type: string, format: uuid }
+        description: 'Required when expected_status=queued. Must match the task''s own chat_session_id exactly (a 409 on mismatch) — see the 409 response.'
+      - name: queue_action
+        in: query
+        schema: { type: string, enum: [edit, remove] }
+        description: >-
+          Required when expected_status=queued. "edit" tells the response to
+          restore the queued message''s content to the composer
+          (restore_to_input: true); "remove" discards it.
+    responses:
+      '200':
+        description: >-
+          OK. `cancelled_chat_message` is present only for a queued chat
+          task cancelled via expected_status=queued.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelTaskByUserResponse' }
+      '400':
+        description: >-
+          Common workspace-gate 400s (see file header), plus: "invalid
+          workspace id"; "invalid task id"; "expected_status must be
+          queued"; "invalid chat_session_id"; "queue_action must be edit or
+          remove"; any other error surfaced verbatim from
+          `TaskService.CancelTaskWithResult` (e.g. the task is already in a
+          terminal state — exact message is the underlying DB/service error,
+          not independently enumerated here).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: >-
+          Common workspace-gate 403 (see file header); "not your task" (a
+          chat task owned by a different member); or "you do not have
+          access to this agent" (non-chat task, private-agent gate).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '404':
+        description: >-
+          Common workspace-gate 404 (see file header), or "task not found"
+          (task id doesn't resolve in this workspace, or — for a chat task —
+          its chat session lookup failed).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "task not found" }
+      '409':
+        description: >-
+          "task does not belong to the expected chat session" (chat_session_id
+          query param doesn't match the task's own); or "task is no longer
+          queued" (ErrTaskNoLongerQueued — a queued-only cancel lost a race
+          with dispatch).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              sessionMismatch: { value: { error: "task does not belong to the expected chat session" } }
+              noLongerQueued: { value: { error: "task is no longer queued" } }

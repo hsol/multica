@@ -1,0 +1,1349 @@
+# Domain: "agent extensions" — agent-builder sessions, per-agent
+# env, the runtime-local skill toggle, an agent's own skill bindings,
+# agent-scoped MCP server bindings, and Mika provisioning. 17 endpoints.
+# Source: server/internal/handler/agent_builder.go, agent_env.go,
+# agent_runtime_skills.go, mika_agent.go, skill.go (agent-skill junction
+# section only), workspace_mcp_api.go (agent-scoped section only).
+#
+# Top-level keys are path strings merged verbatim into the document's
+# "paths" object by scripts/merge.mjs — add operations here, not under a
+# nested "paths:" key.
+#
+# All 17 operations below sit inside the single workspace-scoped r.Group in
+# server/cmd/server/router.go (~line 1985 onward,
+# middleware.RequireWorkspaceMember(queries)) — no additional per-route
+# middleware. That group accepts PersonalAccessToken (mul_) / AgentTaskToken
+# (mat_) / BrowserSession (cookie) — NOT CloudNodePAT, which is only checked
+# by a separate always-401-without-config branch in auth.go unrelated to
+# this group — so every operation's security block is the same 3-scheme set,
+# matching the convention already established in
+# openapi/paths/issues-comments/core.yaml. See
+# components/schemas/agents-extensions.yaml for this file's request/response
+# schemas and its header comment for the cross-domain schemas ($ref'd, not
+# redefined) this file depends on.
+
+/api/agent-builder/sessions:
+  get:
+    operationId: listAgentBuilderSessions
+    summary: List the caller's unfinished agent-creation conversations
+    description: >-
+      server/internal/handler/agent_builder.go:192-227
+      (`ListAgentBuilderSessions`). This is the only way back to a builder
+      session: they are hidden from every normal chat surface by the
+      `kind='system'` agent filter, so without this endpoint the studio
+      would have to delete an in-progress draft on navigation away or leak
+      it forever. Creator-scoped like every other chat read — a workspace
+      admin cannot list someone else's drafts (same rule
+      `loadChatSessionForUser` applies elsewhere). Ordered newest activity
+      first.
+    tags: [agent-builder]
+    security: &agentExtAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListAgentBuilderSessionsResponse'
+      '400':
+        description: Invalid `workspace_id`.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid workspace id" }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '500':
+        description: Failed to list the sessions.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list agent builder sessions" }
+  post:
+    operationId: createAgentBuilderSession
+    summary: Start a private agent-creation conversation on a runtime
+    description: >-
+      server/internal/handler/agent_builder.go:57-151
+      (`CreateAgentBuilderSession`). A hidden `kind='system'` agent is the
+      execution carrier because the chat/task pipeline is intentionally
+      agent-backed; the carrier never appears in normal agent lists and
+      cannot be selected as an assignee. Takes a `FOR KEY SHARE` lock on the
+      workspace row before creating the carrier's chat_session — the
+      creator half of the #5219 delete/create protocol, so a session cannot
+      be created into a workspace that is mid-delete.
+    tags: [agent-builder]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateAgentBuilderSessionRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAgentBuilderSessionResponse' }
+      '400':
+        description: >-
+          Invalid body; missing `runtime_id`; invalid `workspace_id`; or
+          `runtime_id` does not parse as a UUID, or does not resolve to a
+          runtime in this workspace (the lookup failure and the parse
+          failure share the same message).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              runtimeIdRequired: { value: { error: "runtime_id is required" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: The runtime is private and the caller is neither its owner nor an admin-visible public one.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "this runtime is private; only its owner can use it" }
+      '404':
+        description: The workspace was deleted concurrently between request start and the lock (`LockWorkspaceForChatSessionCreate` finds no row).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "workspace not found" }
+      '409':
+        description: The resolved runtime is not online.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime must be online to start an agent builder session" }
+      '500':
+        description: >-
+          "failed to start agent builder session" (tx begin); "failed to
+          lock workspace"; "failed to prepare agent builder"; "failed to
+          create agent builder session"; "failed to mark agent builder
+          session explicit"; "failed to commit agent builder session".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agent-builder/sessions/{sessionId}/runtime:
+  patch:
+    operationId: switchAgentBuilderRuntime
+    summary: Re-point a live builder conversation at another runtime
+    description: >-
+      server/internal/handler/agent_builder.go:401-502
+      (`SwitchAgentBuilderRuntime`). Fixes a bug class where the runtime
+      picker used to mutate only React state, so the UI could show runtime B
+      while every subsequent message still enqueued against the carrier
+      agent frozen to runtime A at session-create time (MUL-5163). Runs
+      under `LockChatSessionForRuntimeBind` — the same row lock
+      `SendDirectChatMessage` takes — so "no reply is in flight" and "the
+      carrier now points at B" are decided in one serialized step; a
+      pending/queued (even on an offline runtime) task is rejected rather
+      than raced. `chat_session.runtime_id` is deliberately left pointing at
+      the OLD runtime: the daemon only resumes a stored provider session
+      when that pointer matches the claiming task's runtime, so leaving it
+      stale is what makes the new runtime start a fresh provider session
+      instead of resuming the old one's. Chat history and the draft are
+      untouched; the carrier's `model` is cleared (model ids are
+      per-runtime).
+    tags: [agent-builder]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SwitchAgentBuilderRuntimeRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SwitchAgentBuilderRuntimeResponse' }
+      '400':
+        description: >-
+          Invalid body; missing `runtime_id`; `{sessionId}` or
+          `workspace_id` is not a parseable UUID; the chat session is
+          archived (`status != "active"`); or `runtime_id` is invalid /
+          does not resolve in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              runtimeIdRequired: { value: { error: "runtime_id is required" } }
+              invalidSessionId: { value: { error: "invalid chat session id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              archived: { value: { error: "chat session is archived" } }
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: The caller does not own this chat session, or the target runtime is private and not theirs.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              notYourSession: { value: { error: "not your chat session" } }
+              privateRuntime: { value: { error: "this runtime is private; only its owner can use it" } }
+      '404':
+        description: >-
+          `{sessionId}` not found in this workspace; the session's agent is
+          not a builder carrier (reported as not-found rather than
+          forbidden — a user-authored agent changes runtime through the
+          agent update path instead, which has its own permission model);
+          or the session/agent disappeared between the initial read and the
+          `LockChatSessionForRuntimeBind` / `RebindAgentBuilderRuntime`
+          re-check.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              sessionNotFound: { value: { error: "chat session not found" } }
+              notABuilderSession: { value: { error: "agent builder session not found" } }
+      '409':
+        description: A reply is pending/queued on this session, or the resolved runtime is not online.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              replyPending: { value: { error: "stop the current reply before switching runtime" } }
+              runtimeOffline: { value: { error: "runtime must be online to switch an agent builder session" } }
+      '500':
+        description: >-
+          "failed to load chat agent"; "failed to switch agent builder
+          runtime" (tx begin, or on `RebindAgentBuilderRuntime` failure);
+          "failed to lock chat session"; "failed to check pending builder
+          task"; "failed to commit agent builder runtime switch".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agent-builder/sessions/{sessionId}/draft:
+  put:
+    operationId: saveAgentBuilderDraft
+    summary: Autosave the in-progress configuration for a builder conversation
+    description: >-
+      server/internal/handler/agent_builder.go:256-340
+      (`SaveAgentBuilderDraft`). Stores the configuration the conversation
+      has arrived at, including edits the user has typed but not yet sent.
+      The payload is opaque (see migration 252): it is the studio's
+      AgentDraft shape, validated client-side, and nothing server-side
+      reads a field — whole-object last-write-wins is correct because a
+      conversation has one editor on one screen. Runs under
+      `LockChatSessionForDraftWrite` (the same row lock the delete path
+      takes) and re-checks the session inside it: unlocked, an autosave
+      racing a discard used to leave a draft hanging off a deleted session,
+      invisible to the UI and reachable by no prune but a full workspace
+      teardown (`agent_builder_draft` has no FK to the chat session to
+      reject that insert). Read back through GET
+      /api/agent-builder/sessions (`draft` field), not its own GET.
+    tags: [agent-builder]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SaveAgentBuilderDraftRequest' }
+    responses:
+      '204':
+        description: Saved — no body.
+      '400':
+        description: >-
+          Invalid body; empty `draft`; `draft` is not valid JSON;
+          `{sessionId}` or `workspace_id` is not a parseable UUID; or the
+          chat session is archived (checked both before and again — under
+          the lock, on a re-read — after acquiring it).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              draftRequired: { value: { error: "draft is required" } }
+              draftNotJson: { value: { error: "draft must be valid JSON" } }
+              invalidSessionId: { value: { error: "invalid chat session id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              archived: { value: { error: "chat session is archived" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: The caller does not own this chat session.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "not your chat session" }
+      '404':
+        description: >-
+          `{sessionId}` not found in this workspace; the session's agent is
+          not a builder carrier (reported as not-found, not forbidden); or
+          the session was deleted concurrently, caught under
+          `LockChatSessionForDraftWrite`'s re-check.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              sessionNotFound: { value: { error: "chat session not found" } }
+              notABuilderSession: { value: { error: "agent builder session not found" } }
+      '413':
+        description: '`draft` exceeds 256 KiB (`maxAgentBuilderDraftBytes`).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "draft is too large" }
+      '500':
+        description: >-
+          "failed to load chat agent"; "failed to save agent builder draft"
+          (tx begin, the upsert itself, or tx commit); "failed to lock chat
+          session".
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/mika:
+  post:
+    operationId: createMikaAgent
+    summary: Provision (or fetch) the workspace's built-in Chief of Staff
+    description: >-
+      server/internal/handler/mika_agent.go:82-104 (`CreateMikaAgent`),
+      delegating to `resolveMikaAgent` (109-217) and
+      `writeMikaAgentResponse` (219-252). The caller supplies only a
+      `runtime_id` and `language`; `kind` and `system_key` are server-owned
+      constants — no client input can forge a "Mika" or bypass the
+      one-per-workspace invariant the generic `POST /api/agents` would not
+      itself enforce. Idempotent per workspace BY `system_key`, not by name
+      (migration 172's unique index covers `(workspace_id, owner_id,
+      runtime_id, system_key)`, which would still admit a second Mika under
+      a different owner or runtime — the `GetAgentBySystemKey` lookup below
+      is the invariant that actually holds "one Mika per workspace").
+      Provisioning is additionally serialized with a Postgres advisory
+      lock (`pg_advisory_xact_lock(hashtextextended('mika:'+workspace_id,
+      0))`) so two members racing "Start with Mika" cannot both miss the
+      fast-path lookup and both insert.
+
+
+      On a REPEAT call (Mika already exists for this workspace): returns
+      the existing agent with HTTP 200 (not 201), and still runs the
+      onboarding-session get-or-create (so a second call from a second
+      member/tab opens that member's own conversation, or returns their
+      existing one — the session key is `(workspace, creator, agent)`, not
+      global). `language`/`model`/`session_title` on a repeat call only
+      affect a session that does not yet exist for that caller; they never
+      modify the existing Mika agent itself.
+    tags: [agents]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateMikaAgentRequest' }
+    responses:
+      '200':
+        description: OK — Mika already existed for this workspace; returned as-is (plus this caller's onboarding session).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MikaAgentResponse' }
+      '201':
+        description: Created — this call provisioned Mika for the first time in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MikaAgentResponse' }
+      '400':
+        description: >-
+          Invalid body; `language` is not one of en/zh/ko/ja; `runtime_id`
+          is not a parseable UUID; or the runtime does not resolve in this
+          workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidLanguage: { value: { error: "language must be en, zh, ko, or ja" } }
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+              runtimeNotFound: { value: { error: "runtime not found in this workspace" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: The resolved runtime is private and the caller is not its owner.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you cannot bind an agent to this runtime" }
+      '500':
+        description: >-
+          "failed to look up the workspace agent"; "failed to start agent
+          create transaction"; "failed to lock the workspace agent"
+          (advisory lock); "failed to create the workspace agent"; "failed
+          to save agent access" (invocation targets); "failed to commit
+          agent create"; or, from the always-separate onboarding-session
+          step (which runs even when Mika already existed), "failed to open
+          the Mika conversation" — this can occur after Mika itself has
+          already been durably created/committed, so a 500 here does not
+          mean no agent was created; a retry is safe and converges (every
+          step is idempotent).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/env:
+  get:
+    operationId: getAgentEnv
+    summary: Reveal an agent's plaintext custom environment variables
+    description: >-
+      server/internal/handler/agent_env.go:141-175 (`GetAgentEnv`), gated by
+      `authorizeAgentEnv` (77-107). Access rule (MUL-2600, MUL-5438): the
+      actor MUST resolve to a human member — ANY request authenticated with
+      an AgentTaskToken is rejected outright, even one bound to a user who
+      is a workspace owner or the agent's own owner (closes an
+      impersonation/lateral-movement path: an agent running in the
+      workspace cannot use its host's credentials to reveal another agent's
+      secrets). Among human callers, only a workspace owner/admin or the
+      agent's own human owner may proceed (`canManageAgentEnv`). Values are
+      returned in PLAINTEXT, not masked — the `****` sentinel in
+      UpdateAgentEnvRequest is an input-only convention, never applied on
+      read. Every successful reveal writes an `agent_env_revealed` row to
+      `activity_log` (key names and count only, never values) in the SAME
+      request as the read; the write is fail-closed — if the audit row
+      cannot be persisted, the plaintext is NOT served (a reveal that
+      cannot be recorded is treated as indistinguishable from an unaudited
+      one).
+    tags: [agent-env]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentEnvResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved, or `{id}` / the resolved workspace id is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          The request authenticated with an AgentTaskToken (agent actor,
+          unconditionally denied); or the caller is a human member but
+          neither a workspace owner/admin nor this agent's owner.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents may not access env management endpoints" } }
+              notAuthorized: { value: { error: "only the agent owner or a workspace owner/admin can manage this agent's env" } }
+      '404':
+        description: '`{id}` does not resolve to a `kind=user` agent in this workspace; or the caller is not a member of the workspace at all (reused as the role-check''s not-found message).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent not found" }
+      '500':
+        description: The `agent_env_revealed` activity_log write failed, so the plaintext was withheld (fail-closed).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "audit log write failed; refusing to serve env without a recorded reveal" }
+  put:
+    operationId: updateAgentEnv
+    summary: Replace an agent's custom environment variables
+    description: >-
+      server/internal/handler/agent_env.go:190-284 (`UpdateAgentEnv`), same
+      `authorizeAgentEnv` gate as the GET above. Whole-map replace with the
+      `****` sentinel rule from UpdateAgentEnvRequest (`mergeAgentEnv`,
+      312-349): a sentinel value for a key that already exists keeps the
+      stored value (never overwrites with the literal `****`); a sentinel
+      for a key that does not yet exist is dropped. The persist and the
+      `agent_env_updated` audit write (added/removed/changed/preserved key
+      NAMES, never values) run in one DB transaction — an audit-write
+      failure rolls back the env change, and a persist failure never
+      produces a phantom audit row. On success, broadcasts an
+      `agent:status` WebSocket event carrying the redacted `AgentResponse`
+      projection (no env values) so other connected clients refresh their
+      "N variables configured" indicator; this re-attaches the agent's
+      skills before broadcasting so the event does not imply skills were
+      cleared (#3459) — if THAT reload fails, the HTTP response is a 500
+      even though the env write itself already committed.
+    tags: [agent-env]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateAgentEnvRequest' }
+    responses:
+      '200':
+        description: OK — the full merged map (plaintext), reflecting the sentinel rule.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentEnvResponse' }
+      '400':
+        description: >-
+          '`workspace_id` could not be resolved; `{id}` / the resolved
+          workspace id is not a parseable UUID; or the request body is
+          invalid JSON.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          The request authenticated with an AgentTaskToken (agent actor,
+          unconditionally denied); or the caller is a human member but
+          neither a workspace owner/admin nor this agent's owner.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents may not access env management endpoints" } }
+              notAuthorized: { value: { error: "only the agent owner or a workspace owner/admin can manage this agent's env" } }
+      '404':
+        description: '`{id}` does not resolve to a `kind=user` agent in this workspace, or the caller is not a workspace member.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent not found" }
+      '500':
+        description: >-
+          "failed to encode env"; "failed to update env" (tx begin, the
+          persist query, or tx commit); "audit log write failed; env update
+          rolled back" (whole transaction rolled back, env change did NOT
+          take effect); or "failed to load agent skills" — this last one is
+          written AFTER the transaction already committed, so it reports a
+          successful write as a 500.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/runtime-skills/enabled:
+  put:
+    operationId: setAgentRuntimeSkillEnabled
+    summary: Toggle one runtime-local skill override for an agent
+    description: >-
+      server/internal/handler/agent_runtime_skills.go:84-211
+      (`SetAgentRuntimeSkillEnabled`). Persists a per-agent override for a
+      skill DISCOVERED FROM the agent's currently assigned LOCAL runtime —
+      distinct from the workspace Skill resource bindings under
+      `/api/agents/{id}/skills*`. Only `codex` and `claude` local runtimes
+      expose this control (`runtime.runtime_mode == "local"` and
+      `provider` one of those two); `root: plugin` additionally requires
+      the runtime's provider to be `claude`. The agent's `runtime_id` is
+      checked against `req.runtime_id` BOTH before starting the transaction
+      and again, under `GetAgentForUpdate`'s row lock, inside it — a
+      runtime reassignment racing this call is rejected as stale rather
+      than silently writing an override for a runtime the agent no longer
+      has. `key` is cleaned and traversal-rejected
+      (`normalizeRuntimeSkillIdentity`) before being stored. On success,
+      broadcasts an updated `agent:status` event (re-attaching skills first,
+      same #3459 concern as the env endpoint) so other open clients see the
+      new disabled-skill state.
+    tags: [agents]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetAgentRuntimeSkillEnabledRequest' }
+    responses:
+      '204':
+        description: Updated — no body.
+      '400':
+        description: >-
+          '`workspace_id` could not be resolved; `{id}` is not a parseable
+          UUID; the request body fails to decode or `enabled` is missing
+          (one combined message covers both); `runtime_id` is not a
+          parseable UUID; the runtime''s mode/provider does not support
+          runtime skill controls; or `root`/`key`/`plugin` fail identity
+          normalization (including `root: plugin` on a non-`claude`
+          runtime); or `name` exceeds 512 characters.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              missingFields: { value: { error: "runtime_id, root, key, and enabled are required" } }
+              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
+              unsupportedProvider: { value: { error: "runtime skill controls are only supported for codex and claude" } }
+              invalidIdentity: { value: { error: "invalid runtime skill identity" } }
+              invalidName: { value: { error: "invalid runtime skill name" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: Caller is a workspace member but neither the agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the agent owner can manage this agent" }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace (or the caller is not a member, reusing the same message); or `runtime_id` does not resolve to a runtime in this workspace.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              runtimeNotFound: { value: { error: "runtime not found" } }
+      '409':
+        description: 'The agent is no longer assigned to `runtime_id` — checked once before the transaction and again under a row lock inside it.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent is no longer assigned to this runtime" }
+      '500':
+        description: '"failed to begin transaction"; "failed to load agent"; "failed to encode runtime skill settings"; "failed to update runtime skill"; "failed to commit".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/skills:
+  get:
+    operationId: listAgentSkills
+    summary: List the workspace skills assigned to an agent
+    description: >-
+      server/internal/handler/skill.go:2586-2608 (`ListAgentSkills`). Unlike
+      every mutating skill-binding endpoint below, this read has NO
+      `canManageAgent` gate — any caller that `loadAgentForUser` admits
+      (any workspace member, and an agent actor whose bound user is a
+      member) may list another agent's skill assignments. Each returned
+      `SkillSummaryResponse.enabled` reflects this agent's own binding
+      toggle; `labels` is always omitted here (nil), unlike the general
+      `GET /api/skills` listing which bulk-attaches it.
+    tags: [agent-skills]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/SkillSummaryResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved, or `{id}` / the resolved workspace id is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: '`{id}` does not resolve to a `kind=user` agent in this workspace.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent not found" }
+      '500':
+        description: Failed to list the agent's skill bindings.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list agent skills" }
+  put:
+    operationId: setAgentSkills
+    summary: Replace an agent's entire set of skill assignments
+    description: >-
+      server/internal/handler/skill.go:2610-2663 (`SetAgentSkills`), gated
+      by `canManageAgent` (workspace owner/admin, or this agent's owner —
+      see agent.go:1867). Full replace inside one transaction:
+      `RemoveAllAgentSkills` then re-`AddAgentSkill` for every id in the
+      request, so a skill bound before the call but absent from
+      `skill_ids` is unassigned. Every id is validated to resolve to a
+      Skill in the agent's own workspace BEFORE the transaction opens.
+      Broadcasts an `agent:status` WebSocket event with the resulting list.
+    tags: [agent-skills]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetAgentSkillsRequest' }
+    responses:
+      '200':
+        description: OK — the agent's resulting skill list.
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/SkillSummaryResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved; `{id}` / the resolved workspace id is not a parseable UUID; the request body is invalid; or one of `skill_ids` is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidSkillIds: { value: { error: "invalid skill_ids" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: Caller is a workspace member but neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the agent owner can manage this agent" }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace (or the caller is not a member); or one of `skill_ids` does not resolve to a Skill in this agent''s workspace.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              skillNotFound: { value: { error: "skill not found" } }
+      '500':
+        description: >-
+          "failed to start transaction"; "failed to clear agent skills";
+          "failed to add agent skill: <err>"; "failed to commit"; or
+          "failed to list agent skills" from the post-write re-read.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/skills/add:
+  post:
+    operationId: addAgentSkills
+    summary: Additively assign skills to an agent
+    description: >-
+      server/internal/handler/skill.go:2665-2712 (`AddAgentSkills`), same
+      `canManageAgent` gate as the PUT above. Additive: skills the agent
+      already has are left untouched. Each id is validated to resolve to a
+      Skill in the agent's own workspace before the transaction opens; the
+      actual `INSERT` (`AddAgentSkill`) has no `ON CONFLICT` clause visible
+      in this handler (unlike the MCP-server binding insert, which does),
+      so re-submitting an id the agent is already bound to surfaces as a
+      500 rather than a silent no-op — see the 500 branch below.
+    tags: [agent-skills]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AddAgentSkillsRequest' }
+    responses:
+      '200':
+        description: OK — the agent's resulting skill list.
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/SkillSummaryResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved; `{id}` / the resolved workspace id is not a parseable UUID; the request body is invalid; or one of `skill_ids` is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidSkillIds: { value: { error: "invalid skill_ids" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: Caller is a workspace member but neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the agent owner can manage this agent" }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace (or the caller is not a member); or one of `skill_ids` does not resolve to a Skill in this agent''s workspace.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              skillNotFound: { value: { error: "skill not found" } }
+      '500':
+        description: >-
+          "failed to start transaction"; "failed to add agent skill: <err>"
+          (including, per the summary note above, a duplicate add of a
+          skill the agent is already bound to — the error text here is
+          whatever the underlying constraint violation renders as); "failed
+          to commit"; or "failed to list agent skills" from the post-write
+          re-read.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/skills/{skillId}/enabled:
+  put:
+    operationId: setAgentSkillEnabled
+    summary: Toggle one assigned skill's enabled state on an agent
+    description: >-
+      server/internal/handler/skill.go:2714-2750 (`SetAgentSkillEnabled`),
+      same `canManageAgent` gate. Flips the junction row's `enabled` column
+      without dropping the binding — unlike removal, toggling back on does
+      not require finding the skill again.
+    tags: [agent-skills]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: skillId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [enabled]
+            properties:
+              enabled: { type: boolean }
+            additionalProperties: false
+    responses:
+      '200':
+        description: OK — the agent's resulting skill list.
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/SkillSummaryResponse' }
+      '400':
+        description: >-
+          '`workspace_id` could not be resolved; `{id}` / `{skillId}` /
+          the resolved workspace id is not a parseable UUID; or the
+          request body fails to decode or omits `enabled`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidSkillId: { value: { error: "invalid skill_id" } }
+              enabledRequired: { value: { error: "enabled is required" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: Caller is a workspace member but neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the agent owner can manage this agent" }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace (or the caller is not a member); or `{skillId}` is not currently bound to this agent (the `UPDATE` affected zero rows).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              bindingNotFound: { value: { error: "agent skill not found" } }
+      '500':
+        description: '"failed to update agent skill"; or "failed to list agent skills" from the post-write re-read.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/skills/{skillId}:
+  delete:
+    operationId: removeAgentSkill
+    summary: Unassign one skill from an agent
+    description: >-
+      server/internal/handler/skill.go:2752-2773 (`RemoveAgentSkill`), same
+      `canManageAgent` gate. Removes only the agent-skill binding; the
+      Skill resource itself is untouched. Unlike a conventional REST
+      delete, this responds `200` with the agent's remaining skill list
+      (via the shared `writeUpdatedAgentSkills` helper), not `204` — and it
+      does so even when `{skillId}` was never bound to this agent, since
+      the underlying `DELETE` matching zero rows is not itself treated as
+      an error here (contrast `SetAgentSkillEnabled`, which DOES 404 on
+      zero affected rows).
+    tags: [agent-skills]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: skillId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: 'OK — the agent''s resulting skill list, whether or not `{skillId}` was actually bound beforehand.'
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/SkillSummaryResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved, or `{id}` / `{skillId}` / the resolved workspace id is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidSkillId: { value: { error: "invalid skill_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: Caller is a workspace member but neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the agent owner can manage this agent" }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace (or the caller is not a member).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent not found" }
+      '500':
+        description: '"failed to remove agent skill"; or "failed to list agent skills" from the post-write re-read.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/mcp-servers:
+  get:
+    operationId: listAgentMcpServers
+    summary: List workspace MCP servers bound to an agent
+    description: >-
+      server/internal/handler/workspace_mcp_api.go:338-352ish
+      (`ListAgentMcpServers`). Like `listAgentSkills`, this read has NO
+      additional writer gate beyond `loadAgentForUser` — any workspace
+      member (or an agent actor whose bound user is one) may list another
+      agent's MCP server bindings. Every row's `enabled` reflects this
+      binding's own toggle; `agent_count` is never populated here (that
+      field only appears on the out-of-scope workspace-level library
+      listing).
+    tags: [agent-mcp-servers]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/WorkspaceMcpServerResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved, or `{id}` / the resolved workspace id is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: '`{id}` does not resolve to a `kind=user` agent in this workspace.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "agent not found" }
+      '500':
+        description: Failed to list the agent's MCP server bindings.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list the agent's MCP servers" }
+  post:
+    operationId: addAgentMcpServer
+    summary: Bind a workspace MCP server to an agent
+    description: >-
+      server/internal/handler/workspace_mcp_api.go:395-432ish
+      (`AddAgentMcpServer`), gated by `requireAgentMcpWriter` (367-383):
+      agent actors are unconditionally denied (same `resolveActor ==
+      "agent"` rejection pattern as the env endpoints), and among human
+      callers only `canViewAgentSecrets` (workspace owner/admin, or this
+      agent's owner) may bind. This is the only way a workspace MCP library
+      entry reaches an agent. Takes `LockWorkspaceForChatSessionCreate`
+      (the #5219 delete fence) plus `LockWorkspaceMcpServerForShare` on the
+      target server row — the latter both scopes the server to this
+      agent's workspace AND serializes the insert against
+      `DeleteWorkspaceMcpServer`'s sweep of the junction table, which has no
+      FK to catch an orphaned row otherwise. The underlying insert is `ON
+      CONFLICT DO NOTHING` (`agent_mcp_server` has no uniqueness problem
+      here, unlike the skill-binding additive endpoint above) — re-adding
+      an already-bound server is a harmless no-op, not an error.
+    tags: [agent-mcp-servers]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AddAgentMcpServerRequest' }
+    responses:
+      '200':
+        description: OK — the agent's resulting MCP server list (includes the newly bound entry, or is unchanged if it was already bound).
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/WorkspaceMcpServerResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved; `{id}` / the resolved workspace id is not a parseable UUID; the request body is invalid; or `server_id` is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidServerId: { value: { error: "invalid server_id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          The request authenticated with an AgentTaskToken (agent actor,
+          unconditionally denied); or the caller is a human member but
+          neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot modify MCP server assignments" } }
+              notAuthorized: { value: { error: "insufficient permissions" } }
+      '404':
+        description: >-
+          `{id}` does not resolve to an agent in this workspace; the
+          workspace was deleted concurrently (`LockWorkspaceForChatSessionCreate`
+          finds no row); or `server_id` does not resolve to a workspace MCP
+          library entry in this agent's workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              workspaceNotFound: { value: { error: "workspace not found" } }
+              serverNotFound: { value: { error: "MCP server not found in this workspace" } }
+      '500':
+        description: '"failed to add the MCP server" (tx begin, the insert itself, or tx commit); or "failed to list the agent''s MCP servers" from the post-write re-read.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/mcp-servers/{serverId}/enabled:
+  put:
+    operationId: setAgentMcpServerEnabled
+    summary: Toggle one bound MCP server's enabled state on an agent
+    description: >-
+      server/internal/handler/workspace_mcp_api.go:459-483ish
+      (`SetAgentMcpServerEnabled`), same `requireAgentMcpWriter` gate as the
+      POST above. Flips the binding's `enabled` column without dropping it
+      — a disabled server is excluded from the runtime claim path
+      (`ListEnabledAgentMcpServers`) but reappears unchanged when
+      re-enabled.
+    tags: [agent-mcp-servers]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: serverId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetAgentMcpServerEnabledRequest' }
+    responses:
+      '200':
+        description: OK — the agent's resulting MCP server list.
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/WorkspaceMcpServerResponse' }
+      '400':
+        description: >-
+          '`workspace_id` could not be resolved; `{id}` / `{serverId}` /
+          the resolved workspace id is not a parseable UUID; or the request
+          body fails to decode or omits `enabled`.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidServerId: { value: { error: "invalid server id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              enabledRequired: { value: { error: "enabled is required" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          The request authenticated with an AgentTaskToken (agent actor,
+          unconditionally denied); or the caller is a human member but
+          neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot modify MCP server assignments" } }
+              notAuthorized: { value: { error: "insufficient permissions" } }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace; or `{serverId}` is not currently bound to this agent (the `UPDATE` affected zero rows).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              bindingNotFound: { value: { error: "this MCP server is not assigned to the agent" } }
+      '500':
+        description: '"failed to update the MCP server"; or "failed to list the agent''s MCP servers" from the post-write re-read.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/agents/{id}/mcp-servers/{serverId}:
+  delete:
+    operationId: removeAgentMcpServer
+    summary: Unbind a workspace MCP server from an agent
+    description: >-
+      server/internal/handler/workspace_mcp_api.go:497-516ish
+      (`RemoveAgentMcpServer`), same `requireAgentMcpWriter` gate. The
+      workspace library entry itself is untouched — only this agent's
+      binding is deleted. Like `removeAgentSkill`, responds `200` with the
+      agent's resulting MCP server list rather than `204`, but UNLIKE
+      `removeAgentSkill` it DOES 404 when `{serverId}` was not actually
+      bound to this agent (the `DELETE` affecting zero rows is treated as
+      not-found here, not as a silent success) — the two "remove a binding"
+      endpoints in this ticket's scope disagree on this point.
+    tags: [agent-mcp-servers]
+    security: *agentExtAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: serverId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK — the agent's resulting MCP server list.
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/WorkspaceMcpServerResponse' }
+      '400':
+        description: '`workspace_id` could not be resolved, or `{id}` / `{serverId}` / the resolved workspace id is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workspaceIdRequired: { value: { error: "workspace_id is required" } }
+              invalidAgentId: { value: { error: "invalid agent id" } }
+              invalidWorkspaceId: { value: { error: "invalid workspace id" } }
+              invalidServerId: { value: { error: "invalid server id" } }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          The request authenticated with an AgentTaskToken (agent actor,
+          unconditionally denied); or the caller is a human member but
+          neither this agent's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot modify MCP server assignments" } }
+              notAuthorized: { value: { error: "insufficient permissions" } }
+      '404':
+        description: '`{id}` does not resolve to an agent in this workspace; or `{serverId}` was not bound to this agent (the `DELETE` affected zero rows).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentNotFound: { value: { error: "agent not found" } }
+              bindingNotFound: { value: { error: "this MCP server is not assigned to the agent" } }
+      '500':
+        description: '"failed to remove the MCP server"; or "failed to list the agent''s MCP servers" from the post-write re-read.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }

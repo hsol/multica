@@ -1,0 +1,745 @@
+# Issue wakeups (agent-created subscriptions/schedules) and the one
+# platform system wakeup (child_done). Source:
+# server/internal/handler/issue_wakeup.go, issue_system_wakeup.go (baseline
+# revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe). Every mutation here
+# requires a resolvable "human originator" (the authenticated member behind
+# the request, even when the caller is an agent acting via a task token) —
+# EXCEPT checkin, which is agent-only, and the system-wakeup PUT, which is
+# human-only (an agent actor is unconditionally rejected there).
+
+/api/issues/{id}/wakeups:
+  get:
+    operationId: listIssueWakeups
+    summary: List an issue's wakeup rules
+    description: Private/inaccessible agent references (filter_agent, filter_actor, source_agent) are redacted to null; the rule's own owning agent is always shown.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK — never null (empty array when none).
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/IssueWakeupListItem'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to resolve agent access"; "could not save wakeup" (reused generic message, including on this read path).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  post:
+    operationId: createIssueWakeup
+    summary: Create a new wakeup rule on an issue
+    description: Always inserts a brand-new rule (never upsert) — see PUT on the {wakeupID} path for replace semantics.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueWakeupInput'
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueWakeup'
+      '400':
+        description: '"invalid wakeup body" (decode/unknown-field/size failure), or any WakeupInput validation failure — see the schema''s per-field notes.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required" (agent caller''s task has no resolvable human originator), or "wakeup permission denied" (agent not invocable, or a filter actor not found/visible).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '409':
+        description: '`wakeup_capacity_exceeded` (per-issue active-rule limit) or `wakeup_source_busy` (source run row locked).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}:
+  put:
+    operationId: replaceIssueWakeup
+    summary: Fully replace an existing wakeup rule
+    description: >-
+      Not create-or-update: the `wakeupID` must already name an existing,
+      non-system-rule wakeup on this issue, owned by the caller or a
+      workspace owner/admin — unknown ids are a 404, never a fresh insert.
+      Discards pending receipts and cancels unstarted queued tasks for the
+      old configuration, then replaces every field from the submitted body
+      (no partial/merge semantics) and resets revision/fire_count/paused_reason.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IfMatchHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueWakeupInput'
+    responses:
+      '200':
+        description: Replaced
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueWakeup'
+      '400':
+        description: '"invalid wakeup id"; "invalid wakeup body"; any WakeupInput validation failure.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required"; or "wakeup permission denied" (not creator/owner/admin, row is a system_rule, agent not invocable, or a filter actor not visible).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found" (the wakeupID does not exist / is not on this issue).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: '`wakeup_capacity_exceeded`, `wakeup_source_busy`, or a generic conflict (e.g. concurrent id reuse).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: deleteIssueWakeup
+    summary: Delete a wakeup rule
+    description: Cancels unstarted queued tasks and deletes receipts for the rule, then hard-deletes the row. Already-started runs keep their history.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted — no body.
+      '400':
+        description: '"invalid wakeup id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required"; or "wakeup permission denied" (not creator/owner/admin, or row is a system_rule — system rules cannot be deleted through this endpoint).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}/disable:
+  post:
+    operationId: disableIssueWakeup
+    summary: Disable a wakeup rule
+    description: Discards pending receipts and cancels not-yet-started queued tasks for the rule; already-running tasks are untouched.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueWakeup'
+      '400':
+        description: '"invalid wakeup id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required"; or "wakeup permission denied" (not creator/owner/admin, or row is a system_rule).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}/enable:
+  post:
+    operationId: enableIssueWakeup
+    summary: Re-enable a wakeup rule (or re-arm a consumed one-shot)
+    description: >-
+      If already enabled and neither `rearm` nor `at` is given, this is a
+      no-op returning the current row unchanged (revision not bumped).
+      Supplying `rearm`/`at` while already enabled is instead a 409.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueWakeupEnableInput'
+    responses:
+      '200':
+        description: OK (re-enabled, re-armed, or an idempotent no-op).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueWakeup'
+      '400':
+        description: >-
+          "invalid wakeup id"; "invalid enable body"; revision < 1; a bad
+          `at` value for a non-`at`-kind rule; a past `at`; a consumed
+          one-shot without `rearm`.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required"; or ownership/system-rule/agent-invocability failures.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: 'Stale `revision`; `rearm`/`at` supplied on an already-enabled rule; or a previous run from this rule is still active.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}/instruction:
+  patch:
+    operationId: editIssueWakeupInstruction
+    summary: Edit a wakeup rule's instruction text only
+    description: Updates only the instruction column — does not bump `revision` and does not touch queued work/receipts.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueWakeupInstructionInput'
+    responses:
+      '204':
+        description: Updated — no body.
+      '400':
+        description: '"invalid wakeup id"; "invalid instruction body"; instruction length or revision<1 validation failure.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required"; or ownership/system-rule/agent-invocability failures.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: '`revision` or `expected_instruction` no longer matches the stored row.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}/trigger:
+  post:
+    operationId: triggerIssueWakeup
+    summary: Fire a wakeup rule immediately ("wake now")
+    description: >-
+      Records a synthetic manual-trigger receipt and attempts one dispatch,
+      best-effort — a dispatch failure is swallowed (the receipt persists
+      for the scheduler's normal tick to retry); the response does not
+      reflect dispatch outcome either way.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Accepted — no body.
+      '400':
+        description: '"invalid wakeup id"; "issue is closed"; "turn the wakeup on first" (rule is currently disabled).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"a human originator is required"; or ownership/system-rule/agent-invocability failures.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}/checkin:
+  post:
+    operationId: checkInIssueWakeup
+    summary: Record a silent check-in for a running scheduled-check task, instead of posting a comment
+    description: >-
+      The sole exception to "every run leaves a comment": a scheduled
+      (every/cron) check that found nothing new can end silently by
+      recording a note here. Agent-only — and specifically only the exact
+      agent task the targeted wakeup itself started (re-verified
+      server-side against the task's issue_id, context.wakeup_id and
+      agent_id); every other mutation on this page instead requires a
+      resolvable human originator.
+    tags: [wakeups]
+    security:
+      - AgentTaskToken: []
+    parameters:
+      - $ref: '#/components/parameters/XAgentIDHeader'
+      - $ref: '#/components/parameters/XTaskIDHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueWakeupCheckinInput'
+    responses:
+      '204':
+        description: Recorded — no body.
+      '400':
+        description: '"invalid wakeup id"; "invalid check-in body"; note too long/empty; the targeted rule is not kind=every/cron ("check-ins are for scheduled checks; post a comment instead").'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"only the run a wakeup started can check in" (caller is not an agent with a current task), or "wakeup permission denied" (task/agent/wakeup mismatch).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"issue not found", or "wakeup not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: 'The authoring task is not currently `running`.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      '500':
+        description: '"could not save wakeup".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/wakeups/{wakeupID}/runs:
+  get:
+    operationId: listIssueWakeupRuns
+    summary: List a wakeup rule's run history
+    description: No creator/admin ownership check — any workspace member or agent who can see the issue may read any rule's run history, including system rules.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: wakeupID
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/IssueWakeupRun'
+      '400':
+        description: '"invalid wakeup id".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found", or "wakeup not found" (rule missing, in a different workspace, or belongs to a different issue — also returned here for a genuine DB error on this specific lookup, not just a true not-found).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"could not save wakeup" (reused generic message, including on this read path).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/system-wakeups:
+  get:
+    operationId: listIssueSystemWakeups
+    summary: List the issue's platform-owned system wakeup rules
+    description: >-
+      Today the platform has exactly one system rule (`child_done`), so the
+      response has 0 or 1 elements — empty whenever the issue is closed, has
+      no children, or every child is closed (not an error).
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SystemWakeupResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"could not load system wakeups".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/system-wakeups/{rule}:
+  put:
+    operationId: updateIssueSystemWakeup
+    summary: Enable/disable or customize the issue's system wakeup rule
+    description: >-
+      Human-only — an agent actor is unconditionally rejected here (403),
+      regardless of its task's human originator; this is stricter than
+      every other wakeup mutation on this page. Any workspace member who can
+      see the issue may change it (not restricted to the issue's own
+      assignee or workspace owner/admin — the rule wakes the issue's own
+      assignee, whose invocation was already authorized when the issue was
+      assigned). Response is the same array shape as GET
+      /api/issues/{id}/system-wakeups, recomputed from current state — it
+      can come back empty immediately after a successful update if the
+      issue currently has no open sub-issues or is itself closed.
+    tags: [wakeups]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: rule
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [child_done]
+        description: Must equal exactly `child_done` today — any other value is a 404 before the body is even read.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IssueSystemWakeupUpdateInput'
+    responses:
+      '200':
+        description: OK — see description for the "can come back empty" gotcha.
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SystemWakeupResponse'
+      '400':
+        description: '"invalid system wakeup body"; instruction over 4000 bytes.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"only members can change system wakeups" (caller is an agent actor); "wakeup permission denied" (member lookup failure).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        description: '"issue not found", or "system wakeup not found" (the `rule` path value is not `child_done`).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"could not save system wakeup"; "could not load system wakeups" (the post-write re-read failed).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'

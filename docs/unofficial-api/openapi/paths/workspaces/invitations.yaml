@@ -1,0 +1,302 @@
+# Domain: invitations.
+# Source: server/internal/handler/invitation.go, router.go:1694-1743, 1909-1913.
+# Note: invitation rate-limiting (checkInvitationAdmission) is verified to
+# apply ONLY to POST /api/workspaces/{id}/members (createInvitation, see
+# core.yaml) — none of the 6 endpoints below call it.
+
+/api/invitations:
+  get:
+    operationId: listMyInvitations
+    summary: List the authenticated user's pending invitations
+    description: >-
+      invitation.go:407-... (`ListMyInvitations`). User-scoped — no workspace
+      header/param. Matches invitations addressed to the caller's user id OR
+      email. `workspace_name`/`inviter_name`/`inviter_email` are enriched.
+    tags: [Invitations]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/InvitationResponse'}}
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "user not authenticated"}
+      '500':
+        description: Loading the user row, or listing invitations, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              user: {value: {error: "failed to load user"}}
+              list: {value: {error: "failed to list invitations"}}
+
+/api/invitations/{id}:
+  get:
+    operationId: getMyInvitation
+    summary: Get one invitation
+    description: >-
+      invitation.go:360-... (`GetMyInvitation`). Caller must own the
+      invitation (matching user id or email) — any status is readable, not
+      only pending.
+    tags: [Invitations]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InvitationResponse'}
+      '400':
+        description: Invalid invitation id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid invitation id"}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Invitation does not belong to the caller.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation does not belong to you"}
+      '404':
+        description: Invitation not found.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation not found"}
+      '500':
+        description: Loading the user row failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to load user"}
+
+/api/invitations/{id}/accept:
+  post:
+    operationId: acceptInvitation
+    summary: Accept an invitation
+    description: >-
+      invitation.go:455-... (`AcceptInvitation`). Creates the member row (and
+      marks the user onboarded) in one transaction. Idempotent for a
+      status=accepted invitation whose membership still exists — re-POSTing
+      returns 200 with that membership rather than erroring; if the
+      membership was since removed (explicit leave), re-accept is rejected
+      with 400. Status must be pending to begin with (checked before the
+      expiry check) unless hitting that idempotent branch.
+    tags: [Invitations]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: Accepted (or idempotently re-confirmed membership).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MemberWithUserResponse'}
+      '400':
+        description: Invalid invitation id, invitation not pending (and no live prior membership to idempotently return).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidId: {value: {error: "invalid invitation id"}}
+              notPending: {value: {error: "invitation is not pending"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Invitation does not belong to the caller.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation does not belong to you"}
+      '404':
+        description: Invitation not found.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation not found"}
+      '409':
+        description: A membership already exists for this user+workspace (unique violation on create).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "you are already a member of this workspace"}
+      '410':
+        description: Invitation has expired.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation has expired"}
+      '429':
+        description: Seat-capacity reservation rate-limited (only when seat capacity is enabled). Sets `Retry-After`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "Member capacity is busy. Please retry shortly.", code: seat_capacity_rate_limited}
+      '503':
+        description: Seat-capacity backend unavailable (only when seat capacity is enabled).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "Member capacity could not be verified. Please try again.", code: seat_capacity_unavailable}
+      '500':
+        description: >-
+          Loading the user row, loading membership state, or the
+          accept/create-member/mark-onboarded transaction, failed; or seat
+          capacity rejected with `seat_capacity_overcommitted`/`seat_capacity_full`
+          (409, only when seat capacity is enabled).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/invitations/{id}/decline:
+  post:
+    operationId: declineInvitation
+    summary: Decline an invitation
+    description: >-
+      invitation.go:640-... (`DeclineInvitation`). Unlike accept, declining a
+      non-pending invitation is a no-op success (204) rather than a 400 — any
+      terminal status is treated as "already handled". Releases any reserved
+      seat capacity.
+    tags: [Invitations]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Declined (or already in a non-pending state — idempotent no-op).
+      '400':
+        description: Invalid invitation id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid invitation id"}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Invitation does not belong to the caller.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation does not belong to you"}
+      '404':
+        description: Invitation not found.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation not found"}
+      '500':
+        description: Loading the user row, or the decline transaction (begin/update/release-capacity/commit), failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to decline invitation"}
+
+/api/workspaces/{id}/invitations:
+  get:
+    operationId: listWorkspaceInvitations
+    summary: List a workspace's pending invitations
+    description: >-
+      invitation.go:256-... (`ListWorkspaceInvitations`). Router requires only
+      plain membership (not owner/admin) despite a code comment calling this
+      an "admin view" — any member may list. `inviter_name`/`inviter_email`
+      are enriched; `workspace_name` is not (caller already knows the
+      workspace from the path).
+    tags: [Workspaces, Invitations]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/InvitationResponse'}}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list invitations"}
+
+/api/workspaces/{id}/invitations/{invitationId}:
+  delete:
+    operationId: revokeInvitation
+    summary: Revoke a pending invitation
+    description: >-
+      invitation.go:295-... (`RevokeInvitation`). Requires `owner` or `admin`.
+      A non-pending invitation, OR one belonging to a different workspace
+      than `id`, both collapse into the same 404 (no distinction made on the
+      wire). Releases any reserved seat capacity.
+    tags: [Workspaces, Invitations]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: invitationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '400':
+        description: Invalid workspace id or invitation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is a member but not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "insufficient permissions"}
+      '404':
+        description: Invitation not found, belongs to a different workspace, or is no longer pending (all three collapse to this response).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invitation not found"}
+      '500':
+        description: The revoke transaction (begin/update/release-capacity/commit) failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to revoke invitation"}

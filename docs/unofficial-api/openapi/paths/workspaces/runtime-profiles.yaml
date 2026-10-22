@@ -1,0 +1,289 @@
+# Domain: Custom runtime profiles.
+# Source: server/internal/handler/runtime_profile.go, router.go:1694-1757.
+
+/api/workspaces/{id}/runtime-profiles:
+  get:
+    operationId: listRuntimeProfiles
+    summary: List a workspace's custom runtime profiles
+    description: >-
+      runtime_profile.go:219-239 (`ListRuntimeProfiles`). Member-visible (the
+      Runtime page renders for everyone; mutations are admin-gated below).
+    tags: [Workspaces, Runtime Profiles]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [runtime_profiles]
+              properties:
+                runtime_profiles: {type: array, items: {$ref: '#/components/schemas/RuntimeProfileResponse'}}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or caller not a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace not found"}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list runtime profiles"}
+  post:
+    operationId: createRuntimeProfile
+    summary: Create a custom runtime profile
+    description: >-
+      runtime_profile.go:132-215 (`CreateRuntimeProfile`). Requires `owner` or
+      `admin`. On success, connected daemons are notified to refresh their
+      runtime profile list.
+    tags: [Workspaces, Runtime Profiles]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CreateRuntimeProfileRequest'}
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RuntimeProfileResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, or a field failed validation.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              displayNameRequired: {value: {error: "display_name is required"}}
+              unsupportedType: {value: {error: "unsupported runtime_type: foo"}}
+              familyMismatch: {value: {error: "protocol_family does not match runtime_type"}}
+              commandRequired: {value: {error: "command_name is required"}}
+              commandNotSingleToken: {value: {error: "command_name must be a single executable token; put arguments in fixed_args"}}
+      '403':
+        description: Caller is not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "insufficient permissions"}
+      '409':
+        description: A profile with this `display_name` already exists in the workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "a runtime profile with this display_name already exists"}
+      '500':
+        description: Insert failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to create runtime profile"}
+
+/api/workspaces/{id}/runtime-profiles/{profileId}:
+  get:
+    operationId: getRuntimeProfile
+    summary: Get a custom runtime profile
+    description: runtime_profile.go:242-265 (`GetRuntimeProfile`). Member-visible.
+    tags: [Workspaces, Runtime Profiles]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: profileId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RuntimeProfileResponse'}
+      '400':
+        description: Invalid workspace id or profile id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found / caller not a member, or no profile with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              workspace: {value: {error: "workspace not found"}}
+              profile: {value: {error: "runtime profile not found"}}
+  put:
+    operationId: updateRuntimeProfilePut
+    summary: Update a custom runtime profile (full-body form)
+    description: >-
+      runtime_profile.go:280-360 (`UpdateRuntimeProfile`). Identical handler
+      to PATCH on this path — partial-update semantics regardless of HTTP
+      method. `runtime_type`/`protocol_family` are immutable: present
+      (non-null) in the body at all rejects the whole request, even if the
+      value matches the current one. Requires `owner` or `admin`.
+    tags: [Workspaces, Runtime Profiles]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: profileId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UpdateRuntimeProfileRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RuntimeProfileResponse'}
+      '400':
+        description: Invalid ids, invalid body, immutable-field change attempted, or a provided field failed validation.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              immutable: {value: {error: "runtime_type and protocol_family are immutable; create a new profile"}}
+              emptyName: {value: {error: "display_name cannot be empty"}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: No profile with this id in this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "runtime profile not found"}
+      '409':
+        description: A profile with the new `display_name` already exists.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "a runtime profile with this display_name already exists"}
+      '500':
+        description: Update failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to update runtime profile"}
+  patch:
+    operationId: updateRuntimeProfilePatch
+    summary: Update a custom runtime profile (partial form)
+    description: Identical handler and behavior to `PUT` on this path above (runtime_profile.go:280).
+    tags: [Workspaces, Runtime Profiles]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: profileId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/UpdateRuntimeProfileRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RuntimeProfileResponse'}
+      '400':
+        description: Same as PUT.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: No profile with this id in this workspace.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: A profile with the new `display_name` already exists.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Update failed.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+  delete:
+    operationId: deleteRuntimeProfile
+    summary: Delete a custom runtime profile
+    description: >-
+      runtime_profile.go:475-640 (`DeleteRuntimeProfile`). Requires `owner` or
+      `admin`. Runs in a transaction bounded by a `SET LOCAL lock_timeout`
+      (default 10s); deletes every `agent_runtime` instance of this profile
+      in the same transaction (application-level cascade, no DB FK, per repo
+      convention). Blocked outright if any non-archived agent is still bound
+      to one of its runtimes.
+    tags: [Workspaces, Runtime Profiles]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: profileId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Deleted (and its runtime instances torn down).
+      '400':
+        description: Invalid workspace id or profile id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: Workspace not found, or no profile/runtime row with this id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              workspace: {value: {error: "workspace not found"}}
+              profile: {value: {error: "runtime profile not found"}}
+      '409':
+        description: >-
+          Active (non-archived) agents still bound to this profile's
+          runtime(s); a runtime still has tasks in flight; or a runtime has an
+          invalid cross-workspace agent binding.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RuntimeProfileDeleteBlockedResponse'
+                - $ref: '#/components/schemas/RuntimeProfileDeleteRetryResponse'
+      '500':
+        description: Any transaction step failed (begin, load profile, enumerate runtimes, lock dependencies, usage check, unbind agents, cleanup, delete, or commit).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}

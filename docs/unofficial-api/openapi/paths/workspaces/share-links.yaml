@@ -1,0 +1,140 @@
+# Domain: Share links.
+# Source: server/internal/handler/share_link.go, router.go:1694-1757.
+# Note: POST /api/share-links/join (JoinByShareLink) is a separate,
+# user-scoped endpoint outside this ticket's 78-endpoint list — not
+# documented here.
+
+/api/workspaces/{id}/share-links:
+  get:
+    operationId: listShareLinks
+    summary: List a workspace's share links
+    description: >-
+      share_link.go:174-196 (`ListShareLinks`). Admin-gated at the router
+      (owner/admin) — the handler itself does not re-check membership/role,
+      unlike several sibling handlers in this domain that redundantly
+      re-verify. Enriches `creator_name`/`creator_email` (unlike the POST
+      response below).
+    tags: [Workspaces, Share Links]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {type: array, items: {$ref: '#/components/schemas/ShareLinkResponse'}}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list share links"}
+  post:
+    operationId: createShareLink
+    summary: Create (and rotate) the workspace's active share link
+    description: >-
+      share_link.go:68-170 (`CreateShareLink`). Requires `owner` or `admin`.
+      A workspace has at most one ACTIVE share link at a time (partial unique
+      index on `workspace_id WHERE is_active`): creating a new one
+      deactivates any existing active link in the same transaction
+      (atomic rotation). `code` is a freshly generated 24-char hex string.
+    tags: [Workspaces, Share Links]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CreateShareLinkRequest'}
+    responses:
+      '201':
+        description: Created (and any prior active link for this workspace deactivated).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ShareLinkResponse'}
+      '400':
+        description: Invalid workspace id, invalid body, invalid role, or expires_in/max_uses out of range.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              invalidBody: {value: {error: "invalid request body"}}
+              invalidRole: {value: {error: "invalid role"}}
+              badExpiry: {value: {error: "expires_in must be between 1 and 2562047 hours"}}
+              badMaxUses: {value: {error: "max_uses must be between 1 and 2147483647"}}
+      '404':
+        description: Workspace not found, or caller not a member (handler re-checks membership via its own fallback path).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "workspace not found"}
+      '409':
+        description: Concurrent creation raced the partial-unique-active-link index (rare — the transaction normally deactivates the old link first).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "a share link is already active for this workspace"}
+      '500':
+        description: Any transaction step (begin, deactivate existing, generate code, insert, commit) failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to create share link"}
+
+/api/workspaces/{id}/share-links/{linkId}:
+  delete:
+    operationId: revokeShareLink
+    summary: Revoke a share link
+    description: >-
+      share_link.go:200-222 (`RevokeShareLink`). Requires `owner` or `admin`.
+      Query is scoped to `(id, workspace_id)` so a `linkId` from another
+      workspace cannot be revoked. UNCONFIRMED: the handler does not
+      pre-fetch the link before revoking, so whether revoking an
+      already-inactive or nonexistent `linkId` returns 404 or a silent 204
+      was not independently verified from this file alone (no explicit
+      not-found branch was found in the handler; the underlying query's
+      affected-row handling was not read).
+    tags: [Workspaces, Share Links]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: linkId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked (see description for the unconfirmed not-found case).
+      '400':
+        description: Invalid workspace id or link id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Revoke query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to revoke share link"}

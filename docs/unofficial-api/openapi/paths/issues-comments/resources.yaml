@@ -1,0 +1,1128 @@
+# Issue sub-resources: attachments, duplicates, labels, metadata,
+# properties, pull requests, reactions, timeline, subscribers. Source:
+# server/internal/handler/{issue_reaction,file,issue_duplicate,label,
+# issue_metadata,property,github,pr_auto_complete,subscriber,activity}.go
+# (baseline revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+
+/api/issues/{id}/attachments:
+  get:
+    operationId: listIssueAttachments
+    summary: List an issue's attachments
+    description: No pagination — returns the full list. `download_url` is either a stable path or a freshly-signed CloudFront URL depending on the `X-Client-Capabilities` header and server configuration.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/AttachmentResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list attachments".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/duplicates:
+  get:
+    operationId: listIssueDuplicates
+    summary: Get an issue's duplicate relationships
+    description: >-
+      A "duplicate" is not a separate status — it's a cancelled issue with a
+      `duplicate_of_issue_id` pointer. The relation is one level deep only
+      (an original cannot itself be a duplicate, and an issue with
+      duplicates pointing at it cannot be marked as one).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [duplicates]
+              properties:
+                duplicate_of:
+                  allOf:
+                    - $ref: '#/components/schemas/IssueResponse'
+                  nullable: true
+                  description: 'Present only when this issue is itself cancelled-as-a-duplicate; null (not an error) if the pointed-to original can no longer be found.'
+                duplicates:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IssueResponse'
+                  description: Always an array (never null), even when empty.
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to load duplicate original"; "failed to list duplicates".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/labels:
+  get:
+    operationId: listLabelsForIssue
+    summary: List labels attached to an issue
+    description: '`usage_count` on this endpoint is always 0 — only the top-level label-catalog endpoint (out of this ticket''s scope) populates a real count.'
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [labels, issue_revision]
+              properties:
+                labels:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/LabelResponse'
+                issue_revision:
+                  type: integer
+                  format: int64
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list labels".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  post:
+    operationId: attachLabel
+    summary: Attach an existing label to an issue
+    description: >-
+      Takes a `label_id` of an already-existing label — there is no
+      inline-create-by-name path here; labels are created via the separate
+      top-level label-catalog endpoint (out of this ticket's scope). An
+      idempotent re-attach of an already-attached label is a no-op write
+      (still 200, no realtime broadcast).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [label_id]
+            properties:
+              label_id:
+                type: string
+                format: uuid
+    responses:
+      '200':
+        description: >-
+          OK. If the post-attach label-list re-read fails, the mutation has
+          already committed and the response degrades to an empty object
+          `{}` (no `labels` key at all) rather than an error.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                labels:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/LabelResponse'
+                issue_revision:
+                  type: integer
+                  format: int64
+                  description: Only present when the attach actually changed something.
+      '400':
+        description: '"invalid request body"; "label_id is required"; malformed `label_id` UUID.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found"; "label not found" (no such label in this workspace); "issue label not found" (the label exists but its resource_type is not "issue" — masked as 404 rather than 400/403).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to attach label".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/labels/{labelId}:
+  delete:
+    operationId: detachLabel
+    summary: Detach a label from an issue
+    description: Same existence/resource_type pre-checks as attach, deliberately — a crafted request with a foreign labelId gets an explicit 404 rather than a silent no-op success.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: labelId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: 'OK — same shape as attach''s response, including the empty-object-on-read-failure fallback.'
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                labels:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/LabelResponse'
+                issue_revision:
+                  type: integer
+                  format: int64
+      '400':
+        description: Malformed `labelId` UUID.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found"; "label not found"; "issue label not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to detach label".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/metadata:
+  get:
+    operationId: listIssueMetadata
+    summary: Get an issue's metadata key/value map
+    description: Values are primitive-only (string, number, or bool) — never null, arrays, or objects. Degrades to an empty object on unparseable/empty stored JSON.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [metadata]
+              properties:
+                metadata:
+                  type: object
+                  additionalProperties: true
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+
+/api/issues/{id}/metadata/{key}:
+  put:
+    operationId: setIssueMetadataKey
+    summary: Set a single metadata key
+    description: >-
+      `key` must match `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$`; an issue is capped
+      at 50 metadata keys total; the DB additionally enforces an 8KB JSONB
+      size limit as defense-in-depth. Every mutation is single-key atomic —
+      UpdateIssue never touches the metadata blob as a whole, to avoid
+      clobbering concurrent agent writes.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [value]
+            properties:
+              value:
+                description: 'Must be a JSON primitive: string, number, or bool. null is rejected (use DELETE to remove a key); arrays/objects are rejected.'
+    responses:
+      '200':
+        description: OK — current metadata and the issue's revision after the write.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [metadata, issue_revision]
+              properties:
+                metadata:
+                  type: object
+                  additionalProperties: true
+                issue_revision:
+                  type: integer
+                  format: int64
+      '400':
+        description: >-
+          Key regex failure; "invalid request body"; value is null, or not
+          a primitive; "metadata cannot exceed 50 keys"; "metadata exceeds
+          the 8KB size limit" (DB CHECK constraint).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found" (initial load, or if the issue row vanishes mid-write and the fallback re-read also 404s).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to load issue metadata" (fallback re-read after a no-rows write); "failed to set metadata key".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: deleteIssueMetadataKey
+    summary: Delete a single metadata key
+    description: Deleting an absent key is a no-op (current metadata is returned unchanged), not an error.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [metadata, issue_revision]
+              properties:
+                metadata:
+                  type: object
+                  additionalProperties: true
+                issue_revision:
+                  type: integer
+                  format: int64
+      '400':
+        description: Key regex failure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found" (initial load, or the issue vanished and the fallback re-read 404s).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to load issue metadata"; "failed to delete metadata key".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/properties/{propertyId}:
+  put:
+    operationId: setIssueProperty
+    summary: Set a custom property value on an issue
+    description: >-
+      `propertyId` is the property *definition* id (see the separate,
+      out-of-scope properties-catalog domain). Per-type value-shape
+      validation is delegated to that definition's type and was not
+      re-derived in full for this ticket. Runs under a Postgres advisory
+      lock keyed on the property id to prevent a TOCTOU race against a
+      concurrent definition edit (e.g. removing a select option while a
+      value referencing it is being written).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: propertyId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [value]
+            properties:
+              value:
+                description: '`actor`/`multi_actor`-typed properties additionally require each referenced id to be an existing member of this workspace.'
+    responses:
+      '200':
+        description: OK — published unconditionally on every successful write, even a no-op re-set of the same value (unlike labels/metadata/reactions, which gate broadcast on an actual change).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [properties, issue_revision]
+              properties:
+                properties:
+                  type: object
+                  additionalProperties: true
+                issue_revision:
+                  type: integer
+                  format: int64
+      '400':
+        description: >-
+          "invalid request body"; the property is archived ("cannot receive
+          new values"); a per-type value validation failure; an actor-ref
+          that doesn't resolve to a workspace member; "issue properties
+          exceed the 16KB size limit".
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found"; "property not found" (no such property definition in this workspace).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to set property".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: deleteIssueProperty
+    summary: Unset a custom property value on an issue
+    description: >-
+      Deleting a value is allowed even for an archived property definition
+      (cleanup must never be blocked) — this is the one asymmetry with Set,
+      which rejects archived definitions. An absent value is a no-op.
+      Broadcasts unconditionally on success, same as Set.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: propertyId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [properties, issue_revision]
+              properties:
+                properties:
+                  type: object
+                  additionalProperties: true
+                issue_revision:
+                  type: integer
+                  format: int64
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found"; "property not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to unset property".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/pull-requests:
+  get:
+    operationId: listPullRequestsForIssue
+    summary: List pull/merge requests linked to an issue
+    description: >-
+      Merges native GitHub-mirrored PRs and other-VCS-provider PRs into one
+      list, newest-first. Side effect despite being a GET: for each native
+      GitHub PR, a stale/missing cached snapshot may be asynchronously
+      re-fetched in the background — the response reflects current
+      (possibly stale) data immediately, with a fresher value arriving
+      later via a realtime event.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuePullRequestsListResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list pull requests" (shared message across four distinct internal failure points: workspace lookup, native-PR list, VCS-PR list, auto-complete decision).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  post:
+    operationId: linkIssuePullRequest
+    summary: Link an already-synced pull/merge request to an issue
+    description: >-
+      Links a PR the workspace's connected integration has already synced
+      into its own tables — this does not create a PR record by calling an
+      external API live. Also clears any prior "exclusion" record, so a
+      previously-unlinked PR can be deliberately re-linked. Successful
+      linking (or merging, or unlinking) is one of exactly three events
+      that re-evaluate the PR-auto-complete decision for the issue.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LinkIssuePullRequestInput'
+    responses:
+      '200':
+        description: OK — same shape as GET (the newly-linked PR included).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuePullRequestsListResponse'
+      '400':
+        description: '"invalid request body"; "url is required" (both url and pull_request_id empty).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found"; "pull request not found; it appears here once its repository is connected and the PR has been synced" (neither the URL nor pull_request_id lookup found a match).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to link pull request".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/pull-requests/{prId}:
+  delete:
+    operationId: unlinkIssuePullRequest
+    summary: Unlink a pull/merge request from an issue
+    description: >-
+      Runs the unlink plus an exclusion-record insert in one transaction —
+      so the next webhook for that PR will not silently re-link it from its
+      title or branch. Also one of the three PR-auto-complete trigger
+      events.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: prId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+        description: The pull-request row id (not the provider's PR number).
+    responses:
+      '200':
+        description: OK — same shape as GET.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuePullRequestsListResponse'
+      '400':
+        description: Malformed `prId` UUID.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: '"issue not found"; "pull request not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to unlink pull request".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/pr-auto-complete:
+  put:
+    operationId: setIssuePRAutoComplete
+    summary: Enable/disable automatic completion of an issue once its linked PRs merge
+    description: >-
+      Turning this setting on/off is NOT itself one of the three
+      PR-auto-complete trigger events (link/merge/unlink) — flipping it on
+      does not complete the issue by itself; the next PR event does. Only
+      writes an activity-log entry when the value actually flips.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SetIssuePRAutoCompleteInput'
+    responses:
+      '200':
+        description: 'OK — same shape as GET /api/issues/{id}/pull-requests; read `auto_complete.issue_disabled` from it rather than a dedicated response body.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuePullRequestsListResponse'
+      '400':
+        description: '"disabled is required" (decode failure or an explicit/omitted null — both rejected identically).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to update pull request automation".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/reactions:
+  post:
+    operationId: addIssueReaction
+    summary: Add an emoji reaction to an issue
+    description: No format/allowlist validation on `emoji` — any non-empty string is accepted and stored verbatim.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [emoji]
+            properties:
+              emoji: {type: string, minLength: 1}
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueReactionResponse'
+      '400':
+        description: '"invalid request body"; "emoji is required".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to add reaction".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: removeIssueReaction
+    summary: Remove an emoji reaction from an issue
+    description: Matches by (actor, emoji) on this issue; removing a reaction that doesn't exist is a no-op.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [emoji]
+            properties:
+              emoji: {type: string, minLength: 1}
+    responses:
+      '204':
+        description: Removed — no body. A no-op removal (reaction didn't exist) still returns 204, without broadcasting.
+      '400':
+        description: '"invalid request body"; "emoji is required".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to remove reaction".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/timeline:
+  get:
+    operationId: listTimeline
+    summary: Get an issue's merged comment + activity timeline
+    description: >-
+      Two response shapes: a bare ascending array by default, or a
+      descending, wrapped object when any of limit/before/after/around is
+      present — none of these actually filter or paginate server-side (the
+      full timeline is always loaded); `around` only locates a
+      `target_index` in the result. Response header
+      `X-Timeline-Truncated` (values `activity`, `comment`, or
+      `activity,comment`) signals a 2000-row-per-type hard cap was hit.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: limit
+        in: query
+        schema: {type: string}
+        description: Presence (any value) switches the response to the wrapped shape; does not itself limit results.
+      - name: before
+        in: query
+        schema: {type: string}
+        description: Presence switches the response to the wrapped shape; does not itself filter results.
+      - name: after
+        in: query
+        schema: {type: string}
+        description: Presence switches the response to the wrapped shape; does not itself filter results.
+      - name: around
+        in: query
+        schema: {type: string, format: uuid}
+        description: Entry id to locate `target_index` for, in the wrapped response.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/TimelineEntry'
+                - $ref: '#/components/schemas/TimelinePaginatedResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list comments"; "failed to list activities"; "failed to complete comment threads" (repairing a reply thread split by truncation — a hard error, unlike most other best-effort enrichment on this endpoint).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/subscribers:
+  get:
+    operationId: listIssueSubscribers
+    summary: List an issue's subscribers
+    description: Includes both explicitly-subscribed and rule-auto-subscribed entries (see `reason`).
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    responses:
+      '200':
+        description: OK — always an array, empty when none.
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SubscriberResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to list subscribers".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/subscribe:
+  post:
+    operationId: subscribeToIssue
+    summary: Subscribe to an issue (self, or an explicit target)
+    description: >-
+      Defaults to the caller as target (resolved via the caller's agent/
+      member identity, not the underlying human for an agent caller) when
+      `user_id`/`user_type` are omitted. Explicit subscribe clears any prior
+      opt-out tombstone — distinct from rule-driven auto-subscribe, which
+      cannot override an opt-out.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SubscribeTargetInput'
+      description: Optional — decode errors are swallowed (an empty/absent body subscribes the caller).
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionStateResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"target user is not a member of this workspace".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to subscribe".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/unsubscribe:
+  post:
+    operationId: unsubscribeFromIssue
+    summary: Unsubscribe from a single issue (self, or an explicit target)
+    description: Single-issue only — does not affect descendants; see the separate subtree variant for that.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SubscribeTargetInput'
+      description: Optional — same default-to-caller leniency as subscribe.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionStateResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"target user is not a member of this workspace".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to unsubscribe".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/unsubscribe/subtree:
+  post:
+    operationId: unsubscribeFromIssueSubtree
+    summary: Unsubscribe from an issue and every descendant, and suppress future re-subscription for the subtree
+    description: >-
+      A separate route rather than a body flag, deliberately: an older
+      server that doesn't know this route 404s instead of silently
+      no-op'ing a `subtree:true` field, across staged deploys. Runs under an
+      advisory lock serializing against the auto-subscribe rule for the
+      same (workspace, user); re-asserts the target's membership under that
+      lock before writing.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier — the subtree root.
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SubscribeTargetInput'
+      description: Optional — same default-to-caller leniency as subscribe.
+    responses:
+      '200':
+        description: 'OK. The per-issue removal list (root + descendants actually retired) is not in the body — only reflected via individual realtime events, one per issue removed.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionStateResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"target user is not a member of this workspace" — either the initial pre-check, or a race re-check under the serializing lock (member revoked from the workspace mid-request).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '404':
+        $ref: '#/components/responses/IssueNotFound'
+      '500':
+        description: '"failed to unsubscribe".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'

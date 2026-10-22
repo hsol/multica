@@ -1,0 +1,2642 @@
+# Domain: cloud/연동
+# Owner: dedicated domain ticket.
+# Top-level keys are path strings merged verbatim into the document's
+# "paths" object by scripts/merge.mjs — add operations here, not under a
+# nested "paths:" key.
+#
+# Scope (58 endpoints per the originating ticket): cloud-billing,
+# cloud-subscriptions, cloud-runtime, integrations/composio, the five
+# chat-platform binding-token redeem endpoints, and a grab-bag of
+# process-level infra routes (health/readyz/ws/uploads/avatars/
+# plugin-surfaces/config/auth-refresh/auth-logout/feedback/hooks/
+# search-index/workspace-wakeups).
+#
+# Per the ticket's acceptance condition 2, full request/response schemas are
+# written for cloud-billing, cloud-subscriptions, integrations (composio),
+# and the five social bindings. Everything else is infra-tier: path+method+
+# security are registered, but schema is intentionally omitted and each such
+# operation's description says so explicitly ("내부/인프라 전용, 스키마
+# 미기재") rather than guessing a shape.
+#
+# IMPORTANT CAVEAT on the "full schema" endpoints: cloud-billing and
+# cloud-subscriptions are proxies to an external multica-cloud HTTP service
+# (server/internal/handler/cloud_billing.go, cloud_runtime.go — see
+# proxyCloudRuntime/proxyCloudSubscription). Their REQUEST bodies are real Go
+# structs validated locally (documented precisely below), but their 2xx
+# RESPONSE bodies are forwarded byte-for-byte from upstream — no Go type in
+# this repo unmarshals them. Those responses use
+# #/components/schemas/CloudProxyResponse (additionalProperties: true) with
+# an explicit "소스에서 확인 불가" note instead of invented field names.
+#
+# Path-list discrepancy found and corrected here (not silently): the
+# originating ticket lists "POST /hooks/{key}". router.go has exactly one
+# matching registration, r.Post("/hooks/{key}", h.InvokePluginHook)
+# (~line 1635), but it is nested inside r.Route(pluginBridgePrefix, ...)
+# where pluginBridgePrefix = "/api/plugin-bridge/v1" (router.go ~line 58,
+# 1631). The true path is therefore /api/plugin-bridge/v1/hooks/{key}; the
+# ticket's static chi-brace-depth extraction evidently lost the enclosing
+# Route's prefix. Registered below under the corrected full path — same
+# handler, same operation, path fixed rather than reproducing the error.
+
+/api/cloud-billing/balance:
+  get:
+    operationId: GetCloudBillingBalance
+    summary: Get the caller's cloud billing wallet balance
+    tags: [cloud-billing]
+    description: >-
+      Forwards GET /api/v1/billing/balance to the multica-cloud service with
+      X-User-ID stamped from the authenticated context
+      (server/internal/handler/cloud_billing.go, GetCloudBillingBalance).
+      Account-level (not workspace-scoped) — available without an active
+      workspace selected. Human actors only: a running agent (mat_ task
+      token) or cloud-node PAT (mcn_) is refused (see
+      handler.RequireHumanActor rationale in
+      server/internal/handler/actor_guards.go).
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Upstream wallet balance payload, forwarded verbatim. 소스에서 확인 불가 (see domain file header).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Either "this endpoint is only available to human actors" (plain
+          Error) — caller authenticated with a mat_/mcn_ machine credential
+          — or "cloud runtime is not configured" (ErrorCode
+          cloud_runtime_not_configured, via writeFeatureDisabled). Same 403
+          status, distinguished only by the response body's `code` field.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream multica-cloud request failed (writeCloudRuntimeError default case).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/transactions:
+  get:
+    operationId: ListCloudBillingTransactions
+    summary: List the caller's cloud billing transactions
+    tags: [cloud-billing]
+    description: >-
+      Forwards GET /api/v1/billing/transactions. Upstream supports `page` /
+      `page_size` query params per the handler's own comment, forwarded
+      unchanged (cloudRuntimeProxyOptions.withQuery) — not validated or
+      typed locally, so not declared as formal `parameters` here (소스에서
+      확인 불가 beyond the comment). Human actors only; account-level.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Upstream transaction list, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured (writeFeatureDisabled, ErrorCode).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/batches:
+  get:
+    operationId: ListCloudBillingBatches
+    summary: List the caller's cloud billing topup/bonus batches
+    tags: [cloud-billing]
+    description: >-
+      Forwards GET /api/v1/billing/batches; same query forwarding and auth
+      shape as ListCloudBillingTransactions.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Upstream batch list, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/topups:
+  get:
+    operationId: ListCloudBillingTopups
+    summary: List the caller's cloud billing topups
+    tags: [cloud-billing]
+    description: Forwards GET /api/v1/billing/topups; same shape as ListCloudBillingTransactions.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Upstream topup list, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/price-tiers:
+  get:
+    operationId: ListCloudBillingPriceTiers
+    summary: List cloud billing price tiers
+    tags: [cloud-billing]
+    description: >-
+      Forwards GET /api/v1/billing/price-tiers with X-User-ID stamped (no
+      query forwarding). Per the handler comment the response is the same
+      for every owner today, but X-User-ID is still sent for upstream audit
+      and forward-compat.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Upstream price-tier list, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/checkout-sessions:
+  post:
+    operationId: CreateCloudBillingCheckoutSession
+    summary: Create a cloud billing (owner-credit) Stripe Checkout session
+    tags: [cloud-billing]
+    description: >-
+      Forwards POST /api/v1/billing/checkout-sessions. Body shape per the
+      handler's own comment (not enforced by a local Go struct — forwarded
+      as opaque validated-JSON bytes): `{tier_id, customer_email?}`. 이 요청
+      바디 필드는 핸들러 주석 기준이며 Go 구조체로 강제되지 않음 — 업스트림
+      계약, 소스에서 타입 검증 불가.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: >-
+              Not locally typed; proxyCloudRuntime only checks the body is
+              syntactically valid JSON (readCloudRuntimeJSONBody) before
+              forwarding. Per-comment shape: `{tier_id, customer_email?}`.
+            additionalProperties: true
+    responses:
+      "200":
+        description: Upstream Checkout session payload, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: Request body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/checkout-sessions/{sessionId}:
+  get:
+    operationId: GetCloudBillingCheckoutSession
+    summary: Get a cloud billing Checkout session by id
+    tags: [cloud-billing]
+    description: >-
+      Forwards GET /api/v1/billing/checkout-sessions/{session_id}.
+      `sessionId` is allow-list validated locally before being spliced into
+      the upstream URL (isValidStripeSessionID: non-empty
+      `[A-Za-z0-9_]+`, handler ~line 451) to prevent path/query injection
+      into the proxied request — not a Stripe-format check per se.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9_]+$'
+    responses:
+      "200":
+        description: Upstream Checkout session payload, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: session_id missing or fails the allow-list pattern.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-billing/portal-sessions:
+  post:
+    operationId: CreateCloudBillingPortalSession
+    summary: Create a Stripe Billing Portal session for the caller
+    tags: [cloud-billing]
+    description: >-
+      Forwards POST /api/v1/billing/portal-sessions. No request body is read
+      or forwarded locally (handler explicitly omits withBody — comment:
+      "can be empty... explicitly do NOT mark withBody and also send no body
+      upstream").
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Upstream Billing Portal session payload, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard rejected a machine credential, or cloud runtime is not configured.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/summary:
+  get:
+    operationId: GetCloudWorkspaceSubscriptionSummary
+    summary: Get the active workspace's subscription summary
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards GET /api/v1/subscriptions/{workspaceId}/summary
+      (server/internal/handler/cloud_billing.go,
+      GetCloudWorkspaceSubscriptionSummary). Member-readable (any workspace
+      role). Served from Cloud's own database without calling Stripe, so it
+      stays available while Stripe is degraded; a Cloud build that predates
+      this endpoint answers 404, which the client must NOT treat as "Free"
+      (handler doc comment).
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: Upstream subscription summary, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: No resolvable workspace_id/workspace_slug.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Any of: human-actor-only guard rejected a machine credential;
+          workspace_subscriptions_disabled feature flag off (ErrorCode);
+          caller is not a workspace member.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "404":
+        description: Cloud build predates this endpoint — MUST NOT be read as "Free" (handler doc comment).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/prices:
+  get:
+    operationId: GetCloudWorkspaceSubscriptionPrices
+    summary: Get validated per-seat subscription prices
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards GET /api/v1/subscriptions/{workspaceId}/prices.
+      Member-readable. Cloud returns only currency/minor-unit amount/interval
+      — Price and Product IDs stay server-side (handler doc comment); 503
+      when a configured Price cannot be validated upstream (client renders
+      "price confirmed at Checkout" rather than a guessed number).
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: Upstream price payload, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: No resolvable workspace_id/workspace_slug.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard, feature-disabled, or not-a-member (see summary operation above for the same triple).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed (includes "Price cannot be validated", per handler comment surfaced as 503 by Cloud and relayed as a 502/error here — exact passthrough status not independently re-verified).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/checkout-sessions:
+  post:
+    operationId: CreateCloudWorkspaceSubscriptionCheckout
+    summary: Create a workspace subscription Checkout session
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards POST /api/v1/subscriptions/checkout-sessions. The handler
+      injects workspace_id (from context, not trusted from the client) and
+      the authenticated user's stored email server-side — a caller cannot
+      smuggle a different workspace or Stripe payer identity (handler doc
+      comment). Requires workspace role owner or admin
+      (middleware.RequireWorkspaceRole, router.go).
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CloudSubscriptionCheckoutRequest'
+    responses:
+      "200":
+        description: Upstream Checkout session payload, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: Invalid body, bad `interval`, or missing idempotency key (body field or header).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Human-actor-only guard; workspace_subscriptions_disabled
+          (ErrorCode); not a member; or role is neither owner nor admin
+          ("insufficient permissions").
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "500":
+        description: Failed to resolve the checkout payer's email server-side.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/seats/purchase-preview:
+  post:
+    operationId: PreviewCloudWorkspaceSubscriptionSeatPurchase
+    summary: Preview the proration/invoice impact of purchasing additional seats
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards POST /api/v1/subscriptions/{workspaceId}/seats/purchase-preview.
+      Accepts only an additive seat count; Cloud reads the authoritative
+      current quantity and returns Stripe's estimated proration plus the next
+      full recurring invoice (handler doc comment). Requires workspace role
+      owner or admin.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CloudSubscriptionSeatPurchasePreviewRequest'
+    responses:
+      "200":
+        description: Upstream proration/invoice preview, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: Invalid body or additional_seats < 1.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard; feature-disabled; not a member; or insufficient role.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/seats/purchases:
+  post:
+    operationId: PurchaseCloudWorkspaceSubscriptionSeats
+    summary: Confirm and purchase additional workspace subscription seats
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards POST /api/v1/subscriptions/{workspaceId}/seats/purchases. This
+      is the user-confirmed quote from a prior purchase-preview call (not a
+      fresh purchase) — the allowlisted body omits any client workspace or
+      absolute target quantity; Cloud repeats the quote and owns
+      concurrency/idempotency/Stripe writes (handler doc comment). Requires
+      workspace role owner or admin.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CloudSubscriptionSeatPurchaseRequest'
+    responses:
+      "200":
+        description: Upstream purchase confirmation, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: Invalid body, out-of-range field, non-ASCII currency, or missing idempotency key.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard; feature-disabled; not a member; or insufficient role.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/seats/reconcile:
+  post:
+    operationId: ReconcileCloudWorkspaceSubscriptionSeats
+    summary: Ask Cloud to re-count and reconcile workspace seat quantity
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards POST /api/v1/subscriptions/{workspaceId}/seats/reconcile. A
+      hint only — no seat quantity is supplied by this handler or its
+      caller; Cloud re-counts human members from its own least-privilege
+      product-database connection (handler doc comment). No request body.
+      Requires workspace role owner or admin.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: Upstream reconciliation result, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard; feature-disabled; not a member; or insufficient role.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-subscriptions/portal-sessions:
+  post:
+    operationId: CreateCloudWorkspaceSubscriptionPortal
+    summary: Create a Stripe Billing Portal session for the active workspace subscription
+    tags: [cloud-subscriptions]
+    description: >-
+      Forwards POST /api/v1/subscriptions/{workspaceId}/portal-sessions. No
+      request body; an idempotency key is still required (from the header,
+      since no body key can be supplied). Requires workspace role owner or
+      admin.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+    responses:
+      "200":
+        description: Upstream Billing Portal session payload, forwarded verbatim. 소스에서 확인 불가.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudProxyResponse'
+      "400":
+        description: Missing Idempotency-Key header (no body field alternative on this operation).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Human-actor-only guard; feature-disabled; not a member; or insufficient role.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+# --- cloud-runtime: infra-tier, schema omitted per acceptance condition 3 ---
+# Proxies to the same multica-cloud service (Fleet) as cloud-billing, SaaS-API
+# nodes only (self-hosted returns 403 feature-disabled). Sits inside the
+# router's big "workspace-scoped" r.Group (middleware.Auth +
+# middleware.RequireWorkspaceMember) — NOT human-actor-restricted, so an
+# agent task token or cloud-node PAT can call these. Response bodies are
+# opaque upstream proxies, same caveat as cloud-billing above.
+
+/api/cloud-runtime:
+  get:
+    operationId: GetCloudRuntimeService
+    summary: "내부/인프라 전용, 스키마 미기재 — cloud-runtime fleet service root (proxy GET /api/v1/)"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, GetCloudRuntimeService.
+      내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "403":
+        description: Cloud runtime not configured (writeFeatureDisabled, ErrorCode).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/healthz:
+  get:
+    operationId: GetCloudRuntimeHealth
+    summary: "내부/인프라 전용, 스키마 미기재 — proxy GET /healthz on the Fleet service"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, GetCloudRuntimeHealth.
+      despite the name, this sits behind full Auth + workspace-membership
+      (not a public liveness probe like the top-level GET /healthz) —
+      confirmed from its position in router.go's workspace-scoped route
+      group. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/readyz:
+  get:
+    operationId: GetCloudRuntimeReady
+    summary: "내부/인프라 전용, 스키마 미기재 — proxy GET /readyz on the Fleet service"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, GetCloudRuntimeReady. Same
+      auth placement caveat as GetCloudRuntimeHealth above. 내부/인프라
+      전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/nodes:
+  get:
+    operationId: ListCloudRuntimeNodes
+    summary: "내부/인프라 전용, 스키마 미기재 — list cloud-runtime nodes (proxy GET /api/v1/nodes)"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, ListCloudRuntimeNodes. Query
+      string forwarded unchanged (withQuery), not locally typed. 내부/인프라
+      전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  post:
+    operationId: CreateCloudRuntimeNode
+    summary: "내부/인프라 전용, 스키마 미기재 — create a cloud-runtime node (proxy POST /api/v1/nodes)"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, CreateCloudRuntimeNode.
+      Request body forwarded verbatim after a JSON-validity check only; no
+      local struct. Cloud now mints the node's mcn_ PAT itself and injects
+      it via SSM bootstrap — the caller's own PAT is no longer forwarded
+      (handler doc comment, security-relevant). 내부/인프라 전용, 스키마
+      미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: 내부/인프라 전용, 스키마 미기재 — forwarded as opaque validated JSON.
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  delete:
+    operationId: DeleteCloudRuntimeNode
+    summary: "내부/인프라 전용, 스키마 미기재 — delete a cloud-runtime node (proxy DELETE /api/v1/nodes)"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, DeleteCloudRuntimeNode.
+      Unusually for DELETE, this forwards a request body (withBody: true) —
+      the node identifier is presumably in the body, not a path/query param;
+      not locally typed. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: 내부/인프라 전용, 스키마 미기재.
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/nodes/start:
+  post:
+    operationId: StartCloudRuntimeNode
+    summary: "내부/인프라 전용, 스키마 미기재 — start a cloud-runtime node"
+    tags: [cloud-runtime]
+    description: server/internal/handler/cloud_runtime.go, StartCloudRuntimeNode. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/nodes/stop:
+  post:
+    operationId: StopCloudRuntimeNode
+    summary: "내부/인프라 전용, 스키마 미기재 — stop a cloud-runtime node"
+    tags: [cloud-runtime]
+    description: server/internal/handler/cloud_runtime.go, StopCloudRuntimeNode. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/nodes/reboot:
+  post:
+    operationId: RebootCloudRuntimeNode
+    summary: "내부/인프라 전용, 스키마 미기재 — reboot a cloud-runtime node"
+    tags: [cloud-runtime]
+    description: server/internal/handler/cloud_runtime.go, RebootCloudRuntimeNode. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/nodes/status:
+  post:
+    operationId: GetCloudRuntimeNodeStatus
+    summary: "내부/인프라 전용, 스키마 미기재 — get a cloud-runtime node's status"
+    tags: [cloud-runtime]
+    description: >-
+      server/internal/handler/cloud_runtime.go, GetCloudRuntimeNodeStatus.
+      POST despite being a read (node identifier presumably in the body).
+      내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/cloud-runtime/nodes/exec:
+  post:
+    operationId: ExecCloudRuntimeNode
+    summary: "내부/인프라 전용, 스키마 미기재 — execute a command on a cloud-runtime node"
+    tags: [cloud-runtime]
+    description: server/internal/handler/cloud_runtime.go, ExecCloudRuntimeNode. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Opaque upstream proxy.
+      "400":
+        description: Body missing, oversized, or not valid JSON.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Cloud runtime not configured.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream request failed.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+# --- integrations: Composio (full schema per acceptance condition 2) ---
+
+/api/integrations/composio/connect/init:
+  post:
+    operationId: ComposioConnectInit
+    summary: Start a hosted Composio auth flow for a toolkit
+    tags: [integrations]
+    description: >-
+      server/internal/handler/integrations_composio.go, ComposioConnectInit.
+      User-scoped (a Composio connection belongs to a user, not a
+      workspace) — sits under plain Auth, no workspace-membership
+      requirement. 403 (ErrorCode composio_not_configured) when
+      COMPOSIO_API_KEY is unset or the composio_mcp_apps feature flag is off.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ComposioConnectInitRequest'
+    responses:
+      "200":
+        description: Redirect URL for the hosted Composio Connect flow.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ComposioConnectInitResponse'
+      "400":
+        description: Invalid body, blank toolkit_slug, or unsupported toolkit.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Composio integration not configured or feature-flagged off.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Failed to start the Composio connect flow upstream.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/integrations/composio/callback:
+  get:
+    operationId: ComposioCallback
+    summary: Composio hosted-flow OAuth browser redirect target
+    tags: [integrations]
+    description: >-
+      server/internal/handler/integrations_composio.go, ComposioCallback.
+      PUBLIC route (outside the Auth group — MUL-3843): the browser
+      frequently arrives here without a session cookie (expired session,
+      SameSite/ITP stripping, private window, self-hosted callback
+      subdomain). Identity comes solely from the HMAC-signed `state` query
+      param, verified before anything else runs. Always responds with an
+      HTTP redirect (302) back to the settings page, success or failure —
+      every failure mode collapses to the same generic error redirect so the
+      browser is never left on a blank API response and the caller can't
+      distinguish which check failed.
+    security: []
+    parameters:
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+        description: HMAC-signed state token minted when the connect flow began; verified (signature, expiry, replay) before use.
+      - name: status
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Composio-supplied flow outcome signal. Allowed value set not independently re-verified (소스에서 확인 불가 beyond "non-success collapses to failure").
+      - name: connected_account_id
+        in: query
+        required: false
+        schema:
+          type: string
+    responses:
+      "302":
+        description: >-
+          Redirect to the settings page, with a success or generic-failure
+          indicator in the query string (h.Composio.CallbackRedirect). No
+          JSON body — 내부/인프라 전용, 스키마 미기재 for the redirect
+          target's own query shape.
+      "403":
+        description: Composio integration not configured or feature-flagged off.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+
+/api/integrations/composio/connections:
+  get:
+    operationId: ListComposioConnections
+    summary: List the caller's active Composio connections
+    tags: [integrations]
+    description: server/internal/handler/integrations_composio.go, ListComposioConnections.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: The caller's connections.
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/ComposioConnectionResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Composio integration not configured or feature-flagged off.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "500":
+        description: Failed to list connections.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/integrations/composio/toolkits:
+  get:
+    operationId: ListComposioToolkits
+    summary: List connectable Composio toolkits
+    tags: [integrations]
+    description: >-
+      server/internal/handler/integrations_composio.go, ListComposioToolkits.
+      Catalog is project-global (not per-user), but the route itself is
+      user-scoped like the rest of the Composio block.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Connectable toolkit catalog.
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/ComposioToolkitResponse'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Composio integration not configured or feature-flagged off.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "502":
+        description: Upstream/resolver failure listing toolkits.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/integrations/composio/connections/{id}:
+  delete:
+    operationId: DeleteComposioConnection
+    summary: Disconnect a Composio connection the caller owns
+    tags: [integrations]
+    description: >-
+      server/internal/handler/integrations_composio.go,
+      DeleteComposioConnection. Idempotent at the service layer; a
+      connection that does not belong to the caller is a 404 (never leaks
+      existence of another user's connection).
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "204":
+        description: Disconnected. No body.
+      "400":
+        description: id is not a valid UUID.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Composio integration not configured or feature-flagged off.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+      "404":
+        description: Connection not found, or does not belong to the caller.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "502":
+        description: Upstream failure disconnecting.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+# --- social bindings: full schema per acceptance condition 2 ---
+# All five follow one pattern (confirmed identical across lark.go, slack.go,
+# dingtalk.go, wecom_web.go, telegram.go): NOT workspace-scoped — the
+# redeemer hits this BEFORE they have any workspace context, since
+# redemption is what mints the binding row. Identity comes from the
+# logged-in session, not the token; the token only proves "this <platform>
+# id requested binding". Plain Auth group (requireUserID), no
+# RequireHumanActor, so technically any of the four schemes authenticates
+# it, though the realistic caller is a browser session following a bot
+# deep-link.
+
+/api/lark/binding/redeem:
+  post:
+    operationId: RedeemLarkBindingToken
+    summary: Redeem a Lark account-binding token
+    tags: [bindings]
+    description: >-
+      server/internal/handler/lark.go, RedeemLarkBindingToken. Consume +
+      bind happen in one DB transaction
+      (lark.BindingTokenService.RedeemAndBind).
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RedeemLarkBindingTokenRequest'
+    responses:
+      "200":
+        description: Bound successfully.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemLarkBindingTokenResponse'
+      "400":
+        description: Invalid body or blank token.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Either "lark integration not configured" (ErrorCode
+          lark_not_configured) or "binding refused (are you a workspace
+          member?)" (plain Error, lark.ErrBindingNotWorkspaceMember).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+      "409":
+        description: This Lark open_id is already bound to a different Multica user.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "410":
+        description: Binding token unknown, consumed, or expired.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "500":
+        description: Unclassified redemption failure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/slack/binding/redeem:
+  post:
+    operationId: RedeemSlackBindingToken
+    summary: Redeem a Slack account-binding token
+    tags: [bindings]
+    description: server/internal/handler/slack.go, RedeemSlackBindingToken. Same transactional redeem+bind pattern as Lark.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RedeemSlackBindingTokenRequest'
+    responses:
+      "200":
+        description: Bound successfully.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemSlackBindingTokenResponse'
+      "400":
+        description: Invalid body or blank token.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Either "slack integration not configured" (ErrorCode
+          slack_not_configured) or "binding refused (are you a workspace
+          member?)" (plain Error).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+      "409":
+        description: This Slack account is already bound to a different Multica user.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "410":
+        description: Binding token unknown, consumed, or expired.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "500":
+        description: Unclassified redemption failure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/dingtalk/binding/redeem:
+  post:
+    operationId: RedeemDingTalkBindingToken
+    summary: Redeem a DingTalk account-binding token
+    tags: [bindings]
+    description: >-
+      server/internal/handler/dingtalk.go, RedeemDingTalkBindingToken. Same
+      pattern as Lark/Slack; additionally publishes
+      EventDingTalkAccountBindingUpdated on success.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RedeemDingTalkBindingTokenRequest'
+    responses:
+      "200":
+        description: Bound successfully.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemDingTalkBindingTokenResponse'
+      "400":
+        description: Invalid body or blank token.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Either "dingtalk integration not configured" (ErrorCode
+          dingtalk_not_configured) or "binding refused (are you a workspace
+          member?)" (plain Error).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+      "409":
+        description: This DingTalk account is already bound to a different Multica user.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "410":
+        description: Binding token unknown, consumed, or expired.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "500":
+        description: Unclassified redemption failure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/wecom/binding/redeem:
+  post:
+    operationId: RedeemWecomBindingToken
+    summary: Redeem a WeCom account-binding token
+    tags: [bindings]
+    description: >-
+      server/internal/handler/wecom_web.go, RedeemWecomBindingToken. Same
+      pattern as Lark/Slack; request body additionally size-capped
+      (wecomBodyLimit) before decoding.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RedeemWecomBindingTokenRequest'
+    responses:
+      "200":
+        description: Bound successfully.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemWecomBindingTokenResponse'
+      "400":
+        description: Invalid body, oversized body, or blank token.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Either "wecom integration not configured" (ErrorCode
+          wecom_not_configured) or "binding refused (are you a workspace
+          member?)" (plain Error).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+      "409":
+        description: This WeCom user is already bound to a different Multica user.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "410":
+        description: Binding token unknown, consumed, or expired.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "500":
+        description: Unclassified redemption failure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/telegram/binding/redeem:
+  post:
+    operationId: RedeemTelegramBindingToken
+    summary: Redeem a Telegram account-binding token
+    tags: [bindings]
+    description: server/internal/handler/telegram.go, RedeemTelegramBindingToken. Status codes mirror the Slack redeem handler (handler doc comment).
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RedeemTelegramBindingTokenRequest'
+    responses:
+      "200":
+        description: Bound successfully.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemTelegramBindingTokenResponse'
+      "400":
+        description: Invalid body or blank token.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: >-
+          Either "telegram integration not configured" (ErrorCode
+          telegram_not_configured) or "binding refused (are you a workspace
+          member?)" (plain Error).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+      "409":
+        description: This Telegram account is already bound to a different Multica user.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "410":
+        description: Binding token unknown, consumed, or expired.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "500":
+        description: Unclassified redemption failure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+# --- remaining infra / misc routes (38 of the 58) — schema omitted, path +
+# method + security verified against router.go and the handler source ---
+
+/health:
+  get:
+    operationId: GetLiveness
+    summary: Process liveness check
+    tags: [infra]
+    description: >-
+      server/cmd/server/health.go, (*serverHealth).liveHandler. Always 200 —
+      proves the process is up and answering HTTP, nothing about DB
+      readiness (see GET /readyz for that).
+    security: []
+    responses:
+      "200":
+        description: Always 200.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LiveResponse'
+
+/readyz:
+  get:
+    operationId: GetReadiness
+    summary: Process readiness check (DB + migrations)
+    tags: [infra]
+    description: >-
+      server/cmd/server/health.go, (*serverHealth).readyHandler. 200 when
+      ready, 503 otherwise. Cached per-process up to 3s. Identical handler
+      to GET /healthz.
+    security: []
+    responses:
+      "200":
+        description: Ready.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadinessResponse'
+      "503":
+        description: Not ready (DB unreachable or required migrations not fully applied).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadinessResponse'
+
+/healthz:
+  get:
+    operationId: GetReadinessAlias
+    summary: Process readiness check (alias of GET /readyz)
+    tags: [infra]
+    description: server/cmd/server/health.go — mounted on the exact same handler as GET /readyz (router.go ~line 1436).
+    security: []
+    responses:
+      "200":
+        description: Ready.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadinessResponse'
+      "503":
+        description: Not ready.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadinessResponse'
+
+/health/realtime:
+  get:
+    operationId: GetRealtimeMetrics
+    summary: "내부/인프라 전용, 스키마 미기재 — realtime subsystem operational counters"
+    tags: [infra]
+    description: >-
+      server/cmd/server/health_realtime.go, realtimeMetricsHandler (MUL-1342).
+      NOT one of the five documented securitySchemes — flagged deviation:
+      access is either (a) `Authorization: Bearer <REALTIME_METRICS_TOKEN>`
+      when that env var is set, a bespoke shared-secret scheme distinct from
+      every mul_/mat_/mcn_/cookie/mdt_ scheme in securitySchemes.yaml, or (b)
+      direct-loopback-only (127.0.0.1/::1, no forwarding headers) when the
+      env var is unset, in which case non-loopback callers get 404 (not 401)
+      so the endpoint is not enumerable. 내부/인프라 전용, 스키마 미기재.
+    security: []
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. JSON snapshot of realtime + daemonws counters.
+      "401":
+        description: Token configured but missing/wrong (WWW-Authenticate challenge set).
+      "404":
+        description: No token configured and caller is not direct-loopback (endpoint hidden, not merely denied).
+
+/ws:
+  get:
+    operationId: ConnectRealtimeWebSocket
+    summary: "내부/인프라 전용, 스키마 미기재 — primary realtime WebSocket upgrade"
+    tags: [infra]
+    description: >-
+      server/cmd/server/router.go ~line 1459 -> realtime.HandleWebSocket
+      (server/internal/realtime/hub.go). "Cookie or first-message auth" per
+      the function's own doc comment — not gated by any of the standard
+      securitySchemes at the HTTP-upgrade layer; workspace is resolved from
+      a `workspace_id` or `workspace_slug` query parameter. Not representable
+      as a normal HTTP request/response pair. 내부/인프라 전용, 스키마
+      미기재.
+    security: []
+    parameters:
+      - name: workspace_id
+        in: query
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: workspace_slug
+        in: query
+        required: false
+        schema:
+          type: string
+    responses:
+      "101":
+        description: Switching Protocols — WebSocket handshake accepted. No body.
+
+/uploads/{path}:
+  get:
+    operationId: ServeLocalUpload
+    summary: "내부/인프라 전용, 스키마 미기재 — local-disk file serving (LocalStorage backend only)"
+    tags: [infra]
+    description: >-
+      server/internal/handler/file.go, ServeLocalUpload. Only mounted when
+      the server is configured with the LocalStorage backend
+      (router.go ~line 1470, type-asserted); 404 if a different storage
+      backend is active (the route is unregistered in that case — this
+      operation entry documents the chi pattern, not a guaranteed-live
+      route). Served through the handler (not a bare static file server) so
+      it carries the same preview security headers as the authenticated
+      attachment-download endpoint. The route is registered in chi as a
+      `*` wildcard (matches any number of remaining path segments);
+      OpenAPI 3.1 path templating has no wildcard syntax, so it is
+      represented here as a single named path parameter `path` holding the
+      full remaining segment verbatim — this is a documentation-format
+      substitution, not a change to the actual route shape.
+      내부/인프라 전용, 스키마 미기재.
+    security: []
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Storage key, taken verbatim from the URL path after `/uploads/`.
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Raw file bytes with the stored content type.
+      "404":
+        description: Backend is not LocalStorage, or the key does not resolve to a file.
+
+/api/avatars/{sig}/{path}:
+  get:
+    operationId: ServeAvatar
+    summary: "내부/인프라 전용, 스키마 미기재 — HMAC-signed public avatar image serving"
+    tags: [infra]
+    description: >-
+      server/internal/handler/avatar.go, ServeAvatar. Public by necessity
+      (handler doc comment): the auth cookie is SameSite=Strict, so this
+      cannot be a cookie-gated URL for a native <img src> from
+      Desktop/mobile webview or a split-origin self-hosted web app. The
+      HMAC signature in `{sig}` is the sole credential; it covers the
+      storage key, only image keys resolve, and the object must be
+      avatar-class. Deny shape is a flat 404 for every failure reason (bad
+      signature, unknown key, non-image key, non-publishable object) so the
+      route is not an existence oracle. The trailing segment is a chi `*`
+      wildcard (matches any number of remaining path segments); OpenAPI
+      3.1 has no wildcard path syntax, so it is represented here as a
+      named path parameter `path` — a documentation-format substitution,
+      not a change to the actual route shape. 내부/인프라 전용, 스키마
+      미기재.
+    security: []
+    parameters:
+      - name: sig
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: URL-escaped storage key.
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Raw image bytes.
+      "404":
+        description: Bad signature, unknown/non-image key, or object not avatar-class-publishable (indistinguishable by design).
+
+/plugin-surfaces/{token}:
+  get:
+    operationId: ServePluginSurface
+    summary: "내부/인프라 전용, 스키마 미기재 — capability-authenticated hosted plugin document"
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_surface.go, ServePluginSurface. Only
+      served on the dedicated Plugin Surface origin
+      (h.cfg.PluginSurfaceOrigin matched against the request Host);
+      intentionally outside the session middleware so that origin stays
+      cookie-free. The handler itself 400s a request that carries a Cookie
+      or Authorization header — the deployment promise is enforced at the
+      boundary, not just by omission. The encrypted path `{token}` binds
+      installation + immutable version + surface + one bridge challenge.
+      내부/인프라 전용, 스키마 미기재.
+    security: []
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재. Hosted plugin document bytes.
+      "400":
+        description: Request carried a Cookie or Authorization header (forbidden on this origin by design).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "404":
+        description: Wrong host for the configured Plugin Surface origin, or token invalid/unresolvable.
+
+/api/config:
+  get:
+    operationId: GetConfig
+    summary: Public runtime configuration for the web/desktop frontend
+    tags: [infra]
+    description: >-
+      server/internal/handler/config.go, GetConfig. PUBLIC
+      (unauthenticated) — called before login to decide whether to render
+      Google sign-in / signup UI. Per the handler's own doc comment, only
+      fields safe for an anonymous caller may ever be added here.
+    security: []
+    responses:
+      "200":
+        description: Runtime config.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppConfig'
+
+/api/github/setup:
+  get:
+    operationId: GitHubSetupCallback
+    summary: GitHub App post-install setup browser redirect target
+    tags: [infra]
+    description: >-
+      server/internal/handler/github.go, GitHubSetupCallback. PUBLIC route
+      hit by GitHub's post-install browser redirect; identity/workspace
+      comes from the HMAC-signed `state` query param
+      (verifyStateWithReturn), not from a session. Always responds with a
+      redirect to the Settings page, success or failure (missing
+      installation_id / invalid state collapse to a settings-page redirect
+      with a `github_error` query flag). 내부/인프라 전용, 스키마 미기재
+      for the redirect target's own query shape.
+    security: []
+    parameters:
+      - name: installation_id
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+    responses:
+      "302":
+        description: Redirect to the Settings page, success or error-flagged.
+
+/auth/logout:
+  post:
+    operationId: Logout
+    summary: Clear the browser session cookies
+    tags: [infra]
+    description: >-
+      server/internal/handler/auth.go, Logout. PUBLIC route (outside the
+      Auth middleware group — router.go ~line 1510, the "Auth (public)"
+      block). Calling it without a session is a no-op that still returns
+      200; it does not require or check prior authentication.
+    security: []
+    responses:
+      "200":
+        description: Cookies cleared (or were already absent).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                  const: logged out
+              additionalProperties: false
+
+/api/auth/refresh:
+  post:
+    operationId: RefreshSession
+    summary: Renew the caller's interactive session if inside its renewal window
+    tags: [infra]
+    description: >-
+      server/internal/handler/session.go, RefreshSession. For clients that
+      hold the session as a string (Desktop localStorage, mobile Keychain);
+      browsers don't need this — their cookie is renewed inline by
+      middleware.Auth. Deviation flag: the Authorization-header path here
+      accepts a raw session JWT, not a mul_ PAT, so it is NOT truly
+      "PersonalAccessToken" — Stage 1's securitySchemes.yaml does not model
+      a distinct "bearer JWT" scheme, so PersonalAccessToken is reused below
+      as the closest available header-based scheme (same gap the
+      AuthorizationHeader parameter's own description already notes: "a JWT
+      is also accepted on this header for parity with the cookie session").
+      A PAT (mul_), agent task token (mat_), or cloud-node PAT (mcn_) all
+      authenticate fine at the middleware but are refused by this handler
+      with 400 ("only interactive sessions can be refreshed") — none of
+      them is a renewable interactive session.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: >-
+          Always 200 once past the interactive-session check — `renewed:
+          false` is a normal answer (outside the renewal window, or a
+          non-fatal re-sign failure), not an error.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshSessionResponse'
+      "400":
+        description: Not authenticated via an interactive session (PAT/task-token/cloud-PAT caller, or missing token).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Session subject does not match the authenticated caller (forged-header defense in depth).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Caller is a temporarily disabled user (auth.ErrTemporarilyDisabledUser).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/feedback:
+  post:
+    operationId: CreateFeedback
+    summary: Submit in-app user feedback
+    tags: [infra]
+    description: server/internal/handler/feedback.go, CreateFeedback. Plain Auth group, no workspace-membership requirement.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [message, url, kind]
+            properties:
+              message:
+                type: string
+              url:
+                type: string
+              kind:
+                type: string
+                description: >-
+                  Metric label via metrics.NormalizeFeedbackKind's fixed
+                  allow-list ("bug","feature","general","praise"); anything
+                  else collapses to "other" for the metric. Empty/missing
+                  falls back to "general" server-side for legacy-client
+                  compatibility. Not enforced as a hard validation error
+                  here (소스에서 확인 불가 beyond the metric-normalization
+                  comment).
+              workspace_id:
+                type: string
+                format: uuid
+              context:
+                type: object
+                properties:
+                  kind:
+                    type: string
+                  trigger:
+                    type: string
+                  error:
+                    type: object
+                    required: [name, message]
+                    properties:
+                      name:
+                        type: string
+                      message:
+                        type: string
+                      stack:
+                        type: string
+                    additionalProperties: false
+                additionalProperties: false
+            additionalProperties: false
+    responses:
+      "200":
+        description: Feedback recorded.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, created_at]
+              properties:
+                id:
+                  type: string
+                created_at:
+                  type: string
+              additionalProperties: false
+      "400":
+        description: Invalid body, oversized body, or blank message.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/plugin-bridge/v1/hooks/{key}:
+  post:
+    operationId: InvokePluginHook
+    summary: "내부/인프라 전용, 스키마 미기재 — invoke a UI/manual plugin hook over the browser-session bridge"
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_hook.go, InvokePluginHook. Path
+      corrected from the originating ticket's "POST /hooks/{key}" — see
+      this file's header comment for why. Sits under the browser-session
+      relay group (router.go ~line 1626-1636, middleware.Auth) used by the
+      host page to talk to sandboxed plugin surfaces over the postMessage
+      bridge; "ui"/"manual" triggers only (an "event" trigger is dispatched
+      internally off the event bus, "agent" arrives over MCP, neither goes
+      through this HTTP endpoint). 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: 내부/인프라 전용, 스키마 미기재.
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/search-index/manifest:
+  get:
+    operationId: GetSearchIndexManifest
+    summary: "내부/인프라 전용, 스키마 미기재 — local search index sync manifest (Web/Desktop only, MUL-7754)"
+    tags: [infra]
+    description: >-
+      server/internal/handler/search_index.go, GetSearchIndexManifest.
+      Workspace-scoped (middleware.RequireWorkspaceMember) AND human-actor
+      restricted (handler.RequireHumanActor) AND gated by
+      h.RequireLocalSearchIndex (feature-availability middleware) — agents
+      search through GET/POST /api/issues/search instead (handler doc
+      comment). 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member, human-actor guard rejected a machine credential, or local search index unavailable for this deployment.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+
+/api/search-index/snapshot:
+  get:
+    operationId: GetSearchIndexSnapshot
+    summary: "내부/인프라 전용, 스키마 미기재 — local search index sync snapshot (Web/Desktop only)"
+    tags: [infra]
+    description: >-
+      server/internal/handler/search_index.go, GetSearchIndexSnapshot. Same
+      guard stack as GetSearchIndexManifest. Accepts an `after_number` query
+      param (parsed as int64 if present). 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: after_number
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace, or after_number is not a valid integer.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member, human-actor guard rejected a machine credential, or local search index unavailable.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+
+/api/search-index/changes:
+  post:
+    operationId: ListSearchIndexChanges
+    summary: "내부/인프라 전용, 스키마 미기재 — local search index incremental change feed (Web/Desktop only)"
+    tags: [infra]
+    description: >-
+      server/internal/handler/search_index.go, ListSearchIndexChanges. Same
+      guard stack as the other two search-index endpoints. Request body is
+      `{cursor: string, limit: int}` per the handler's inline anonymous
+      struct — included here as the one concrete field pair confirmed from
+      source, rest of the response shape 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              cursor:
+                type: string
+              limit:
+                type: integer
+            additionalProperties: false
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace, or invalid body.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member, human-actor guard rejected a machine credential, or local search index unavailable.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+
+/api/issue-wakeup-summaries:
+  get:
+    operationId: ListWorkspaceWakeupSummaries
+    summary: "내부/인프라 전용, 스키마 미기재 — workspace-wide issue wakeup summaries"
+    tags: [infra]
+    description: >-
+      server/internal/handler/issue_wakeup.go, ListWorkspaceWakeupSummaries.
+      Workspace-scoped (RequireWorkspaceMember), no human-actor restriction
+      (agents may call this). 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issue-wakeups:
+  get:
+    operationId: ListWorkspaceWakeups
+    summary: "내부/인프라 전용, 스키마 미기재 — list workspace issue wakeups"
+    tags: [infra]
+    description: server/internal/handler/issue_wakeup.go, ListWorkspaceWakeups. Same guard stack as ListWorkspaceWakeupSummaries; accepts query filters not individually typed here. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/NextCursorParam'
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issue-wakeup-paused:
+  get:
+    operationId: ListPausedWakeups
+    summary: "내부/인프라 전용, 스키마 미기재 — list paused issue wakeups for the workspace"
+    tags: [infra]
+    description: server/internal/handler/issue_wakeup.go, ListPausedWakeups. Same guard stack as ListWorkspaceWakeups. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/system-wakeups:
+  get:
+    operationId: ListWorkspaceSystemWakeups
+    summary: "내부/인프라 전용, 스키마 미기재 — list workspace-level system wakeup rules"
+    tags: [infra]
+    description: server/internal/handler/issue_system_wakeup.go, ListWorkspaceSystemWakeups. Workspace-scoped, no human-actor restriction. 내부/인프라 전용, 스키마 미기재.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/system-wakeups/{rule}:
+  put:
+    operationId: UpdateWorkspaceSystemWakeup
+    summary: "내부/인프라 전용, 스키마 미기재 — update a workspace-level system wakeup rule"
+    tags: [infra]
+    description: >-
+      server/internal/handler/issue_system_wakeup.go,
+      UpdateWorkspaceSystemWakeup. `{rule}` is checked against exactly one
+      known constant (service.SystemRuleChildDone) and 404s otherwise — not
+      an open set of rule names as the path template might suggest.
+      내부/인프라 전용, 스키마 미기재 for the request body
+      (service.SystemWakeupInput).
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: rule
+        in: path
+        required: true
+        schema:
+          type: string
+          const: child_done
+          description: >-
+            Only verified value is service.SystemRuleChildDone; the actual
+            string constant's value was not independently re-read from
+            source for this entry (소스에서 확인 불가 — flagged rather than
+            guessed as "child_done").
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: 내부/인프라 전용, 스키마 미기재 — service.SystemWakeupInput, not read for this ticket.
+            additionalProperties: true
+    responses:
+      "200":
+        description: 내부/인프라 전용, 스키마 미기재.
+      "400":
+        description: No resolvable workspace, or invalid body.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "401":
+        description: Not authenticated.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "403":
+        description: Not a workspace member.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      "404":
+        description: rule is not the one known constant.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'

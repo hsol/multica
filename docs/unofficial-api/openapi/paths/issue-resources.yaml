@@ -1,0 +1,1387 @@
+# Domain: 이슈 보조 리소스 — labels, properties, issue-statuses, issue-views
+# (+ view-bar preferences), pins, quick-actions (29 endpoints).
+# Source: server/internal/handler/{label,property,issue_status,issue_view,
+# issue_view_preference,pin,quick_action}.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+#
+# All 29 operations below live inside the single workspace-scoped route
+# group in server/cmd/server/router.go (~line 1983:
+# `r.Group(func(r chi.Router) { r.Use(middleware.RequireWorkspaceMember(queries)) ... })`),
+# itself nested under the outer `middleware.Auth` group. Every operation
+# therefore:
+#   - accepts the same 4 credentials middleware.Auth dispatches on
+#     (PersonalAccessToken / AgentTaskToken / CloudNodePAT / BrowserSession —
+#     see components/securitySchemes.yaml; CloudNodePAT resolves to a real
+#     X-User-ID via the cloud-fleet owner lookup, so it satisfies
+#     RequireWorkspaceMember like any other credential, unlike the `/api/me`
+#     family some other domain tickets scoped to 4 schemes vs. 3 — included
+#     here per "구현이 정본": server/internal/middleware/auth.go ~line 183);
+#   - requires X-Workspace-ID or X-Workspace-Slug to resolve a workspace,
+#     and a valid user to resolve a member — both enforced by
+#     RequireWorkspaceMember (server/internal/middleware/workspace.go
+#     ~line 195). The exact failure split is:
+#       400 "workspace_id or workspace_slug is required" — neither header present
+#       400 "invalid workspace_id" — header value is not a UUID (direct ID path only)
+#       401 "user not authenticated" — no resolvable user from the credential
+#       404 "workspace not found" — header resolved, but no membership row
+#         for this user in that workspace
+#     These four are common to literally every operation below via the
+#     shared middleware and are NOT repeated per-operation (matching the
+#     precedent set by the already-reviewed account.yaml / issues-comments
+#     domain files) — only each handler's OWN additional validation and
+#     authorization branches are documented per-operation.
+
+/api/quick-actions:
+  get:
+    operationId: listQuickActions
+    summary: List the workspace's quick action catalog
+    description: >-
+      server/internal/handler/quick_action.go:487-520 (`ListQuickActions`).
+      No permission filtering beyond `private` ownership — every other row
+      (including one whose bound target the caller cannot invoke) is
+      returned to every member; RunQuickAction is the only place invoke
+      permission is checked.
+    tags: [Quick Actions]
+    security: &workspaceAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters: &workspaceHeaders
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: include_archived
+        in: query
+        required: false
+        schema: { type: string, enum: ["true", "false"] }
+        description: Exact string "true"; any other value (including absence) excludes archived (status=archived) actions.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quick_actions]
+              properties:
+                quick_actions:
+                  type: array
+                  items: { $ref: '#/components/schemas/QuickActionResponse' }
+      '500':
+        description: '"failed to list quick actions".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createQuickAction
+    summary: Create a quick action
+    description: >-
+      server/internal/handler/quick_action.go:522-594 (`CreateQuickAction`).
+      Agent actors are rejected outright. A `public` action additionally
+      requires owner/admin; a `private` one may be created by any member.
+      Capped at 30 active actions per workspace.
+    tags: [Quick Actions]
+    security: *workspaceAuth
+    parameters: *workspaceHeaders
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateQuickActionRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuickActionResponse' }
+      '400':
+        description: Invalid body, invalid visibility, name/prompt/description validation failure, invalid assignee_type/assignee_id, assignee not found in this workspace, a public action bound to a non-everyone-invocable agent, or the 30-active-action cap reached.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              visibility: { value: { error: "visibility must be \"public\" or \"private\"" } }
+              name: { value: { error: "name is required" } }
+              assigneeType: { value: { error: "assignee_type must be \"agent\" or \"squad\"" } }
+              prompt: { value: { error: "template variables are not supported yet; remove {{issue.title}} — the agent already reads this issue" } }
+              mention: { value: { error: "the prompt cannot @mention an agent, squad, or person; a quick action reaches exactly the one target it is bound to (an issue link is fine)" } }
+              targetNotFound: { value: { error: "assignee not found in this workspace" } }
+              notInvocable: { value: { error: "a public quick action must use an agent every workspace member can trigger; make the agent public or set this action to private" } }
+              cap: { value: { error: "a workspace can have at most 30 active quick actions; archive one first" } }
+      '403':
+        description: Caller is an agent actor (forbidden from managing quick actions at all), or a `public` action requires owner/admin and the caller has neither role.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot manage quick actions" } }
+              role: { value: { error: "insufficient permissions" } }
+      '500':
+        description: '"failed to create quick action".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/quick-actions/{id}:
+  patch:
+    operationId: updateQuickAction
+    summary: Update a quick action
+    description: >-
+      server/internal/handler/quick_action.go:596-715 (`UpdateQuickAction`).
+      All body fields optional. The role gate is evaluated against the
+      RESULTING visibility (so flipping private -> public requires
+      owner/admin) and also reapplied if the action is ALREADY public (so a
+      member cannot rewrite a public action's prompt without the role).
+      assignee_type/assignee_id move together and are re-validated against
+      the resulting visibility even when only one of the two changes.
+    tags: [Quick Actions]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateQuickActionRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuickActionResponse' }
+      '400':
+        description: Invalid body, invalid visibility/name/description/prompt/assignee, assignee not found or not everyone-invocable for a public action, invalid status value, or reactivating would exceed the 30-active-action cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              status: { value: { error: "status must be \"active\" or \"archived\"" } }
+              cap: { value: { error: "a workspace can have at most 30 active quick actions" } }
+      '403':
+        description: Caller is an agent actor, or the (resulting or existing) visibility is public and the caller lacks owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot manage quick actions" } }
+              role: { value: { error: "insufficient permissions" } }
+      '404':
+        description: 'Quick action not found in this workspace, or (per loadReachableQuickAction) exists but is `private` and owned by someone else — both report identically so a foreign private action''s existence never leaks.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "quick action not found" }
+      '500':
+        description: '"failed to update quick action".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  delete:
+    operationId: deleteQuickAction
+    summary: Delete a quick action
+    description: >-
+      server/internal/handler/quick_action.go:717-751 (`DeleteQuickAction`).
+      A `public` action is workspace furniture and requires owner/admin; a
+      `private` one may only be deleted by its own creator (403 for anyone
+      else, including other owner/admins).
+    tags: [Quick Actions]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted.
+      '403':
+        description: Caller is an agent actor; the action is public and the caller lacks owner/admin; or the action is private and the caller is not its creator.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot manage quick actions" } }
+              role: { value: { error: "insufficient permissions" } }
+              notCreator: { value: { error: "only the creator can delete a private quick action" } }
+      '404':
+        description: Quick action not found in this workspace (or a foreign private one).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "quick action not found" }
+      '500':
+        description: '"failed to delete quick action".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/properties:
+  get:
+    operationId: listProperties
+    summary: List the workspace's custom issue property definitions
+    description: server/internal/handler/property.go:421-442 (`ListProperties`). Readable by any member; no role gate.
+    tags: [Properties]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: include_archived
+        in: query
+        required: false
+        schema: { type: string, enum: ["true", "false"] }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [properties, total]
+              properties:
+                properties:
+                  type: array
+                  items: { $ref: '#/components/schemas/PropertyResponse' }
+                total: { type: integer }
+      '500':
+        description: '"failed to list properties".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createProperty
+    summary: Create a custom issue property definition
+    description: >-
+      server/internal/handler/property.go:467-542 (`CreateProperty`).
+      Human owner/admin members only — agent actors are rejected outright,
+      regardless of role, so an admin's agent cannot mass-create fields.
+      Capped at 20 active definitions per workspace (checked atomically
+      under an advisory lock against concurrent creates/unarchives).
+    tags: [Properties]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreatePropertyRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyResponse' }
+      '400':
+        description: Invalid body, invalid name (empty, too long, control characters, or reserved), invalid type, description too long, invalid icon, invalid/missing select config, or the 20-active-definition cap reached.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              reserved: { value: { error: "\"status\" is reserved for a built-in issue field" } }
+              invalidType: { value: { error: "invalid type \"foo\"; valid types: text, number, select, multi_select, date, checkbox, url, actor, multi_actor" } }
+              noOptions: { value: { error: "select properties require at least one option" } }
+              cap: { value: { error: "a workspace cannot have more than 20 active properties; archive unused ones first" } }
+      '403':
+        description: Caller is an agent actor, or a human member without owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot manage property definitions" } }
+              role: { value: { error: "insufficient permissions" } }
+      '409':
+        description: A property with that (normalized) name already exists in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a property with that name already exists" }
+      '500':
+        description: '"failed to create property".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/properties/{id}:
+  get:
+    operationId: getProperty
+    summary: Get a custom issue property definition
+    description: server/internal/handler/property.go:444-465 (`GetProperty`). Readable by any member; no role gate.
+    tags: [Properties]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyResponse' }
+      '404':
+        description: Property not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "property not found" }
+      '500':
+        description: '"failed to get property".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  patch:
+    operationId: updateProperty
+    summary: Update a custom issue property definition
+    description: >-
+      server/internal/handler/property.go:544-665 (`UpdateProperty`). Human
+      owner/admin only, like create. All body fields optional. Removing a
+      select option still referenced by at least one issue is rejected with
+      409 naming the options and their usage counts; `archived: false` is
+      rejected once the workspace is back at the 20-active cap. The whole
+      read-validate-write flow runs under the workspace + property advisory
+      locks shared with SetIssueProperty, closing a TOCTOU between a config
+      edit's usage census and a concurrent value write.
+    tags: [Properties]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdatePropertyRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyResponse' }
+      '400':
+        description: Invalid body, invalid name/description/icon/config, or reactivating (archived:false) would exceed the 20-active cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              cap: { value: { error: "a workspace cannot have more than 20 active properties; archive unused ones first" } }
+      '403':
+        description: Caller is an agent actor, or a human member without owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              agentActor: { value: { error: "agents cannot manage property definitions" } }
+              role: { value: { error: "insufficient permissions" } }
+      '404':
+        description: Property not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "property not found" }
+      '409':
+        description: Renaming to a name already in use, or removing select options still referenced by at least one issue.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              nameTaken: { value: { error: "a property with that name already exists" } }
+              optionsInUse: { value: { error: "cannot remove options still in use: \"Critical\" (3 issues); clear or change those values first" } }
+      '500':
+        description: '"failed to update property".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/labels:
+  get:
+    operationId: listLabels
+    summary: List the workspace's label catalog
+    description: server/internal/handler/label.go:144-164 (`ListLabels`). Readable by any member; `resource_type` filters the catalog (issue/agent/skill share one table).
+    tags: [Labels]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: resource_type
+        in: query
+        required: false
+        schema: { type: string, enum: [issue, agent, skill], default: issue }
+        description: Empty/omitted defaults to "issue".
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [labels, total]
+              properties:
+                labels:
+                  type: array
+                  items: { $ref: '#/components/schemas/LabelResponse' }
+                total: { type: integer }
+      '400':
+        description: resource_type is not one of issue/agent/skill.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "resource_type must be issue, agent, or skill" }
+      '500':
+        description: '"failed to list labels".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createLabel
+    summary: Create a label
+    description: server/internal/handler/label.go:192-238 (`CreateLabel`). No role gate — any member may create a label of any resource_type.
+    tags: [Labels]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateLabelRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabelResponse' }
+      '400':
+        description: Invalid body, invalid/empty/too-long/control-character name, invalid color, or invalid resource_type.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              name: { value: { error: "name is required" } }
+              color: { value: { error: "color must be a 6-digit hex value like #3b82f6" } }
+              resourceType: { value: { error: "resource_type must be issue, agent, or skill" } }
+      '409':
+        description: A label with that name already exists (within this workspace + resource_type).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a label with that name already exists" }
+      '500':
+        description: '"failed to create label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/labels/{id}:
+  get:
+    operationId: getLabel
+    summary: Get a label
+    description: server/internal/handler/label.go:166-190 (`GetLabel`).
+    tags: [Labels]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabelResponse' }
+      '404':
+        description: Label not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "label not found" }
+      '500':
+        description: '"failed to get label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  put:
+    operationId: updateLabel
+    summary: Update a label
+    description: >-
+      server/internal/handler/label.go:240-307 (`UpdateLabel`). All body
+      fields optional. No role gate. The UPDATE statement itself scopes by
+      (id, workspace_id) and a zero-row result is reported as 404 directly
+      (no separate precheck, closing a TOCTOU window).
+    tags: [Labels]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateLabelRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabelResponse' }
+      '400':
+        description: Invalid body, invalid name, or invalid color.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              name: { value: { error: "name is required" } }
+              color: { value: { error: "color must be a 6-digit hex value like #3b82f6" } }
+      '404':
+        description: Label not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "label not found" }
+      '409':
+        description: Renaming to a name already in use.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a label with that name already exists" }
+      '500':
+        description: '"failed to update label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  delete:
+    operationId: deleteLabel
+    summary: Delete a label
+    description: >-
+      server/internal/handler/label.go:309-366 (`DeleteLabel`). No role
+      gate. Transactionally removes every issue/agent/skill label
+      assignment referencing this label (application-level cleanup, not a
+      DB cascade) before deleting the catalog row itself.
+    tags: [Labels]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted.
+      '404':
+        description: Label not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "label not found" }
+      '500':
+        description: '"failed to start transaction", "failed to remove label assignments", "failed to delete label", or "failed to commit label deletion".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-statuses:
+  get:
+    operationId: listIssueStatuses
+    summary: List the workspace's issue status catalog
+    description: >-
+      server/internal/handler/issue_status.go:96-136 (`ListIssueStatuses`,
+      MUL-6243). Readable by any member. Self-heals: seeds the 7 built-in
+      statuses into the catalog on read if the workspace predates this
+      feature and has none yet (idempotent).
+    tags: [Issue Statuses]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: include_archived
+        in: query
+        required: false
+        schema: { type: string }
+        description: Case-insensitive "true" includes archived statuses.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [statuses, categories, total]
+              properties:
+                statuses:
+                  type: array
+                  items: { $ref: '#/components/schemas/IssueStatusResponse' }
+                categories:
+                  type: array
+                  items: { type: string }
+                  description: >-
+                    Despite the field name, this is issuestatus.Canonical() —
+                    the 7 canonical STATUS KEYS (backlog, todo, in_progress,
+                    in_review, blocked, done, cancelled) in display order, not
+                    the 4 lifecycle categories. Confirmed directly from
+                    source (ListIssueStatuses, issue_status.go ~line 131);
+                    not a guess despite how the name reads.
+                total: { type: integer }
+      '500':
+        description: '"failed to list issue statuses".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createIssueStatus
+    summary: Create a custom issue status
+    description: >-
+      server/internal/handler/issue_status.go:139-218 (`CreateIssueStatus`).
+      Owner/admin only. Key derivation (when `key` is omitted) and the
+      insert happen under one EXCLUSIVE catalog lock so two concurrent
+      creates can never derive the same key.
+    tags: [Issue Statuses]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateIssueStatusRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueStatusResponse' }
+      '400':
+        description: Invalid body, invalid name/description length, invalid category, invalid icon, invalid color, invalid explicit key (malformed, or collides with a built-in key/category name), or a derived key could not be produced.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              name: { value: { error: "name must be 1-64 characters" } }
+              category: { value: { error: "category must be one of: unstarted, started, done, closed" } }
+              icon: { value: { error: "invalid status icon" } }
+              color: { value: { error: "color must be a 6-digit hex value like #3b82f6" } }
+      '403':
+        description: Caller lacks owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "insufficient permissions" }
+      '409':
+        description: A status with this key or name already exists.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a status with this key or name already exists" }
+      '500':
+        description: '"failed to create issue status".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-statuses/reorder:
+  patch:
+    operationId: reorderIssueStatuses
+    summary: Reorder one lifecycle category's statuses
+    description: >-
+      server/internal/handler/issue_status.go:529-700 (`ReorderIssueStatuses`).
+      Owner/admin only. Runs entirely inside one transaction holding the
+      EXCLUSIVE catalog lock; the affected-row count is checked against the
+      payload so a concurrently-archived row cannot silently commit a
+      partial reorder. `ids` must list every active status currently in
+      scope exactly once.
+    tags: [Issue Statuses]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ReorderIssueStatusesRequest' }
+    responses:
+      '200':
+        description: OK — the reordered, full catalog (mirrors GET /api/issue-statuses' shape).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [statuses, categories, total]
+              properties:
+                statuses:
+                  type: array
+                  items: { $ref: '#/components/schemas/IssueStatusResponse' }
+                categories:
+                  type: array
+                  items: { type: string }
+                  description: Same Canonical()-not-categories quirk as GET /api/issue-statuses.
+                total: { type: integer }
+      '400':
+        description: Invalid body, invalid category, empty ids, duplicate ids, an id naming a status outside the requested category, or `include_system` is false and an id names a built-in status.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              category: { value: { error: "category must be one of: unstarted, started, done, closed" } }
+              empty: { value: { error: "ids must not be empty" } }
+              duplicate: { value: { error: "duplicate ids" } }
+              wrongCategory: { value: { error: "ids must all belong to the requested category" } }
+      '403':
+        description: Caller lacks owner/admin, or `include_system` is false and an id names a built-in status.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              role: { value: { error: "insufficient permissions" } }
+              systemId: { value: { error: "include_system is required to reorder built-in statuses" } }
+      '404':
+        description: An id does not resolve to any status in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "issue status not found" }
+      '409':
+        description: An id names an already-archived status, `ids` omits an active status in scope, or the catalog changed under the caller mid-reorder (re-derived race, or the UPDATE's affected-row count mismatched).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              archived: { value: { error: "archived statuses cannot be reordered" } }
+              incomplete: { value: { error: "ids must name every active status in the requested reorder scope" } }
+              race: { value: { error: "issue status catalog changed during reorder" } }
+      '500':
+        description: '"failed to reorder issue statuses".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-statuses/{id}:
+  patch:
+    operationId: updateIssueStatus
+    summary: Update a custom issue status's presentation
+    description: >-
+      server/internal/handler/issue_status.go:286-372 (`UpdateIssueStatus`).
+      Owner/admin only. Built-in statuses are entirely immutable (403); an
+      already-archived status is also immutable (409). No key or category
+      field exists on this request — both are permanently fixed at create
+      time.
+    tags: [Issue Statuses]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateIssueStatusRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueStatusResponse' }
+      '400':
+        description: Invalid body, invalid name/description length, invalid color, or invalid icon.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              name: { value: { error: "name must be 1-64 characters" } }
+              icon: { value: { error: "invalid status icon" } }
+      '403':
+        description: Caller lacks owner/admin, or the status is a built-in (immutable regardless of role).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              role: { value: { error: "insufficient permissions" } }
+              builtin: { value: { error: "built-in statuses cannot be modified" } }
+      '404':
+        description: Issue status not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "issue status not found" }
+      '409':
+        description: The status is already archived, or it stopped being editable (e.g. concurrently archived) / a rename collided with an existing name.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              archived: { value: { error: "archived statuses cannot be modified" } }
+              raced: { value: { error: "status is no longer editable" } }
+              nameTaken: { value: { error: "a status with this name already exists" } }
+      '500':
+        description: '"failed to update issue status".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  delete:
+    operationId: archiveIssueStatus
+    summary: Archive a custom issue status
+    description: >-
+      server/internal/handler/issue_status.go:386-459 (`ArchiveIssueStatus`).
+      Owner/admin only. Retires a status from future assignment; rejected
+      with 409 (structured body, not the shared Error/ErrorCode shape) while
+      any issue still uses it. Already-archived is idempotent (200, not an
+      error). Despite the HTTP verb this does not hard-delete the row.
+    tags: [Issue Statuses]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: Archived (or already was — idempotent).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueStatusResponse' }
+      '403':
+        description: Caller lacks owner/admin, or the status is a built-in (cannot be archived at all).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              role: { value: { error: "insufficient permissions" } }
+              builtin: { value: { error: "built-in statuses cannot be archived" } }
+      '404':
+        description: Issue status not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "issue status not found" }
+      '409':
+        description: Issues still use this status (structured body naming the count), or it stopped being archivable concurrently.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/IssueStatusInUseError'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              inUse: { value: { error: "cannot archive status: 3 issues still use it; move them to another status first", code: "issue_status_in_use", issue_count: 3 } }
+              raced: { value: { error: "status is no longer archivable" } }
+      '500':
+        description: '"failed to archive issue status" (lock/count/commit failures all report this same message).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/pins:
+  get:
+    operationId: listPins
+    summary: List the caller's pinned items in this workspace
+    description: >-
+      server/internal/handler/pin.go:53-85 (`ListPins`). Scoped to the
+      calling user — pins are per-user, not shared. `item_type=view` rows
+      are hidden unless the client opts in with `?include=view` (clients
+      built before saved views existed would otherwise treat a view pin as
+      a project pin, 404 its detail fetch, and auto-unpin it).
+    tags: [Pins]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: include
+        in: query
+        required: false
+        schema: { type: string }
+        description: 'Substring-matched (strings.Contains), not an exact enum. Include "view" (e.g. "view") to also receive item_type=view pins.'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/PinnedItemResponse' }
+      '500':
+        description: '"failed to list pins".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createPin
+    summary: Pin an item
+    description: >-
+      server/internal/handler/pin.go:87-175 (`CreatePin`). The target must
+      exist in this workspace; a `view` target additionally must be
+      readable by the caller (own, or workspace-shared — same rule as GET
+      /api/issue-views/{id}; a foreign private view 404s so its existence
+      never leaks). Appended at the end of the caller's pin order.
+    tags: [Pins]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreatePinRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PinnedItemResponse' }
+      '400':
+        description: Invalid body, invalid item_type, or missing item_id.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              itemType: { value: { error: "item_type must be 'issue', 'project' or 'view'" } }
+              itemId: { value: { error: "item_id is required" } }
+      '404':
+        description: The referenced issue/project/view does not exist in this workspace (or, for a view, is private and owned by someone else).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              issue: { value: { error: "issue not found" } }
+              project: { value: { error: "project not found" } }
+              view: { value: { error: "view not found" } }
+      '409':
+        description: This item is already pinned by the caller.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "item already pinned" }
+      '500':
+        description: '"failed to get position" or "failed to create pin".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/pins/reorder:
+  put:
+    operationId: reorderPins
+    summary: Reorder the caller's pins
+    description: >-
+      server/internal/handler/pin.go:213-253 (`ReorderPins`). Writes
+      positions one row at a time (not a single batch statement); any
+      unresolvable item id fails the request but rows updated before the
+      failing one are NOT rolled back (no transaction wraps the loop) — a
+      partial reorder can be left in place by a malformed payload.
+    tags: [Pins]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ReorderPinsRequest' }
+    responses:
+      '204':
+        description: Reordered.
+      '400':
+        description: Invalid body, or an items[].id is not a UUID.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              badId: { value: { error: "invalid items[].id" } }
+      '500':
+        description: '"failed to reorder pins".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/pins/{itemType}/{itemId}:
+  delete:
+    operationId: deletePin
+    summary: Unpin an item
+    description: >-
+      server/internal/handler/pin.go:177-211 (`DeletePin`). Unconditional
+      delete-if-exists scoped to (workspace, caller, item_type, item_id) —
+      unpinning something not currently pinned is NOT an error.
+    tags: [Pins]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: itemType
+        in: path
+        required: true
+        schema: { type: string, enum: [issue, project, view] }
+        description: Not validated against this enum server-side — an arbitrary string is accepted and simply matches zero rows.
+      - name: itemId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted (or was never pinned — still 204).
+      '400':
+        description: itemId is not a UUID.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid item id" }
+      '500':
+        description: '"failed to delete pin".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-view-preferences:
+  get:
+    operationId: getIssueViewPreference
+    summary: Get the caller's view-bar preferences for one scope
+    description: >-
+      server/internal/handler/issue_view_preference.go:59-99
+      (`GetIssueViewPreference`). A scope with no saved row yet returns a
+      synthesized 200 with `prefs: {}` and no `updated_at`, rather than 404.
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: scope_type
+        in: query
+        required: true
+        schema: { type: string, enum: [workspace, my, project] }
+      - name: scope_id
+        in: query
+        required: false
+        schema: { type: string, format: uuid }
+        description: Required (and must resolve in this workspace) when scope_type=project; ignored otherwise.
+    responses:
+      '200':
+        description: OK — a synthesized empty-prefs document when no row exists yet.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueViewPreferenceResponse' }
+      '400':
+        description: Invalid scope_type, or scope_id missing/not a UUID when scope_type=project.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              scopeType: { value: { error: "invalid scope_type" } }
+              scopeId: { value: { error: "scope_id is required for project scope" } }
+      '404':
+        description: scope_type=project and scope_id does not resolve to a project in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '500':
+        description: '"failed to load preference".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  put:
+    operationId: putIssueViewPreference
+    summary: Save the caller's view-bar preferences for one scope
+    description: >-
+      server/internal/handler/issue_view_preference.go:101-155
+      (`PutIssueViewPreference`). Upsert — always 200, never 201. Full
+      replace of `prefs` for the (workspace, caller, scope_type, scope_id)
+      key, not a merge.
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PutIssueViewPreferenceRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueViewPreferenceResponse' }
+      '400':
+        description: Invalid body, invalid scope_type, scope_id missing for project scope, or prefs is not a JSON object.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              scopeType: { value: { error: "invalid scope_type" } }
+              prefs: { value: { error: "prefs must be a JSON object" } }
+      '404':
+        description: scope_type=project and scope_id does not resolve to a project in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '500':
+        description: '"failed to save preference".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-views:
+  get:
+    operationId: listIssueViews
+    summary: List issue views visible to the caller in one scope
+    description: >-
+      server/internal/handler/issue_view.go:230-269 (`ListIssueViews`).
+      Returns the caller's own views in scope plus workspace-shared ones;
+      private views owned by others never appear.
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: scope_type
+        in: query
+        required: true
+        schema: { type: string, enum: [workspace, my, project] }
+      - name: scope_id
+        in: query
+        required: false
+        schema: { type: string, format: uuid }
+        description: Filters to one project's views when scope_type=project; not independently verified to belong to this workspace at this endpoint (unlike create).
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/IssueViewResponse' }
+      '400':
+        description: Invalid scope_type, or scope_id present but not a UUID.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid scope_type" }
+      '500':
+        description: '"failed to list views".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createIssueView
+    summary: Create a saved issue view
+    description: >-
+      server/internal/handler/issue_view.go:123-228 (`CreateIssueView`). No
+      role gate — any member may create a view; a scope_type=my view is
+      always forced private server-side regardless of the requested
+      visibility. Capped at 100 owned views per workspace. Request body
+      capped at 128 KiB (`http.MaxBytesReader`).
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateIssueViewRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueViewResponse' }
+      '400':
+        description: Invalid body (including over the 128 KiB cap), invalid name length, invalid scope_type/visibility, missing scope_id for a project view, invalid/missing scope_variant for the given scope_type, query is missing or not a JSON object, or display is present but not a JSON object.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              name: { value: { error: "name must be between 1 and 80 characters" } }
+              viewLimit: { value: { error: "view limit reached for this workspace" } }
+              scopeType: { value: { error: "invalid scope_type" } }
+              visibility: { value: { error: "invalid visibility" } }
+              projectScopeId: { value: { error: "scope_id is required for project views" } }
+              scopeVariant: { value: { error: "invalid scope_variant for this scope_type" } }
+              query: { value: { error: "query must be a JSON object" } }
+              display: { value: { error: "display must be a JSON object" } }
+      '404':
+        description: scope_type=project and scope_id does not resolve to a project in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '500':
+        description: '"failed to check view quota" or "failed to create view".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-views/{id}:
+  get:
+    operationId: getIssueViewByID
+    summary: Get a saved issue view
+    description: >-
+      server/internal/handler/issue_view.go:271-303 (`GetIssueViewByID`).
+      Own view, or a workspace-shared one; a foreign private view 404s so
+      its existence never leaks.
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueViewResponse' }
+      '404':
+        description: View not found in this workspace, or a foreign private view.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "view not found" }
+  patch:
+    operationId: updateIssueView
+    summary: Update a saved issue view
+    description: >-
+      server/internal/handler/issue_view.go:325-427 (`UpdateIssueView`).
+      The owner may always update; a workspace-shared view may also be
+      updated by a workspace owner/admin. `expected_revision` is mandatory
+      optimistic concurrency — a mismatch (or the view having moved since
+      the GET) reports 409, not a silent overwrite. Request body capped at
+      128 KiB.
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpdateIssueViewRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueViewResponse' }
+      '400':
+        description: Invalid body (including over the 128 KiB cap), missing/non-positive expected_revision, invalid name length, invalid visibility (including setting a non-private visibility on a `my` view), invalid scope_variant, or query/display present but not a JSON object.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              revision: { value: { error: "expected_revision is required" } }
+              name: { value: { error: "name must be between 1 and 80 characters" } }
+              visibility: { value: { error: "invalid visibility" } }
+              myView: { value: { error: "my views are always private" } }
+              scopeVariant: { value: { error: "invalid scope_variant for this scope_type" } }
+              query: { value: { error: "query must be a JSON object" } }
+              display: { value: { error: "display must be a JSON object" } }
+      '403':
+        description: Caller is neither the owner nor (for a workspace-shared view) a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "insufficient permissions" }
+      '404':
+        description: View not found in this workspace, or a foreign private view.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "view not found" }
+      '409':
+        description: expected_revision no longer matches the stored revision (view was modified since it was loaded).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "view was modified by someone else" }
+      '500':
+        description: '"failed to update view".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  delete:
+    operationId: deleteIssueView
+    summary: Delete a saved issue view
+    description: >-
+      server/internal/handler/issue_view.go:429-449 (`DeleteIssueView`).
+      Same ownership rule as update: owner always, or workspace owner/admin
+      for a shared view.
+    tags: [Issue Views]
+    security: *workspaceAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted.
+      '403':
+        description: Caller is neither the owner nor (for a workspace-shared view) a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "insufficient permissions" }
+      '404':
+        description: View not found in this workspace, or a foreign private view.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "view not found" }
+      '500':
+        description: '"failed to delete view".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }

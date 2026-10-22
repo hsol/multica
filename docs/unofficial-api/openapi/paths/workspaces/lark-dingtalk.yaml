@@ -1,0 +1,506 @@
+# Domain: Lark + DingTalk channel integrations.
+# Source: server/internal/handler/lark.go, dingtalk.go, router.go:1803-1856.
+# Binding-token redemption endpoints (/api/lark/binding/redeem,
+# /api/dingtalk/binding/redeem) are a different ticket's scope (G8) and are
+# NOT documented here.
+#
+# Common authorization pattern for the agent-scoped write operations below
+# (Revoke*, BeginLarkInstall, RegisterDingTalkBYO): the router only requires
+# workspace MEMBERSHIP, and each handler then calls `canManageAgent`
+# internally — true for the target agent's owner OR a workspace owner/admin.
+# A member who is neither gets 403 "only the agent owner can manage this
+# agent"; someone who isn't even a member gets 404 "agent not found" (the
+# agent lookup itself fails membership-scoped). `ForgetDingTalkGroup` is the
+# one exception — see its own description.
+
+/api/workspaces/{id}/lark/installations:
+  get:
+    operationId: listLarkInstallations
+    summary: List the workspace's Lark bot installations
+    description: >-
+      lark.go:80-121 (`ListLarkInstallations`). Member-visible (Integrations
+      tab renders for non-admins). Degrades to an empty/unconfigured response
+      rather than erroring when the at-rest encryption key is unset.
+    tags: [Workspaces, Lark]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LarkInstallationsListResponse'}
+      '400':
+        description: Invalid workspace id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "invalid workspace id"}
+      '500':
+        description: Query failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to list lark installations"}
+
+/api/workspaces/{id}/lark/installations/{installationId}:
+  delete:
+    operationId: revokeLarkInstallation
+    summary: Revoke a Lark bot installation
+    description: >-
+      lark.go:123-... (`RevokeLarkInstallation`). Soft-delete (status ->
+      'revoked', row preserved); publishes `EventLarkInstallationRevoked` on
+      success. See file-level note for the `canManageAgent` authorization
+      pattern; when the bound agent has been hard-deleted (orphan row), the
+      handler falls back to a plain `owner`/`admin` role check instead.
+    tags: [Workspaces, Lark]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '400':
+        description: Invalid workspace id or installation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Lark integration not configured; or caller is a member but neither the agent's owner nor workspace owner/admin (or, for an orphaned installation, not owner/admin).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              notConfigured: {value: {error: "lark integration not configured", code: lark_not_configured}}
+              notManager: {value: {error: "only the agent owner can manage this agent"}}
+      '404':
+        description: No Lark installation with this id in this workspace, or (for the canManageAgent path) caller is not even a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "lark installation not found"}
+      '500':
+        description: Loading the installation, or the revoke update, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/lark/install/begin:
+  post:
+    operationId: beginLarkInstall
+    summary: Begin a Lark bot device-flow install session
+    description: >-
+      lark.go:278-... (`BeginLarkInstall`). Opens a device-flow registration
+      session; the client polls `GET .../lark/install/{sessionId}/status`
+      until success or terminal failure. See file-level note for the
+      `canManageAgent` authorization pattern (target agent identified by the
+      `agent_id` query param).
+    tags: [Workspaces, Lark]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: agent_id
+        in: query
+        required: true
+        schema: {type: string, format: uuid}
+      - name: region
+        in: query
+        required: false
+        schema: {type: string, enum: [feishu, lark]}
+        description: Case-insensitive, trimmed. Omit to default to feishu server-side.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BeginLarkInstallResponse'}
+      '400':
+        description: Invalid workspace id, missing/invalid `agent_id`, or invalid `region`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              missingAgent: {value: {error: "agent_id is required"}}
+              badRegion: {value: {error: "region must be 'feishu' or 'lark'"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Lark integration not configured; or caller is a member but neither the agent's owner nor workspace owner/admin.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              notConfigured: {value: {error: "lark integration not configured", code: lark_not_configured}}
+              notManager: {value: {error: "only the agent owner can manage this agent"}}
+      '404':
+        description: No agent with `agent_id` in this workspace, or caller is not even a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "agent not found in this workspace"}
+      '502':
+        description: 'Starting the install session against Lark failed (dynamic message, e.g. "failed to start install: ...").'
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/lark/install/{sessionId}/status:
+  get:
+    operationId: getLarkInstallStatus
+    summary: Poll a Lark install session's status
+    description: >-
+      lark.go:386-... (`GetLarkInstallStatus`). Does NOT use the
+      `canManageAgent` pattern — only the session's own initiator or a
+      workspace owner/admin may read it; everyone else (including the agent's
+      owner, if different from the initiator) gets 404, treated by the
+      frontend as "session lost, restart".
+    tags: [Workspaces, Lark]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: sessionId
+        in: path
+        required: true
+        schema: {type: string}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LarkInstallStatusResponse'}
+      '400':
+        description: Invalid workspace id, or blank `sessionId`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "session id is required"}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Lark integration not configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ErrorCode'}
+            example: {error: "lark integration not configured", code: lark_not_configured}
+      '404':
+        description: Session not found, GC'd, cross-workspace, or caller is neither the initiator nor an owner/admin (all collapse to this response).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "install session not found"}
+      '500':
+        description: Loading the session failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to load install session"}
+
+/api/workspaces/{id}/dingtalk/installations:
+  get:
+    operationId: listDingTalkInstallations
+    summary: List the workspace's DingTalk robot installations
+    description: >-
+      dingtalk.go:133-... (`ListDingTalkInstallations`). Member-visible, but
+      response content is further filtered by `dingtalkAgentVisibility`: a
+      plain member sees only installations bound to agents they may view;
+      owner/admin see all. `bound_dingtalk_user_ids` is populated only for an
+      owner/admin caller (`canViewAccountBindings`).
+    tags: [Workspaces, DingTalk]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DingTalkInstallationsListResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Resolving visibility, listing installations, or listing user bindings, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/dingtalk/groups:
+  get:
+    operationId: listDingTalkGroups
+    summary: List DingTalk groups the workspace's bots have observed
+    description: >-
+      dingtalk.go:213-... (`ListDingTalkGroups`). Member-visible, filtered by
+      agent visibility like the installations list above. Active window is
+      90 days; the `activity=inactive` page is capped at 100 pages of 20.
+    tags: [Workspaces, DingTalk]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: activity
+        in: query
+        required: false
+        schema: {type: string, enum: ["", inactive]}
+        description: Omit (or empty) for the default active-window view.
+      - name: installation_id
+        in: query
+        required: false
+        schema: {type: string, format: uuid}
+        description: Required when `activity=inactive`.
+      - name: limit
+        in: query
+        required: false
+        schema: {type: integer, default: 20, minimum: 1, maximum: 100}
+        description: Only meaningful when `activity=inactive`.
+      - name: offset
+        in: query
+        required: false
+        schema: {type: integer, default: 0, minimum: 0}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ListDingTalkGroupsResponse'}
+      '400':
+        description: Invalid workspace id; invalid `activity` value; missing/invalid `installation_id` for `activity=inactive`; or `limit`/`offset` out of range.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              badActivity: {value: {error: "activity must be inactive when provided"}}
+              missingInstallation: {value: {error: "installation_id is required for inactive groups"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Resolving visibility, authorizing the installation, or any of the list/count queries, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/dingtalk/installations/{installationId}/groups/{conversationId}:
+  delete:
+    operationId: forgetDingTalkGroup
+    summary: Forget an observed DingTalk group
+    description: >-
+      dingtalk.go:521-... (`ForgetDingTalkGroup`). IMPORTANT ASYMMETRY: the
+      router registers this in the member-only group (router.go:1853), but
+      the handler internally requires `owner` or `admin`
+      (`h.requireWorkspaceRole`) — NOT the `canManageAgent` pattern the other
+      8 Lark/DingTalk operations use. An agent's own owner who is not a
+      workspace owner/admin CANNOT forget a group here, unlike every sibling
+      revoke/install endpoint in this file. Soft-delete — session/message
+      history is preserved and the group can be re-observed on a future
+      message.
+    tags: [Workspaces, DingTalk]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: conversationId
+        in: path
+        required: true
+        schema: {type: string}
+        description: URL-path-escaped DingTalk conversation id.
+    responses:
+      '204':
+        description: Forgotten.
+      '400':
+        description: Invalid workspace/installation id, unescapable or blank `conversationId`.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "conversation id is required"}
+      '403':
+        description: Caller is a member but not owner/admin.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "insufficient permissions"}
+      '404':
+        description: No matching group row, or caller is not even a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "dingtalk group not found"}
+      '500':
+        description: Delete failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "failed to forget dingtalk group"}
+
+/api/workspaces/{id}/dingtalk/installations/{installationId}:
+  delete:
+    operationId: revokeDingTalkInstallation
+    summary: Revoke a DingTalk robot installation
+    description: >-
+      dingtalk.go:666-... (`RevokeDingTalkInstallation`). Uses the
+      `canManageAgent` pattern (see file-level note) — orphaned installations
+      (agent hard-deleted) fall back to a plain owner/admin check. Soft-delete
+      + publishes `EventDingTalkInstallationRevoked`.
+    tags: [Workspaces, DingTalk]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: installationId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '204':
+        description: Revoked.
+      '400':
+        description: Invalid workspace id or installation id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: DingTalk integration not configured; or caller is a member but neither agent owner nor workspace owner/admin (or, for an orphan, not owner/admin).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              notConfigured: {value: {error: "dingtalk integration not enabled", code: dingtalk_not_configured}}
+              notManager: {value: {error: "only the agent owner can manage this agent"}}
+      '404':
+        description: No DingTalk installation with this id in this workspace, or caller is not even a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "dingtalk installation not found"}
+      '500':
+        description: Loading the installation, or the revoke update, failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/dingtalk/install/byo:
+  post:
+    operationId: registerDingTalkBYO
+    summary: Register a user-supplied ("bring your own") DingTalk robot for an agent
+    description: >-
+      dingtalk.go:571-... (`RegisterDingTalkBYO`). Lets several agents in the
+      SAME DingTalk organization each have their own bot identity. Uses the
+      `canManageAgent` pattern. Credentials are verified against DingTalk
+      before being stored.
+    tags: [Workspaces, DingTalk]
+    security: *auth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+      - name: agent_id
+        in: query
+        required: true
+        schema: {type: string, format: uuid}
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RegisterDingTalkBYORequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DingTalkInstallationResponse'}
+      '400':
+        description: Invalid workspace id, missing/invalid `agent_id`, invalid body, missing `client_id`/`client_secret`, or DingTalk rejected/could not verify the AppKey+AppSecret against a live Stream-mode robot.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              missingAgent: {value: {error: "agent_id is required"}}
+              invalidBody: {value: {error: "invalid request body"}}
+              missingKey: {value: {error: "dingtalk: AppKey (client id) is required"}}
+              missingSecret: {value: {error: "dingtalk: AppSecret (client secret) is required"}}
+              credentialValidation: {value: {error: "could not verify the DingTalk credentials — check the AppKey (client id) and AppSecret (client secret), and that the robot is a Stream-mode robot in your organization"}}
+      '401':
+        description: Not authenticated.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: DingTalk integration not configured; or caller is a member but neither the agent's owner nor workspace owner/admin.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              notConfigured: {value: {error: "dingtalk integration not enabled", code: dingtalk_not_configured}}
+              notManager: {value: {error: "only the agent owner can manage this agent"}}
+      '404':
+        description: No agent with `agent_id` in this workspace, or caller is not even a member.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "agent not found in this workspace"}
+      '409':
+        description: This DingTalk robot is already connected to another agent in the same workspace, to an archived agent, or to a different Multica workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              sameWorkspace: {value: {error: "this DingTalk robot is already connected to another agent in this workspace — disconnect it there first, then connect it here"}}
+              archived: {value: {error: "this DingTalk robot is connected to an archived agent in this workspace — restore that agent, or disconnect its robot, before connecting it here"}}
+              otherWorkspace: {value: {error: "this DingTalk robot is already connected to a different Multica workspace — disconnect it there before connecting it here"}}
+      '500':
+        description: Encryption/persistence failed after successful credential verification.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "could not connect the DingTalk robot"}

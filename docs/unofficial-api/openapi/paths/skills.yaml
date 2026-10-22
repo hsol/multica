@@ -1,0 +1,1293 @@
+# Domain: skills (skill-resource-rooted routes only — /api/skills*,
+# /api/skills/{id}/labels*, /api/skills/{id}/files*). 14 endpoints. Handlers
+# live in server/internal/handler/skill.go, skill_create.go,
+# skill_refresh.go, skill_import_archive.go, and label.go:639-700 (baseline
+# revision ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+#
+# Top-level keys are path strings merged verbatim into the document's
+# "paths" object by scripts/merge.mjs — add operations here, not under a
+# nested "paths:" key.
+#
+# Scope note: /api/agents/{id}/skills* (agent<->skill assignment) and the
+# agent-label endpoints are a DIFFERENT domain ticket's responsibility, even
+# though some of those handlers (ListAgentSkills, SetAgentSkills, ...) live
+# in this same skill.go file. Not documented here.
+#
+# Routing: every operation below sits inside the single chi r.Group wrapped
+# with middleware.RequireWorkspaceMember(queries)
+# (server/cmd/server/router.go:1985-2307) — no route-specific middleware on
+# top. That group's buildMiddleware
+# (server/internal/middleware/workspace.go:195-264) runs BEFORE any handler
+# in this file and is the source of every operation's common 400/401/403/404
+# cases, reused below via YAML anchors:
+#   - 400 invalid/missing workspace: "workspace_id or workspace_slug is
+#     required" (no X-Workspace-ID/X-Workspace-Slug and no resolvable slug)
+#     or "invalid workspace_id" (present but not a parseable UUID).
+#   - 401 "user not authenticated" (no X-User-ID header — set by the auth
+#     middleware that runs before this one; unreachable without it).
+#   - 403 "task token is bound to a different workspace" — only for an
+#     AgentTaskToken (mat_) request whose token-bound X-Workspace-ID differs
+#     from the resolved workspace (MUL-2600).
+#   - 404 "workspace not found" — the resolved workspace has no membership
+#     row for this user (covers both "workspace doesn't exist" and "exists
+#     but you're not a member" with the same message, by design).
+# RequireWorkspaceMember is called with no role list
+# (server/cmd/server/router.go:1986), so it does not itself gate by role;
+# every per-operation role check below (`canManageSkill`,
+# RefreshSkill's own check) is the handler's own, layered on top.
+
+/api/skills:
+  get:
+    operationId: listSkills
+    summary: List a workspace's skills
+    description: >-
+      server/internal/handler/skill.go:348-377 (`ListSkills`). Returns a bare
+      JSON array (not wrapped in an envelope object), unlike most other list
+      endpoints in this codebase. Every element's `labels` is bulk-loaded via
+      one extra query (`labelsBySkill`, skill.go:383-410) — a failure there
+      degrades every skill's `labels` to `[]` rather than failing the whole
+      request (logged as a warning only).
+    tags: [skills]
+    security: &skillsAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SkillSummaryResponse'
+      '400':
+        description: &wsBadRequestDesc >-
+          Workspace-scope middleware (see file header): missing
+          X-Workspace-ID/X-Workspace-Slug, or an X-Workspace-ID that isn't a
+          parseable UUID.
+        content:
+          application/json:
+            schema: &wsBadRequestSchema
+              $ref: '#/components/schemas/Error'
+            examples: &wsBadRequestExamples
+              missing: &wsMissingExample { value: { error: "workspace_id or workspace_slug is required" } }
+              invalid: &wsInvalidWorkspaceExample { value: { error: "invalid workspace_id" } }
+      '401':
+        description: &wsUnauthorizedDesc Workspace-scope middleware — no authenticated user.
+        content:
+          application/json:
+            schema: &wsUnauthorizedSchema
+              $ref: '#/components/schemas/Error'
+            example: &wsUnauthorizedExample { error: "user not authenticated" }
+      '403':
+        description: &wsTaskTokenForbiddenDesc >-
+          Workspace-scope middleware — an AgentTaskToken (mat_) request whose
+          token-bound workspace differs from the one resolved for this
+          request (MUL-2600).
+        content:
+          application/json:
+            schema: &wsTaskTokenForbiddenSchema
+              $ref: '#/components/schemas/Error'
+            example: &wsTaskTokenForbiddenExample { error: "task token is bound to a different workspace" }
+      '404':
+        description: &wsNotFoundDesc >-
+          Workspace-scope middleware — the resolved workspace has no
+          membership row for this user (covers both a nonexistent workspace
+          and "exists but you are not a member").
+        content:
+          application/json:
+            schema: &wsNotFoundSchema
+              $ref: '#/components/schemas/Error'
+            example: &wsNotFoundExample { error: "workspace not found" }
+      '500':
+        description: '"failed to list skills" (ListSkillSummariesByWorkspace query failure).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list skills" }
+  post:
+    operationId: createSkill
+    summary: Create a skill
+    description: >-
+      server/internal/handler/skill.go:527-578 (`CreateSkill`), writing
+      through `createSkillWithFiles` / `createSkillWithFilesInTx`
+      (skill_create.go:24-93) in one transaction with its optional
+      `files`. `name` must be unique within the workspace
+      (`UNIQUE(workspace_id, name)`); a collision is reported as 409, not
+      400.
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateSkillRequest'
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillWithFilesResponse'
+      '400':
+        description: >-
+          Workspace-scope middleware cases, plus: body decode failure; empty
+          `name`; an invalid `files[].path`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidBody: { value: { error: "invalid request body" } }
+              nameRequired: { value: { error: "name is required" } }
+              invalidFilePath: { value: { error: "invalid file path: ../escape.md" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: *wsTaskTokenForbiddenDesc
+        content:
+          application/json:
+            schema: *wsTaskTokenForbiddenSchema
+            example: *wsTaskTokenForbiddenExample
+      '404':
+        description: *wsNotFoundDesc
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            example: *wsNotFoundExample
+      '409':
+        description: A skill with this `name` already exists in the workspace (unique-constraint violation).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a skill with this name already exists" }
+      '500':
+        description: '"failed to create skill: <err>" (any non-unique-violation write failure).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to create skill: ..." }
+
+/api/skills/search:
+  get:
+    operationId: searchSkills
+    summary: Search ClawHub for installable skills
+    description: >-
+      server/internal/handler/skill.go:412-429 (`SearchSkills`). A distinct
+      endpoint from GET /api/skills: it does not touch the workspace's own
+      skills at all — it proxies a live search to the public ClawHub
+      directory (`https://clawhub.ai/api/v1/search?q=...`) and, for the
+      first 10 results only (`clawHubSearchStatsLimit`), fetches each
+      candidate's install-count stats with a second upstream request. Still
+      sits inside the workspace-scoped route group (so the common
+      workspace-middleware cases below still apply) even though the handler
+      itself never reads the workspace.
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: q
+        in: query
+        required: true
+        schema: { type: string }
+        description: Search query, trimmed. Empty (or whitespace-only) is rejected with 400.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/SkillSearchCandidateResponse'
+      '400':
+        description: Workspace-scope middleware cases, plus a missing/blank `q`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              queryRequired: { value: { error: "query is required" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: *wsTaskTokenForbiddenDesc
+        content:
+          application/json:
+            schema: *wsTaskTokenForbiddenSchema
+            example: *wsTaskTokenForbiddenExample
+      '404':
+        description: *wsNotFoundDesc
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            example: *wsNotFoundExample
+      '502':
+        description: >-
+          ClawHub search itself failed (network error, non-200 response, or
+          an undecodable body). Written directly with a bespoke {code,
+          error} shape — NOT the shared ErrorCode schema: `code` is always
+          the literal `"upstream_unavailable"`, which is not a member of the
+          50-value enum in components/schemas.yaml. Flagged rather than
+          added to that shared enum (out of this ticket's scope).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillSearchUpstreamErrorResponse' }
+            examples:
+              unreachable: { value: { code: "upstream_unavailable", error: "failed to reach ClawHub: ..." } }
+              nonOk: { value: { code: "upstream_unavailable", error: "ClawHub search returned status 503" } }
+              badBody: { value: { code: "upstream_unavailable", error: "failed to parse ClawHub search response" } }
+
+/api/skills/import:
+  post:
+    operationId: importSkill
+    summary: Import a skill from a hosted source URL or an uploaded archive
+    description: >-
+      server/internal/handler/skill.go:2311-2379 (`ImportSkill`) plus the
+      shared tail `finishSkillImport` (skill.go:2420-2475) and, for the
+      multipart form, skill_import_archive.go:36-82
+      (`importSkillFromArchive`). Two mutually exclusive request shapes,
+      switched on Content-Type (`isMultipartForm`, skill.go:2327): a JSON
+      body importing from a hosted URL (ClawHub, skills.sh, or a GitHub
+      repo/path — `detectImportSource`, skill.go:950-981), or a
+      `multipart/form-data` upload of a `.skill`/`.zip` archive. Both
+      converge on the same create-or-resolve-conflict tail.
+
+
+      **Response shape and status code depend on whether the request is
+      "structured"** (`structuredResult`, skill.go:2341): true for every
+      archive upload, and for a JSON request that sent `on_conflict`
+      (including the literal `"fail"` — see ImportSkillRequest.on_conflict).
+      False only for a JSON request that omitted `on_conflict` entirely —
+      the legacy, pre-on_conflict behavior.
+
+
+      | Outcome | structured | status | body |
+      |---|---|---|---|
+      | Clean import (no name collision) | true | 201 | `SkillImportResult{status:"created"}` |
+      | Clean import (no name collision) | false | 201 | bare `SkillWithFilesResponse` |
+      | Name collision, `on_conflict=skip` | true | 200 | `SkillImportResult{status:"skipped"}` |
+      | Name collision, `on_conflict=overwrite` (allowed) | true | 200 | `SkillImportResult{status:"updated"}` |
+      | Name collision, `on_conflict=overwrite` (not the creator) | true | 403 | `SkillImportResult{status:"failed"}` |
+      | Name collision, `on_conflict=rename` | true | 201 | `SkillImportResult{status:"created", reason:"renamed..."}` |
+      | Name collision, `on_conflict` omitted/`"fail"` | true | 409 | `SkillImportResult{status:"conflict"}` |
+      | Name collision | false | 409 | `SkillImportDuplicateConflictResponse`, or plain `Error` as a fallback |
+
+
+      A same-name collision can also surface as a *write-time* unique-
+      violation race (the name was free at the pre-check but taken by a
+      concurrent request before this one's INSERT) — handled identically to
+      a pre-detected collision when `structured`, and via the same 409
+      fallback pair when not.
+
+
+      Archive uploads enforce the same per-file (1 MiB), per-bundle (8 MiB),
+      and file-count (256) import caps as a URL import
+      (`maxImportFileSize`/`maxImportTotalSize`/`maxImportFileCount`,
+      skill.go:777-781) but report a breach as a plain 400 (from
+      `parseSkillArchive`), not the 413 a URL import uses via
+      `importFetchErrorResponse` — the two paths share the cap constants but
+      not the cap-violation status code.
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ImportSkillRequest'
+        multipart/form-data:
+          schema:
+            type: object
+            required: [file]
+            properties:
+              file:
+                type: string
+                format: binary
+                description: >-
+                  A `.skill` or `.zip` archive, max 16 MiB compressed
+                  (`maxImportArchiveUploadSize`). Must contain a `SKILL.md`
+                  at its root or under a single top-level wrapper directory
+                  (the layout Anthropic's `package_skill` produces).
+              on_conflict:
+                type: string
+                enum: [fail, overwrite, rename, skip]
+                description: Form field, same semantics as the JSON body's `on_conflict`. Omitted defaults to `fail`.
+    responses:
+      '200':
+        description: >-
+          `status:"skipped"` (`on_conflict=skip`) or `status:"updated"`
+          (`on_conflict=overwrite`, applied successfully). Only reachable
+          when `structured` (see description).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillImportResult' }
+            examples:
+              skipped: { value: { status: "skipped", reason: "a skill with this name already exists", existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill", can_overwrite: true } } }
+              updated: { value: { status: "updated", skill: &exampleSkillWithFiles { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", workspace_id: "2c6a9e4d-8b31-4f7c-9d2a-6e4b8c1f3a75", name: "my-skill", description: "", content: "# my-skill\n...", config: {}, created_by: "9a4c2e7f-1b68-4d3a-8c5e-2f7a9b4d6c13", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", files: [] } } }
+      '201':
+        description: >-
+          A new skill was created: either no name collision occurred, or
+          `on_conflict=rename` resolved one by suffixing the name (`-2`,
+          `-3`, ... up to 50 attempts). When the request was a
+          non-structured JSON import (no `on_conflict` sent) and there was
+          no collision, the body is the bare `SkillWithFilesResponse`
+          instead of `SkillImportResult`.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SkillImportResult'
+                - $ref: '#/components/schemas/SkillWithFilesResponse'
+            examples:
+              structuredCreated: { value: { status: "created", skill: *exampleSkillWithFiles } }
+              structuredRenamed: { value: { status: "created", reason: "renamed to avoid an existing skill", skill: { id: "7f2e9c1a-3d84-4b6f-8a2e-5c9d1f3b7e64", workspace_id: "2c6a9e4d-8b31-4f7c-9d2a-6e4b8c1f3a75", name: "my-skill-2", description: "", content: "# my-skill\n...", config: {}, created_by: "9a4c2e7f-1b68-4d3a-8c5e-2f7a9b4d6c13", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", files: [] }, existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill" } } }
+              legacyBareSkill: { value: { id: "7f2e9c1a-3d84-4b6f-8a2e-5c9d1f3b7e64", workspace_id: "2c6a9e4d-8b31-4f7c-9d2a-6e4b8c1f3a75", name: "my-skill", description: "", content: "# my-skill\n...", config: {}, created_by: "9a4c2e7f-1b68-4d3a-8c5e-2f7a9b4d6c13", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", files: [] } }
+      '400':
+        description: >-
+          Workspace-scope middleware cases. JSON-body path: invalid JSON;
+          an `on_conflict` outside the allowed enum; an empty/invalid/
+          unsupported source `url`. Archive-upload path: malformed
+          multipart or oversized upload; missing `file` form field;
+          unreadable file; not a valid zip; no `SKILL.md` found; the
+          SKILL.md has no name and none could be derived from the archive;
+          colliding archive entries that normalize to the same path; or an
+          import-cap breach (see description).
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidBody: { value: { error: "invalid request body" } }
+              badOnConflict: { value: { error: "on_conflict must be one of: fail, overwrite, rename, skip" } }
+              emptyUrl: { value: { error: "empty URL" } }
+              unsupportedSource: { value: { error: "unsupported source: example.com (supported: clawhub.ai, skills.sh, github.com)" } }
+              badMultipart: { value: { error: "invalid multipart upload or file exceeds the size limit" } }
+              missingFile: { value: { error: "a skill archive file is required (form field \"file\")" } }
+              notAZip: { value: { error: "uploaded file is not a valid .skill/.zip archive" } }
+              noSkillMd: { value: { error: "archive does not contain a SKILL.md" } }
+              noName: { value: { error: "could not determine the skill name: SKILL.md has no name field and the archive is unnamed" } }
+              archiveCapExceeded: { value: { error: "import cap exceeded: import bundle exceeds 256 file limit" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: >-
+          Workspace-scope task-token case (plain Error), or
+          `on_conflict=overwrite` while not the skill's original creator
+          (`canOverwriteSkillByLocalImport` — creator-only; structured
+          `SkillImportResult{status:"failed"}` body, not a plain Error).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/SkillImportResult'
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              overwriteForbidden: { value: { status: "failed", reason: "only the skill creator can overwrite this skill", existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill", can_overwrite: false } } }
+      '404':
+        description: *wsNotFoundDesc
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            example: *wsNotFoundExample
+      '409':
+        description: >-
+          A same-name skill already exists and no conflict resolution
+          applied. Three distinct shapes depending on path: the structured
+          "no strategy matched" case (`on_conflict` omitted/`"fail"`); an
+          `on_conflict=overwrite` that failed because the target vanished or
+          was renamed between lookup and write; and the two non-structured
+          fallbacks (the dedicated duplicate-conflict shape, or a last-resort
+          plain Error if even that lookup fails).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SkillImportResult'
+                - $ref: '#/components/schemas/SkillImportDuplicateConflictResponse'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              structuredConflict: { value: { status: "conflict", reason: "a skill with this name already exists; use --on-conflict overwrite to replace it or --on-conflict rename to import a copy", existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill", can_overwrite: true } } }
+              overwriteTargetGone: { value: { status: "failed", reason: "target skill no longer exists", existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill" } } }
+              overwriteNameMismatch: { value: { status: "failed", reason: "target skill name no longer matches the imported skill", existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill" } } }
+              legacyDuplicate: { value: { error: "a skill with this name already exists", existing_skill: { id: "4b7d8f2a-6c91-4e3d-9a5f-1d8e6c2b4a90", name: "my-skill" } } }
+              legacyDuplicateFallback: { value: { error: "a skill with this name already exists" } }
+      '413':
+        description: >-
+          URL-import path only: the fetched bundle exceeded the per-file (1
+          MiB), per-bundle (8 MiB), or file-count (256) import cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "import cap exceeded: import bundle exceeds 8388608 byte limit" }
+      '500':
+        description: >-
+          Any other write failure: skill creation, the pre-check name
+          lookup, the renamed-skill retry loop exhausting its 50 attempts,
+          or a generic overwrite failure. Structured requests wrap these in
+          `SkillImportResult{status:"failed"}`; non-structured requests get
+          a plain `Error`.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/SkillImportResult'
+            examples:
+              plainCreateFailed: { value: { error: "failed to create skill: ..." } }
+              structuredLookupFailed: { value: { status: "failed", reason: "failed to check for existing skill: ..." } }
+              structuredRenameExhausted: { value: { status: "failed", reason: "failed to create renamed skill: failed to find an available renamed skill name after 50 attempts" } }
+              structuredOverwriteFailed: { value: { status: "failed", reason: "failed to overwrite skill: ..." } }
+      '502':
+        description: >-
+          URL-import path only: the upstream source returned an error status,
+          an unparseable response, or a not-found skill/file. Message is the
+          raw upstream error text.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              notFound: { value: { error: "skill not found on ClawHub: my-skill" } }
+              nonOk: { value: { error: "ClawHub returned status 500" } }
+              noSkillMdGithub: { value: { error: "SKILL.md not found at the root of owner/repo@main. For multi-skill repositories, point to a specific directory using github.com/owner/repo/tree/main/<skill-dir>" } }
+      '503':
+        description: >-
+          URL-import path only: the upstream source is transiently
+          unavailable (`errImportSourceUnavailable` — typically GitHub API
+          rate limiting on the tree fetch that backs a skills.sh import).
+          Retryable.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "import source temporarily unavailable: could not read the owner/repo repository tree (usually GitHub API rate limiting — set GITHUB_TOKEN on the server or retry): ..." }
+      '504':
+        description: >-
+          URL-import path only: the 45-second server-side fetch budget
+          (`importFetchTimeout`) was exhausted, deliberately kept below the
+          reverse-proxy gateway timeout so this is a readable API error
+          rather than a bare proxy 504.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "skill import timed out fetching source files; the skill may be too large or the source too slow" }
+
+/api/skills/{id}:
+  get:
+    operationId: getSkill
+    summary: Get a single skill
+    description: >-
+      server/internal/handler/skill.go:467-498 (`GetSkill`) and
+      `writeSkillMetadata` (skill.go:504-525) for the metadata variant.
+      `{id}` must be a UUID (unlike issues, there is no `PREFIX-NUMBER`
+      fallback for skills — `loadSkillForUser` calls
+      `parseUUIDOrBadRequest` directly, skill.go:323-344).
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: include
+        in: query
+        schema: { type: string, enum: [content, metadata] }
+        description: >-
+          `content` (the default — also what an omitted/empty value means,
+          kept for installed clients that never send this param,
+          skill.go:438-452) returns the full SkillWithFilesResponse.
+          `metadata` returns SkillWithFileMetadataResponse (no SKILL.md
+          body, no file bodies — just sizes/hashes).
+    responses:
+      '200':
+        description: OK — shape selected by `include` (see parameter description).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SkillWithFilesResponse'
+                - $ref: '#/components/schemas/SkillWithFileMetadataResponse'
+      '400':
+        description: >-
+          Workspace-scope middleware cases; an `include` value other than
+          `content`/`metadata`; or (practically unreachable through normal
+          routing, since the enclosing middleware already guarantees a
+          resolved workspace) the defensive "workspace_id is required"
+          re-check inside `loadSkillForUser`; or `{id}` not a parseable UUID.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              badInclude: { value: { error: "invalid include: expected \"content\" or \"metadata\"" } }
+              invalidId: { value: { error: "invalid skill id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: *wsTaskTokenForbiddenDesc
+        content:
+          application/json:
+            schema: *wsTaskTokenForbiddenSchema
+            example: *wsTaskTokenForbiddenExample
+      '404':
+        description: >-
+          Workspace-scope "workspace not found", or `{id}` not found in this
+          workspace ("skill not found" — `loadSkillForUser` reports any
+          lookup failure this way, not narrowed further).
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '500':
+        description: '"failed to list skill files" (the files/metadata query failed after the skill itself loaded).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list skill files" }
+  put:
+    operationId: updateSkill
+    summary: Update a skill
+    description: >-
+      server/internal/handler/skill.go:606-710 (`UpdateSkill`). Requires
+      `canManageSkill` (skill.go:580-595): the skill's creator, or a
+      workspace owner/admin. Runs in one transaction: the skill row update,
+      then (only when `files` was present in the body) a full
+      delete-and-reinsert of the file set.
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UpdateSkillRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillWithFilesResponse'
+      '400':
+        description: Workspace-scope middleware cases, plus body decode failure, an invalid `{id}`, or an invalid `files[].path`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidFilePath: { value: { error: "invalid file path: ../escape.md" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: >-
+          Workspace-scope task-token case, or caller is neither the skill's
+          creator nor a workspace owner/admin (`canManageSkill`).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator can manage this skill" } }
+      '404':
+        description: Workspace not found/not a member, or `{id}` not found in this workspace.
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '409':
+        description: The requested `name` collides with another skill already in the workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a skill with this name already exists" }
+      '500':
+        description: >-
+          Transaction start/commit failure, or a non-unique-violation write
+          error at any step (skill row update, old-file cleanup, per-file
+          upsert).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              txStart: { value: { error: "failed to start transaction" } }
+              updateFailed: { value: { error: "failed to update skill: ..." } }
+              deleteOldFiles: { value: { error: "failed to delete old skill files" } }
+              upsertFile: { value: { error: "failed to upsert skill file: ..." } }
+              commitFailed: { value: { error: "failed to commit" } }
+  delete:
+    operationId: deleteSkill
+    summary: Delete a skill
+    description: >-
+      server/internal/handler/skill.go:712-747 (`DeleteSkill`). Requires
+      `canManageSkill` (creator or workspace owner/admin). In one
+      transaction: removes the skill's label assignments
+      (`skill_to_label` rows), then deletes the skill row itself (files and
+      agent-skill bindings cascade at the database level, not asserted
+      independently here).
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted — no body.
+      '400':
+        description: Workspace-scope middleware cases, or an invalid `{id}`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: Workspace-scope task-token case, or caller is neither the skill's creator nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator can manage this skill" } }
+      '404':
+        description: Workspace not found/not a member, or `{id}` not found in this workspace.
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '500':
+        description: Transaction start/commit failure, label-assignment cleanup failure, or the delete itself failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              txStart: { value: { error: "failed to start transaction" } }
+              labelCleanup: { value: { error: "failed to remove skill label assignments" } }
+              deleteFailed: { value: { error: "failed to delete skill" } }
+              commitFailed: { value: { error: "failed to commit skill deletion" } }
+
+/api/skills/{id}/refresh:
+  post:
+    operationId: refreshSkill
+    summary: Re-import a skill from its original source, in place
+    description: >-
+      server/internal/handler/skill_refresh.go:113-202 (`RefreshSkill`).
+      Only eligible when the skill's stored `config.origin` records a
+      refreshable provenance — `type` one of `github`/`skills_sh`/`clawhub`
+      with a non-empty `source_url` that still resolves to that same
+      source type (`parseSkillOrigin` + `refreshableOriginSource`,
+      skill_refresh.go:30-68). Manually-created skills, archive uploads,
+      and runtime-local copies have no refreshable origin and always 422.
+
+
+      Permission is checked BEFORE the upstream fetch (so a forbidden
+      caller cannot burn the 45-second fetch budget): workspace owner/admin,
+      or the skill's original creator. This is deliberately the same
+      creator-or-admin policy as `canManageSkill` generally, NOT the
+      narrower creator-only policy `POST /api/skills/import`'s
+      `on_conflict=overwrite` uses — because here the source URL is already
+      pinned on the skill itself, so a refreshing admin cannot inject
+      arbitrary content the way an admin-initiated fresh import could.
+
+
+      On success, re-runs the exact same overwrite used by import-overwrite
+      (`overwriteSkillWithFiles`): identity (id, created_by, created_at) and
+      agent-skill bindings are preserved; name (if the upstream renamed it),
+      description, content, the full file set, and `config.origin` are
+      replaced — other `config` keys a user may have set are preserved
+      (`mergeSkillConfigOrigin`, skill_refresh.go:95-111).
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK — the skill after being overwritten with freshly-fetched upstream content.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillWithFilesResponse'
+      '400':
+        description: Workspace-scope middleware cases, or an invalid `{id}`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: >-
+          Workspace-scope task-token case, or caller is neither a workspace
+          owner/admin nor the skill's creator (checked twice: once before
+          the fetch, and re-checked inside the overwrite transaction via
+          `AllowOverwrite` — the second check only fires if role/ownership
+          changed concurrently between the two).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator or a workspace admin can update this skill from its source" } }
+      '404':
+        description: >-
+          Workspace not found/not a member; `{id}` not found in this
+          workspace; or the skill was deleted concurrently between the
+          initial load and the overwrite transaction's re-read
+          (`errSkillOverwriteNotFound`, same "skill not found" message
+          either way).
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '409':
+        description: >-
+          The upstream source renamed the skill, and that new name already
+          belongs to a different skill in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "a skill named \"renamed-skill\" already exists in this workspace" }
+      '413':
+        description: The re-fetched upstream bundle exceeded the per-file/per-bundle/file-count import cap.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "import cap exceeded: import bundle exceeds 8388608 byte limit" }
+      '422':
+        description: >-
+          The skill has no refreshable origin: no `config.origin` at all, an
+          origin `type` outside github/skills_sh/clawhub, an empty
+          `source_url`, or a `source_url` that no longer resolves to the
+          recorded origin type (e.g. hand-edited config).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "this skill was not imported from a refreshable source (GitHub, skills.sh, or ClawHub)" }
+      '500':
+        description: Any other overwrite failure (e.g. a non-unique-violation write error inside the overwrite transaction).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to update skill from source: ..." }
+      '502':
+        description: The upstream source returned an error status, an unparseable response, or a not-found skill/file.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "ClawHub returned status 500" }
+      '503':
+        description: The upstream source is transiently unavailable (typically GitHub API rate limiting). Retryable.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "import source temporarily unavailable: could not read the owner/repo repository tree (usually GitHub API rate limiting — set GITHUB_TOKEN on the server or retry): ..." }
+      '504':
+        description: The 45-second server-side fetch budget was exhausted.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "skill import timed out fetching source files; the skill may be too large or the source too slow" }
+
+/api/skills/{id}/labels:
+  get:
+    operationId: listLabelsForSkill
+    summary: List a skill's labels
+    description: server/internal/handler/label.go:639-652 (`ListLabelsForSkill`). No role gate beyond workspace membership — any member can read a skill's labels.
+    tags: [skills, labels]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillLabelListResponse'
+      '400':
+        description: Workspace-scope middleware cases, or an invalid `{id}`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: *wsTaskTokenForbiddenDesc
+        content:
+          application/json:
+            schema: *wsTaskTokenForbiddenSchema
+            example: *wsTaskTokenForbiddenExample
+      '404':
+        description: Workspace not found/not a member, or `{id}` not found in this workspace.
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '500':
+        description: '"failed to list skill labels".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list skill labels" }
+  post:
+    operationId: attachLabelToSkill
+    summary: Attach a label to a skill
+    description: >-
+      server/internal/handler/label.go:654-681 (`AttachLabelToSkill`).
+      Requires `canManageSkill` (creator or workspace owner/admin). The
+      label must already exist in this workspace with `resource_type:
+      "skill"`. Re-attaching an already-attached label is a silent no-op
+      (`ON CONFLICT DO NOTHING`), not an error. Returns 200 with the full
+      current label list (delegates to `ListLabelsForSkill`), not 201 and
+      not just the attached label.
+    tags: [skills, labels]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AttachSkillLabelRequest'
+    responses:
+      '200':
+        description: OK — the skill's full label list after attaching.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillLabelListResponse'
+      '400':
+        description: >-
+          Workspace-scope middleware cases; an invalid `{id}`; a body that
+          fails to decode OR decodes with an empty `label_id` (same message
+          either way); or `label_id` present but not a parseable UUID.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+              labelIdRequired: { value: { error: "label_id is required" } }
+              invalidLabelId: { value: { error: "invalid label_id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: Workspace-scope task-token case, or caller is neither the skill's creator nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator can manage this skill" } }
+      '404':
+        description: >-
+          Workspace not found/not a member; `{id}` not found in this
+          workspace; or `label_id` doesn't exist in this workspace, or
+          exists but isn't a `resource_type: "skill"` label (same "skill
+          label not found" message for both).
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+              label: { value: { error: "skill label not found" } }
+      '500':
+        description: '"failed to attach skill label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to attach skill label" }
+
+/api/skills/{id}/labels/{labelId}:
+  delete:
+    operationId: detachLabelFromSkill
+    summary: Detach a label from a skill
+    description: >-
+      server/internal/handler/label.go:683-700 (`DetachLabelFromSkill`).
+      Requires `canManageSkill`. Detaching a label that isn't currently
+      attached is a silent no-op (the DELETE simply matches zero rows), not
+      an error. Returns 200 with the full current label list (delegates to
+      `ListLabelsForSkill`), not 204.
+    tags: [skills, labels]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: labelId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK — the skill's full label list after detaching.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillLabelListResponse'
+      '400':
+        description: Workspace-scope middleware cases; an invalid `{id}`; or `{labelId}` not a parseable UUID.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+              invalidLabelId: { value: { error: "invalid label id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: Workspace-scope task-token case, or caller is neither the skill's creator nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator can manage this skill" } }
+      '404':
+        description: Workspace not found/not a member, or `{id}` not found in this workspace.
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '500':
+        description: '"failed to detach skill label".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to detach skill label" }
+
+/api/skills/{id}/files:
+  get:
+    operationId: listSkillFiles
+    summary: List a skill's supporting files
+    description: >-
+      server/internal/handler/skill.go:2479-2515 (`ListSkillFiles`). Files
+      are stored and returned as inline text (no separate blob/upload
+      storage). No role gate beyond workspace membership.
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: include
+        in: query
+        schema: { type: string, enum: [content, metadata] }
+        description: >-
+          `content` (the default) returns each file's full body.
+          `metadata` returns path/size/content-hash only, no bodies — same
+          `resolveSkillInclude` rule as GET /api/skills/{id}.
+    responses:
+      '200':
+        description: OK — array shape selected by `include` (see parameter description).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: array
+                  items: { $ref: '#/components/schemas/SkillFileResponse' }
+                - type: array
+                  items: { $ref: '#/components/schemas/SkillFileMetadataResponse' }
+      '400':
+        description: Workspace-scope middleware cases; an invalid `include`; or an invalid `{id}`.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              badInclude: { value: { error: "invalid include: expected \"content\" or \"metadata\"" } }
+              invalidId: { value: { error: "invalid skill id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: *wsTaskTokenForbiddenDesc
+        content:
+          application/json:
+            schema: *wsTaskTokenForbiddenSchema
+            example: *wsTaskTokenForbiddenExample
+      '404':
+        description: Workspace not found/not a member, or `{id}` not found in this workspace.
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '500':
+        description: '"failed to list skill files".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to list skill files" }
+  put:
+    operationId: upsertSkillFile
+    summary: Create or replace a single skill file
+    description: >-
+      server/internal/handler/skill.go:2517-2553 (`UpsertSkillFile`).
+      Requires `canManageSkill`. Upserts exactly one file by `path`
+      (insert, or overwrite if a file at that path already exists) — unlike
+      PUT /api/skills/{id} with a `files` array, this does NOT touch any
+      other existing file.
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateSkillFileRequest'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillFileResponse'
+      '400':
+        description: >-
+          Workspace-scope middleware cases; an invalid `{id}`; body decode
+          failure; an invalid `path`; or `path` is (case-insensitively)
+          `SKILL.md`, which this single-file endpoint rejects outright
+          rather than silently dropping (contrast with POST/PUT on the
+          skill itself, which silently drops a `SKILL.md` entry from
+          `files[]` instead of erroring).
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidPath: { value: { error: "invalid file path" } }
+              reservedPath: { value: { error: "SKILL.md is reserved for the primary skill content" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: Workspace-scope task-token case, or caller is neither the skill's creator nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator can manage this skill" } }
+      '404':
+        description: Workspace not found/not a member, or `{id}` not found in this workspace.
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+      '500':
+        description: '"failed to upsert skill file: <err>".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to upsert skill file: ..." }
+
+/api/skills/{id}/files/{fileId}:
+  delete:
+    operationId: deleteSkillFile
+    summary: Delete a single skill file
+    description: >-
+      server/internal/handler/skill.go:2555-2582 (`DeleteSkillFile`).
+      Requires `canManageSkill`. Verifies `{fileId}` actually belongs to
+      `{id}` before deleting — a `{fileId}` that exists but belongs to a
+      different skill is reported as not-found, not forbidden (deliberate
+      information hiding, matching the same pattern used for attachments
+      elsewhere in this API).
+    tags: [skills]
+    security: *skillsAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: fileId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted — no body.
+      '400':
+        description: Workspace-scope middleware cases; an invalid `{id}`; or `{fileId}` not a parseable UUID.
+        content:
+          application/json:
+            schema: *wsBadRequestSchema
+            examples:
+              missing: *wsMissingExample
+              invalid: *wsInvalidWorkspaceExample
+              invalidId: { value: { error: "invalid skill id" } }
+              invalidFileId: { value: { error: "invalid file id" } }
+      '401':
+        description: *wsUnauthorizedDesc
+        content:
+          application/json:
+            schema: *wsUnauthorizedSchema
+            example: *wsUnauthorizedExample
+      '403':
+        description: Workspace-scope task-token case, or caller is neither the skill's creator nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              taskToken: { value: *wsTaskTokenForbiddenExample }
+              notManager: { value: { error: "only the skill creator can manage this skill" } }
+      '404':
+        description: >-
+          Workspace not found/not a member; `{id}` not found in this
+          workspace; or `{fileId}` doesn't exist, or exists but belongs to a
+          different skill (same "skill file not found" message for both —
+          see description).
+        content:
+          application/json:
+            schema: *wsNotFoundSchema
+            examples:
+              workspace: { value: *wsNotFoundExample }
+              skill: { value: { error: "skill not found" } }
+              file: { value: { error: "skill file not found" } }
+      '500':
+        description: '"failed to delete skill file".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to delete skill file" }

@@ -1,0 +1,1147 @@
+# Domain: daemon
+# Owner: dedicated domain ticket.
+# Top-level keys are path strings merged verbatim into the document's
+# "paths" object by scripts/merge.mjs — add operations here, not under a
+# nested "paths:" key.
+#
+# Internal-only domain (local daemon <-> server protocol, not an external
+# consumer surface). Per the originating ticket's acceptance condition 3,
+# request/response schemas are omitted; every operation below says so in its
+# own `description` instead of guessing a shape. Every operation is
+# cross-checked against server/cmd/server/router.go's `/api/daemon` route
+# group (~line 1554-1609) and carries `security: [{DaemonAuth: []}]`, the
+# dedicated scheme `middleware.DaemonAuth` mounts on that group (distinct
+# from the five schemes the other domain files use — see
+# openapi/components/securitySchemes.yaml). `401` is listed on every
+# operation because DaemonAuth rejects a missing/invalid/wrong-prefix bearer
+# token with `writeError(w, 401, ...)` (server/internal/middleware/daemon_auth.go)
+# before any handler-specific logic runs; that is the one response shape
+# verified identically across all 38 operations, so it is written out in
+# full instead of also being left as "스키마 미기재".
+#
+# Router.go lists 38 chi route registrations under r.Route("/api/daemon",
+# ...), not 39 — the originating ticket's endpoint count/table both say 39
+# but enumerate only 38 distinct path+method pairs (verified: `grep -oE
+# 'r\.(Get|Post)\("[^"]*"' ` over router.go's daemon block, and independently
+# against server/internal/daemon/client.go's caller-side paths). All 38 are
+# registered below; none were dropped.
+
+/api/daemon/register:
+  post:
+    operationId: DaemonRegister
+    summary: Register a daemon runtime
+    tags: [daemon]
+    description: >-
+      Registers (or re-registers) a daemon process with the server. 내부
+      데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      DaemonRegister.
+    security:
+      - DaemonAuth: []
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/deregister:
+  post:
+    operationId: DaemonDeregister
+    summary: Mark a daemon's runtimes offline on shutdown
+    tags: [daemon]
+    description: >-
+      Marks runtimes as offline when the daemon shuts down gracefully. 내부
+      데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      DaemonDeregister.
+    security:
+      - DaemonAuth: []
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/heartbeat:
+  post:
+    operationId: DaemonHeartbeat
+    summary: Daemon liveness heartbeat
+    tags: [daemon]
+    description: >-
+      Periodic liveness signal from a daemon; DB writes are coalesced by
+      HeartbeatScheduler (~60s flush interval) rather than applied inline
+      per request. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, DaemonHeartbeat.
+    security:
+      - DaemonAuth: []
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/ws:
+  get:
+    operationId: DaemonWebSocket
+    summary: Daemon WebSocket upgrade
+    tags: [daemon]
+    description: >-
+      WebSocket handshake endpoint for the daemon's persistent connection
+      (server/internal/daemonws). Not representable as a normal HTTP
+      request/response pair; 2xx response schema intentionally omitted per
+      the originating ticket. See server/internal/handler/daemon_ws.go,
+      DaemonWebSocket.
+    security:
+      - DaemonAuth: []
+    responses:
+      "101":
+        description: Switching Protocols — WebSocket handshake accepted. No body.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/workspaces:
+  get:
+    operationId: ListDaemonWorkspaces
+    summary: List workspaces visible to this daemon
+    tags: [daemon]
+    description: >-
+      Minimal workspace-membership projection for local daemons. A
+      user-scoped PAT/JWT caller gets every workspace it belongs to; a
+      workspace-scoped daemon token (mdt_) gets only its bound workspace.
+      Eventual-consistency safe — downstream daemon endpoints authorize
+      their own requests rather than trusting this list as an admission
+      decision. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon_workspace.go, ListDaemonWorkspaces.
+    security:
+      - DaemonAuth: []
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/workspaces/{workspaceId}/repos:
+  get:
+    operationId: GetDaemonWorkspaceRepos
+    summary: List a workspace's repos for daemon checkout
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      GetDaemonWorkspaceRepos.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: workspaceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/workspaces/{workspaceId}/runtime-profiles:
+  get:
+    operationId: DaemonListRuntimeProfiles
+    summary: List enabled runtime profiles for a workspace
+    tags: [daemon]
+    description: >-
+      Serves the enabled runtime profiles for a workspace to a daemon; the
+      daemon resolves each profile's command_name on PATH and registers an
+      agent_runtime instance per profile it can run. 내부 데몬 전용, 스키마
+      미기재 — see server/internal/handler/runtime_profile.go,
+      DaemonListRuntimeProfiles.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: workspaceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{id}/plugin-hooks:
+  post:
+    operationId: InvokeAgentPluginHook
+    summary: Invoke an agent-triggered plugin hook
+    tags: [daemon]
+    description: >-
+      Called by the daemon's local MCP server when an agent picks one of its
+      plugin tools; the server makes the signed request so the daemon never
+      holds the plugin's signing secret. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/plugin_agent_hook.go, InvokeAgentPluginHook.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: id
+        in: path
+        description: Task id.
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{id}/plugin-mcp/{contributionId}/credential:
+  get:
+    operationId: ResolvePluginMCPCredential
+    summary: Resolve a plugin MCP hook's credential
+    tags: [daemon]
+    description: >-
+      The daemon's broker asks for an MCP hook's credential at connection
+      time, rather than receiving it in the task claim payload, so a secret
+      never sits in a task record. Authenticated as the daemon and scoped to
+      a claimed task. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/plugin_mcp.go, ResolvePluginMCPCredential.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: id
+        in: path
+        description: Task id.
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: contributionId
+        in: path
+        description: >-
+          Composite id, not a UUID — `"<prefix>installationId:hookKey"`
+          (server/internal/handler/plugin_mcp.go splitPluginContributionID).
+        required: true
+        schema:
+          type: string
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/tasks/claim:
+  post:
+    operationId: ClaimTaskByRuntime
+    summary: Claim the next queued task for a runtime (per-runtime)
+    tags: [daemon]
+    description: >-
+      Atomically claims the next queued task for a single runtime; the
+      response includes the agent's name and skills fetched fresh from the
+      DB. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, ClaimTaskByRuntime.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/claim:
+  post:
+    operationId: ClaimTasksByRuntime
+    summary: Claim queued tasks across runtimes (batch, canonical)
+    tags: [daemon]
+    description: >-
+      Canonical machine-level batch claim (MUL-4257). Each returned task
+      goes through the same FinalizeTaskClaim as the per-runtime endpoint,
+      so the task-scoped token and the comment-delivery receipt
+      (delivered_comment_ids) persist atomically; a finalization failure
+      requeues that claim and omits it from the batch. Unknown/unauthorized
+      runtime_ids are skipped silently. Shares a handler with
+      `POST /api/daemon/claim` (see below). 내부 데몬 전용, 스키마 미기재 —
+      see server/internal/handler/daemon.go, ClaimTasksByRuntime.
+    security:
+      - DaemonAuth: []
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/claim:
+  post:
+    operationId: ClaimTasksByRuntimeAlias
+    summary: Claim queued tasks across runtimes (batch, transitional alias)
+    tags: [daemon]
+    description: >-
+      Transitional alias for `POST /api/daemon/tasks/claim` — same handler
+      (ClaimTasksByRuntime), kept so the daemon coordinator can target the
+      canonical path while older daemons still call this one. 내부 데몬
+      전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      ClaimTasksByRuntime.
+    security:
+      - DaemonAuth: []
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/prepare-lease:
+  post:
+    operationId: ExtendTaskPrepareLease
+    summary: Extend a task's prepare lease
+    tags: [daemon]
+    description: >-
+      Keeps a dispatched task protected while the daemon resolves startup
+      inputs and prepares the execution environment. 내부 데몬 전용, 스키마
+      미기재 — see server/internal/handler/daemon.go, ExtendTaskPrepareLease.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/skill-bundles/resolve:
+  post:
+    operationId: ResolveTaskSkillBundles
+    summary: Resolve a task's skill bundles against the daemon's cache
+    tags: [daemon]
+    description: >-
+      Lets a daemon confirm its cached local skill files are current so
+      runtimes see complete skill content at startup. If a requested hash no
+      longer matches the agent's current skill bundle, returns the current
+      bundle and hash instead; Stage 1 does not snapshot skill content at
+      claim time, so the daemon validates the returned bundle before
+      writing it to cache and materializing it. 내부 데몬 전용, 스키마
+      미기재 — see server/internal/handler/daemon.go, ResolveTaskSkillBundles.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/tasks/pending:
+  get:
+    operationId: ListPendingTasksByRuntime
+    summary: List queued/dispatched tasks for a runtime
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      ListPendingTasksByRuntime.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/update/{updateId}/result:
+  post:
+    operationId: ReportUpdateResult
+    summary: Report a self-update attempt's result
+    tags: [daemon]
+    description: >-
+      Receives the result of a daemon self-update attempt. 내부 데몬 전용,
+      스키마 미기재 — see server/internal/handler/runtime_update.go,
+      ReportUpdateResult.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: updateId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/models/{requestId}/result:
+  post:
+    operationId: ReportModelListResult
+    summary: Report a model-list request's result
+    tags: [daemon]
+    description: >-
+      Receives the result of an async "list available models" request the
+      server issued to the daemon. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/runtime_models.go, ReportModelListResult.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: requestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/local-skills/{requestId}/result:
+  post:
+    operationId: ReportLocalSkillListResult
+    summary: Report a local-skill-list request's result
+    tags: [daemon]
+    description: >-
+      Receives the result of an async "list local skills" request the
+      server issued to the daemon. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/runtime_local_skills.go,
+      ReportLocalSkillListResult.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: requestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/local-skills/import/{requestId}/result:
+  post:
+    operationId: ReportLocalSkillImportResult
+    summary: Report a local-skill-import request's result
+    tags: [daemon]
+    description: >-
+      Receives the result of an async "import local skill" request the
+      server issued to the daemon. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/runtime_local_skills.go,
+      ReportLocalSkillImportResult.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: requestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/status:
+  get:
+    operationId: GetTaskStatus
+    summary: Get a task's current status
+    tags: [daemon]
+    description: >-
+      Used by the daemon to detect terminal/interruption signals
+      (cancelled, failed, completed) while a task is executing mid-flight.
+      내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, GetTaskStatus.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/start:
+  post:
+    operationId: StartTask
+    summary: Mark a dispatched task as running
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      StartTask.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/supplements/claim:
+  post:
+    operationId: ClaimTaskSupplement
+    summary: Claim the next queued supplement message for a task
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/task_supplement.go, ClaimTaskSupplement.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/supplements/{commentId}/ack:
+  post:
+    operationId: AckTaskSupplement
+    summary: Acknowledge delivery of a claimed supplement message
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/task_supplement.go, AckTaskSupplement.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: commentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/wait-local-directory:
+  post:
+    operationId: MarkTaskWaitingLocalDirectory
+    summary: Mark a task waiting on a local-directory mutex
+    tags: [daemon]
+    description: >-
+      Transitions a dispatched task to waiting_local_directory. Called by
+      the daemon when, after claiming a task whose project carries a
+      local_directory resource, it discovers another in-flight task already
+      holds the path's mutex. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, MarkTaskWaitingLocalDirectory.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/progress:
+  post:
+    operationId: ReportTaskProgress
+    summary: Report a running task's progress
+    tags: [daemon]
+    description: >-
+      Request body is a named struct in source
+      (server/internal/handler/daemon.go TaskProgressRequest: `summary`
+      string, `step`/`total` int) but is left undocumented here per the
+      originating ticket's schema-omission allowance — 내부 데몬 전용,
+      스키마 미기재.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/complete:
+  post:
+    operationId: CompleteTask
+    summary: Mark a task complete
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      CompleteTask.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/fail:
+  post:
+    operationId: FailTask
+    summary: Mark a task failed
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      FailTask.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/usage:
+  post:
+    operationId: ReportTaskUsage
+    summary: Report a task's resource/token usage
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      ReportTaskUsage.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/messages:
+  post:
+    operationId: ReportTaskMessages
+    summary: Report a batch of agent execution messages
+    tags: [daemon]
+    description: >-
+      Receives a batch of agent execution messages from the daemon. Request
+      body is a named struct in source
+      (server/internal/handler/daemon.go TaskMessageBatchRequest: a
+      `messages` array of TaskMessageRequest) but is left undocumented here
+      per the originating ticket's schema-omission allowance — 내부 데몬
+      전용, 스키마 미기재.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+  get:
+    operationId: ListTaskMessages
+    summary: List a task's persisted messages (catch-up after reconnect)
+    tags: [daemon]
+    description: >-
+      Returns the persisted messages for a task so a reconnecting daemon
+      can catch up. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, ListTaskMessages.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/NextCursorParam'
+    responses:
+      "200":
+        description: >-
+          내부 데몬 전용, 스키마 미기재. Cursor-paginated per the handler's
+          own `next_cursor`, not independently confirmed to honor
+          LimitParam's documented default/max (see parameters.yaml note).
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/cancel-ack:
+  post:
+    operationId: AckTaskCancelled
+    summary: Acknowledge a task cancellation
+    tags: [daemon]
+    description: >-
+      내부 데몬 전용, 스키마 미기재 — see server/internal/handler/daemon.go,
+      AckTaskCancelled.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/workspaces/{workspaceId}/issues/gc-check:
+  post:
+    operationId: BatchIssueGCCheck
+    summary: Batch GC-eligibility check for issues
+    tags: [daemon]
+    description: >-
+      Returns one explicit result for every requested issue id. The query
+      is workspace-scoped at the SQL layer; missing rows and ids owned by
+      another workspace both become found=false so the endpoint is not an
+      enumeration oracle. The request count is capped because installed
+      daemons run this periodically and must not be able to produce
+      unbounded DB work. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, BatchIssueGCCheck.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: workspaceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/issues/{issueId}/gc-check:
+  get:
+    operationId: GetIssueGCCheck
+    summary: GC-eligibility check for one issue (legacy single-item form)
+    tags: [daemon]
+    description: >-
+      Returns minimal issue info needed by older daemon GC loops. Gated on
+      workspace access so a daemon token scoped to workspace A cannot read
+      issue metadata from workspace B via UUID enumeration. 내부 데몬 전용,
+      스키마 미기재 — see server/internal/handler/daemon.go,
+      GetIssueGCCheck.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: issueId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/chat-sessions/{sessionId}/gc-check:
+  get:
+    operationId: GetChatSessionGCCheck
+    summary: GC-eligibility check for a chat session
+    tags: [daemon]
+    description: >-
+      Same anti-enumeration shape as GetIssueGCCheck: a workspace mismatch
+      returns the same 404 so a scoped daemon token can't probe other
+      workspaces. An explicit user delete of the chat session is treated as
+      an immediate-clean signal for GC. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, GetChatSessionGCCheck.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/autopilot-runs/{runId}/gc-check:
+  get:
+    operationId: GetAutopilotRunGCCheck
+    summary: GC-eligibility check for an autopilot run
+    tags: [daemon]
+    description: >-
+      The daemon decides purely on terminal status: an autopilot run's
+      workdir is never reused, so a terminal run is reclaimed on sight,
+      while non-terminal status is a skip signal — completed_at is returned
+      for the API contract and diagnostics, not as a TTL anchor. Workspace
+      ownership is resolved via the parent autopilot row. 내부 데몬 전용,
+      스키마 미기재 — see server/internal/handler/daemon.go,
+      GetAutopilotRunGCCheck.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/gc-check:
+  get:
+    operationId: GetTaskGCCheck
+    summary: GC-eligibility check for a quick-create task
+    tags: [daemon]
+    description: >-
+      Returns the agent_task_queue status for quick-create cleanup.
+      Quick-create tasks have no parent record (no issue_id at WriteGCMeta
+      time, no chat session, no autopilot run) so the daemon keys GC
+      directly on the task row itself. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/daemon.go, GetTaskGCCheck.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/runtimes/{runtimeId}/recover-orphans:
+  post:
+    operationId: RecoverOrphanedTasks
+    summary: Recover tasks orphaned by a daemon restart
+    tags: [daemon]
+    description: >-
+      On daemon restart, re-queues tasks the runtime heartbeat sweeper
+      believes belong to that runtime (tasks the previous daemon process
+      was running when it died) and triggers a retry for each, so the user
+      sees a fresh attempt instead of a permanently stuck row. Targeted fix
+      for "issue stuck at in_progress when daemon restarts mid-task": the
+      heartbeat sweeper alone takes up to 75s plus the in-process task
+      timeout (2.5h) to notice; the daemon knows the moment it comes back
+      up. 내부 데몬 전용, 스키마 미기재 — see
+      server/internal/handler/task_lifecycle.go, RecoverOrphanedTasks.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: runtimeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/daemon/tasks/{taskId}/session:
+  post:
+    operationId: PinTaskSession
+    summary: Pin a task's session id / work dir as soon as known
+    tags: [daemon]
+    description: >-
+      Lets the daemon report session_id/work_dir as soon as they're known
+      — typically right after the agent emits its first system message —
+      so a crash mid-run doesn't lose the resume pointer needed to
+      continue the conversation on the next attempt. Request body is a
+      named struct in source (server/internal/handler/task_lifecycle.go
+      PinTaskSessionRequest: `session_id`, `work_dir`, both optional) but
+      is left undocumented here per the originating ticket's
+      schema-omission allowance — 내부 데몬 전용, 스키마 미기재.
+    security:
+      - DaemonAuth: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: 내부 데몬 전용, 스키마 미기재.
+      "401":
+        description: Missing/invalid/malformed Authorization header.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
